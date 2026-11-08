@@ -168,6 +168,7 @@ class Switch(unittest.TestCase):
             with self.assertRaisesRegex(SwitchFailed, "no VRAM.*alpha is loaded again"):
                 self.svc.switch_model("beta")
         self.assertIs(self.svc.engine, self.old)
+        self.assertTrue(until(lambda: (self.old.starts, self.old.running) == (1, True)))
         self.assertEqual((self.old.stops, self.old.starts, self.old.running, self.svc.model), (1, 1, True, "alpha"))
 
     def test_no_switch_under_a_request_and_none_to_a_model_that_cannot_run(self):

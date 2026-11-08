@@ -50,7 +50,7 @@ function list() {
     const row = document.createElement("div"); row.className = "row";
     const time = document.createElement("span"); time.textContent = new Date(r.started_at * 1000).toLocaleTimeString();
     const tag = document.createElement("span"); tag.className = `tag ${r.state}`;
-    tag.textContent = isAudio(r) && r.phase ? r.phase : r.state;
+    tag.textContent = r.phase || r.state;   // queued / encode / prefill / generate while it runs, then completed/error
     row.append(time, tag);
     const endpoint = document.createElement("div"); endpoint.className = "endpoint"; endpoint.textContent = `POST ${r.path}`;
     const meta = document.createElement("div"); meta.className = "small";

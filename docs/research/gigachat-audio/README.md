@@ -13,6 +13,7 @@ unchanged, `serve/server.py` moved by +61/−13 lines)
 | [`02-polystrata-integration.md`](02-polystrata-integration.md) | Engine architecture, backend hooks, GGUF loading, expert cache, KV, graphs, `GENI` path, ordered patch plan, memory budgets |
 | [`decoder-notes.md`](decoder-notes.md) | Tensors the decoder backend reads, the MLA cache row, and the limits it still refuses |
 | [`03-audio-pipeline.md`](03-audio-pipeline.md) | Mel front end, Conformer graph, adapter, 6.25 tok/s arithmetic, prompt/timestamp format, streaming, quantization, test plan, risks |
+| [`04-single-gpu-residency.md`](04-single-gpu-residency.md) | CUDA/VMM/MPS facts, switch timings, eviction, KV checkpoint, residency budgets, `switch_on_request` manager design |
 | [`PLAN.md`](PLAN.md) | Ordered implementation plan with acceptance criteria and file ownership |
 
 ## Decisions
@@ -69,7 +70,7 @@ unchanged, `serve/server.py` moved by +61/−13 lines)
 | `strata-audio` Conformer (CPU, q8/mixed) | done |
 | `GENA` + `input_audio` front end | pending |
 | 200-frame streaming with halos | pending |
-| KV checkpoint (`DUMPKV`/`LOADKV`) | pending |
+| KV shelf in the `strata-poly` process (`SWITCH`) | done |
 
 ### Measured on 2026-11-05
 

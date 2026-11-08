@@ -212,6 +212,9 @@ async function poll() {
       lastMetrics = await r.json();
       metricsFailures = 0;
       render(lastMetrics);
+      const mid = (lastMetrics.engine || {}).model;
+      const sel = $("model-select");
+      if (mid && sel && ![...sel.options].some((o) => o.value === mid) && sel.dataset.current !== mid) loadModels();
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
@@ -231,7 +234,13 @@ function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || [])[0];
   // the header pill
-  if (live.state === "reading") {
+  if (live.phase_name === "loading") {
+    setPill("queued", "Loading the model");
+  } else if (live.state === "unloaded") {
+    setPill("idle", "Unloaded");
+  } else if (live.state === "encoding" || live.phase_name === "encode") {
+    setPill("reading", "Encoding audio");
+  } else if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
     setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
   } else if (live.state === "generating") {
@@ -240,6 +249,11 @@ function render(m) {
     setPill("idle", "Idle");
   }
   if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  const sel = $("model-select");
+  if (eng.model && sel && [...sel.options].some((o) => o.value === eng.model)) {
+    if (sel.value !== eng.model) sel.value = eng.model;
+    sel.dataset.current = eng.model;
+  }
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
   if (tab === "about") renderAbout(eng, hw, st);
@@ -290,37 +304,65 @@ function renderTotals(t) {
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
   const prog = $("state-progress");
-  const encoding = live.phase_name === "encode" || live.state === "encoding";
-  const on = live.queued > 0 ? "queued" : encoding ? "encoding" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
   let label = "Waiting for a request", detail = "", pct = 0, indeterminate = false;
-  if (encoding) {
+  // The phase and its real progress come from /v1/status.activity (model=live in /metrics): the audio encoder's
+  // rows while it encodes, the decoder's prompt read during prefill (the audio rows included), its own tokens
+  // during generate.  `progress` is null when the phase has no known end - the bar stays indeterminate, it is
+  // never filled with a number from the previous request.
+  const phase = (live.state === "unloaded" && live.phase_name !== "loading") ? null
+    : (live.phase_name || (live.state === "reading" ? "prefill"
+                                   : live.state === "generating" ? "generate" : null));
+  const on = (live.state === "unloaded" && phase !== "loading") ? ""
+    : live.queued > 0 ? "queued"
+    : phase === "loading" ? "queued"
+    : (phase === "engine" && live.state !== "idle" && live.state !== "unloaded") ? "engine"
+    : live.state;
+  for (const b of document.querySelectorAll("#state-badges .st-badge"))
+    b.classList.toggle("on", b.dataset.s === on);
+  if (live.state === "unloaded") {
+    label = "Model unloaded";
+    detail = "The next request loads it again";
+    indeterminate = false;
+    delete prog.dataset.tone;
+  } else if (phase === "loading") {
+    label = live.progress_label || "Loading the model";
+    detail = live.progress_detail || "";
+    indeterminate = true;
+  } else if (phase === "encode") {
     label = live.progress_label || "Encoding audio";
     detail = live.progress_detail || "";
-    prog.dataset.tone = "info";
     if (typeof live.progress === "number") pct = 100 * live.progress; else indeterminate = true;
-  } else if (live.state === "reading") {
-    label = live.progress_label && live.progress_label.includes("audio") ? live.progress_label : "Reading prompt";
-    prog.dataset.tone = "info";
-    if (live.prompt_total) {
-      pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
-    } else {
-      detail = `${fmt(live.prompt_tokens)} tokens`;
-    }
-  } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating";
+  } else if (phase === "prefill") {
+    label = live.progress_label || "Prefill (after audio)";
     delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+    if (typeof live.progress === "number") {
+      pct = 100 * live.progress;
+    } else if (live.prompt_total) {                       // older server: only the counters
+      pct = (100 * live.prompt_read) / live.prompt_total;
+    } else {
+      indeterminate = true;
+    }
+    detail = live.progress_detail || (live.prompt_total
+      ? `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%` : `${fmt(live.prompt_tokens)} tokens`);
+    prog.dataset.tone = "info";
+  } else if (phase === "generate") {
+    label = live.progress_label || (live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Generating");
+    delete prog.dataset.tone;
+    if (typeof live.progress === "number") pct = 100 * live.progress;
+    else indeterminate = true;              // no cap the client asked for: tokens, no bar
+    detail = live.progress_detail || `${fmt(live.generated)} tokens${live.max_tokens ? ` / ${fmt(live.max_tokens)}` : ""}` +
+      ` · ${fmt(live.tok_s, 1)} tok/s`;
+  } else if (live.state === "queued") {
+    label = live.progress_label || "Queued"; detail = live.progress_detail || ""; indeterminate = true;
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
-  $("state-bar").style.width = indeterminate ? "0%" : `${pct}%`;
+  $("state-bar").style.width = indeterminate ? "0%" : `${Math.max(0, Math.min(100, pct))}%`;
   prog.classList.toggle("is-indeterminate", indeterminate);
+  prog.setAttribute("aria-valuenow", indeterminate ? "" : String(Math.round(pct)));
 
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;

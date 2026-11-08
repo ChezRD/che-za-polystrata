@@ -339,8 +339,23 @@ void spill() {
     check(std::memcmp(s->data(), want.data(), n) == 0, "and reads back the same after its pages left");
 }
 
+void shelf_survives_a_new_engine() {
+    const uint64_t sig = 0xabc;
+    std::vector<int32_t> a = text(9, 5000);
+    {
+        Chat c(options(64));
+        c.ask(a);
+        c.kept.shelve(sig);
+    }
+    Chat d(options(64));
+    check(d.kept.unshelve(sig) >= 1, "a shelved conversation is still in the process");
+    std::vector<int32_t> again = a;
+    check(d.ask(again) > 0, "the next engine takes that conversation up past its start");
+}
+
 int main() {
     spill();
+    shelf_survives_a_new_engine();
     for (const int64_t f : {0, 6000, 700}) {   // 700: reads that start and end between checkpoints
         far = f;
         one_conversation();

@@ -68,7 +68,7 @@ from serve import runconfig  # noqa: E402
 from serve import models as registry  # noqa: E402
 from serve.model_gate import Cancelled, ModelGate  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
-from serve.winjob import contain  # noqa: E402
+from serve.winjob import contain, signal_group, spawn, spawn_kwargs  # noqa: E402
 from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
@@ -86,9 +86,10 @@ IMAGE_PAD = "<|image_pad|>"
 def popen(what: str, args: list, **kw):
     """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
     Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
-    OSError."""
+    OSError.  The child is started on the server's spawner thread (serve/winjob.spawn), so its parent-death signal
+    follows a thread that lives as long as the server."""
     try:
-        return subprocess.Popen(args, **kw)
+        return spawn(args, **kw)
     except OSError as e:
         if getattr(e, "winerror", None) in (4551, 1260):
             raise OSError(f"Windows blocked {what} ({args[0]}): Smart App Control, or an application-control policy, does "
@@ -309,6 +310,16 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
 VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 300.0)
 VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
+# A switch starts the new model in the request that asked for it: a model that has not said READY within its run
+# config's "ready_timeout_s" (this many seconds when it sets none) failed, and the next request for it is answered
+# 503 at once instead of holding on to the turn for the global engine timeout above.
+SWITCH_READY_S = 300.0
+# VRAM preflight: what a model's own estimate adds beyond its weights (see Service.model_vram_need)
+VRAM_CACHE_FLOOR_MIB = 512       # the smallest expert cache / context and graphs a start is allowed to plan on
+VRAM_SWITCH_RESERVE_MIB = 512    # kept free for the driver and the desktop while a switch happens
+RELEASE_WAIT_S = 4.0             # how long an eviction waits for the card's free VRAM to show the release (< 10 s)
+SWITCH_FAIL_COOLDOWN_S = 30.0    # a model that failed to start is not tried again by every request for this long
+SWITCH_RETRY_AFTER_S = 30        # Retry-After of a refusal that may fit later (too little VRAM, busy admission)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -358,7 +369,12 @@ class ClientGone(Exception):
 
 
 class ModelBusy(RuntimeError):
-    """Explicit model controls must not interrupt active or queued requests."""
+    """Explicit model controls must not interrupt active or queued requests.  `retry_after`: seconds for the
+    Retry-After header when the caller should come back (None: a 409, as before)."""
+
+    def __init__(self, message="", retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class EngineSilent(EngineDied):
@@ -368,7 +384,12 @@ class EngineSilent(EngineDied):
 
 
 class SwitchFailed(RuntimeError):
-    """The model asked for did not start.  The message says whether the earlier one runs again."""
+    """The model asked for did not start.  The message says whether the earlier one runs again.  `retry_after`:
+    seconds for the 503's Retry-After header (a model in a failure cooldown says when it may be tried again)."""
+
+    def __init__(self, message="", retry_after=None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class EngineNonFinite(ValueError):
@@ -408,6 +429,99 @@ class GpuBusy(RuntimeError):
     def __init__(self, message="", retry_after=None):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+_NVML_CACHE: dict = {}                 # NVML index -> (library, device, processes function, its record type), or None
+_NVML_LOCK = threading.Lock()
+
+
+def _nvml_record(proc_function):
+    """The record type of an NVML process-list function: v2 and v3 use nvmlProcessInfo_t, the base one the two-field
+    record it started with."""
+    import ctypes as c
+
+    class V1(c.Structure):
+        _fields_ = [("pid", c.c_uint), ("used", c.c_ulonglong)]
+
+    class V2(c.Structure):
+        _fields_ = [("pid", c.c_uint), ("used", c.c_ulonglong), ("gpu", c.c_uint), ("compute", c.c_uint)]
+
+    return V1 if not (proc_function.endswith("_v2") or proc_function.endswith("_v3")) else V2
+
+
+def nvml_process_mib(index: int = 0) -> dict[int, int] | None:
+    """The VRAM each process holds on NVIDIA card `index`, in MiB (NVML's compute-process list), or None when NVML
+    cannot be read.  Used to prove that an evicted engine gave its VRAM back, and to know how much it will give."""
+    state = _NVML_CACHE.get(index)
+    if state is None and index not in _NVML_CACHE:
+        with _NVML_LOCK:
+            if index not in _NVML_CACHE:
+                state = None
+                names = ["nvml.dll", os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                                                  "NVIDIA Corporation", "NVSMI", "nvml.dll")] \
+                    if os.name == "nt" else ["libnvidia-ml.so.1", "libnvidia-ml.so"]
+                for name in names:
+                    try:
+                        lib = ctypes.CDLL(name)
+                        init = getattr(lib, "nvmlInit_v2", None) or getattr(lib, "nvmlInit", None)
+                        dev = ctypes.c_void_p()
+                        get = getattr(lib, "nvmlDeviceGetHandleByIndex_v2", None) or \
+                            getattr(lib, "nvmlDeviceGetHandleByIndex", None)
+                        if init is None or get is None or init() != 0 or get(index, ctypes.byref(dev)) != 0:
+                            continue
+                        for fname in ("nvmlDeviceGetComputeRunningProcesses_v3",
+                                      "nvmlDeviceGetComputeRunningProcesses_v2",
+                                      "nvmlDeviceGetComputeRunningProcesses"):
+                            fn = getattr(lib, fname, None)
+                            if fn is not None:
+                                state = (lib, dev, fn, _nvml_record(fname))
+                                break
+                        if state is not None:
+                            break
+                    except (OSError, AttributeError, ValueError):
+                        continue
+                _NVML_CACHE[index] = state
+    if state is None:
+        return None
+    lib, dev, fn, record = state
+    count = ctypes.c_uint(0)
+    try:
+        rc = fn(dev, ctypes.byref(count), None)       # 0 or INSUFFICIENT_SIZE (7): the count is what matters
+        if rc not in (0, 7) and count.value == 0:
+            return None
+        records = (record * max(1, count.value))()
+        if fn(dev, ctypes.byref(count), records) != 0:
+            return None
+        out = {}
+        for i in range(count.value):
+            used = int(records[i].used)
+            if 0 < used < (1 << 64) - 1:               # not NVML_VALUE_NOT_AVAILABLE
+                out[int(records[i].pid)] = used >> 20
+        return out
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def nvidia_smi_process_mib(index: int = 0) -> dict[int, int] | None:
+    """NVML's process list without NVML: `nvidia-smi --query-compute-apps` (the fallback when the library is not
+    there, as in a container).  None when it cannot be read."""
+    try:
+        r = subprocess.run(["nvidia-smi", "-i", str(index), "--query-compute-apps=pid,used_memory",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for line in r.stdout.splitlines():
+        pid, _, used = line.partition(",")
+        try:
+            pid, used = int(pid.strip()), int(float(used.strip()))
+        except ValueError:
+            continue
+        if pid > 0 and used > 0:
+            out[pid] = used
+    return out
 
 
 def unload_wait(value, default: float) -> float:
@@ -843,12 +957,15 @@ class StrataEngine:
 
     @property
     def disk_sessions(self) -> bool:
-        """SAVE / RESTORE: the Strata project's engine has them, strata-poly does not (issue 114)."""
+        """SAVE / RESTORE: the Strata project's engine has them, strata-poly does not (issue 114). A strata-poly
+        process keeps its conversation cache in memory and loads the next model itself."""
         return Path(str(self.spawn[0])).stem.lower() not in ("strata-poly", "strata-glm")
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
-        self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None,
+                 ready_s: float | None = None, _attempt: int = 0):
+        ready_s = ENGINE_READY_S if ready_s is None else ready_s   # None: the server's global timeout, as before
+        self.spawn = (exe, list(args), cwd, log, env, False, cpus, ready_s)   # to start it again after it died (#27)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
         self.model_path = paths.get("--native") or paths.get("--model") or paths.get("--pack", "pack/full")
@@ -891,18 +1008,16 @@ class StrataEngine:
             except OSError:
                 pass
         self.max_context = 0                             # before the new process is visible: never its predecessor's
-        pin = {}
-        if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (serve/replicas.py)
-            pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        pin = spawn_kwargs(cpus)                         # own session + PDEATHSIG (Linux), affinity; close_fds
         spawned_at = time.monotonic()
         self.proc = popen("the PolyStrata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env, **pin)
-        contain(self.proc)                               # ends with the server, however it ends (Windows)
+        contain(self.proc)                               # ends with the server, however it ends (Windows; Linux: the session)
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
         threading.Thread(target=self._ready_pump, args=(self.proc, ready_q), daemon=True).start()
-        ready_deadline = None if ENGINE_READY_S is None else time.monotonic() + ENGINE_READY_S
+        ready_deadline = None if ready_s is None or ready_s == math.inf else time.monotonic() + ready_s
         timed_out = False
         while True:
             left = None if ready_deadline is None else ready_deadline - time.monotonic()
@@ -954,9 +1069,9 @@ class StrataEngine:
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
                 time.sleep(wait_s)
-                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, ready_s, _attempt + 1)
                 return
-            why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
+            why = (f"the engine did not report READY within {ready_s:g} s" if timed_out else
                    "the engine exited before it was ready")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
@@ -975,41 +1090,7 @@ class StrataEngine:
         self.ended = False                              # READY: alive from here (restart() set it True, #344)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
-        # --batch: concurrent requests in the engine's batch slots (see generate_batched).  The engine says how many
-        # it runs (INFO batch_slots=N: it may have fewer than asked, or none, when they do not fit)
-        asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
-        self.batch = int(self.info.get("batch_slots") or 0)
-        if asked and self.batch != asked:
-            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
-                  "(its log says why)", flush=True)
-        _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
-        # no `--batch-groups` (the default on a layer split) or `auto`: the engine picks the groups and says so
-        # (INFO batch_groups=G); a number is the group count asked for (1 = off)
-        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
-        groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
-        gs = self.batch // groups if self.batch else 0
-        # slots in the order that spreads requests over the pipeline's groups first: 0, gs, 2gs, .., 1, gs+1, ..
-        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
-        self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]   # each slot's pipeline group
-        self.slot_groups = groups
-        # pipelined groups (the engine says how many it runs: INFO batch_groups; older engines: the args).  A pipelined
-        # group's window spans its slots up to its last busy one, and the engine keeps no pipelined slot as a
-        # conversation cache - see pick_slot
-        groups_run = int(self.info.get("batch_groups") or groups)
-        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
-        self.slot_q = [queue.Queue() for _ in range(self.batch)]
-        self.slot_busy = [False] * self.batch
-        # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
-        # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
-        # (its flag leaked) and would keep every later request waiting for a slot that nothing will free.
-        self.slot_claims: set[int] = set()
-        self.slot_releasing: set[int] = set()
-        self._orphan_seen: dict[int, float] = {}
-        # what each slot's sessions hold (prompt + every token a window fed), so a conversation's next turn goes to
-        # the slot that has its start (the engine checks it again); when the slot was last used
-        self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
-        self.slot_used = [0.0] * self.batch
-        self.slot_live: list[dict | None] = [None] * self.batch   # /metrics: the request in each slot
+        self._note_batch(args)
         # #1012: the admission state belongs to the server, not to one engine process.  restart() runs this again
         # while requests still wait on it (they hold these very objects), so it is made once and kept: new ones
         # would leave the waiters on a lock and a condition nobody notifies, with their counts missing from the
@@ -1027,6 +1108,106 @@ class StrataEngine:
         self.wlock = threading.Lock()                   # stdin writes from several request threads
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+
+    def _note_batch(self, args: list[str]) -> None:
+        """The batch slots the READY line reported. A SWITCH in this process builds them again for the new model."""
+        asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args), 0)
+        self.batch = int(self.info.get("batch_slots") or 0)
+        if asked and self.batch != asked:
+            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
+                  "(its log says why)", flush=True)
+        _bg = args[args.index("--batch-groups") + 1] if "--batch-groups" in args else "default"
+        groups = int(self.info.get("batch_groups") or 1) if _bg in ("auto", "default") else int(_bg)
+        groups = groups if self.batch and groups > 0 and self.batch % groups == 0 else 1
+        gs = self.batch // groups if self.batch else 0
+        self.slot_order = [g * gs + t for t in range(gs) for g in range(groups)]
+        self.slot_group = [b // gs if gs else 0 for b in range(self.batch)]
+        self.slot_groups = groups
+        groups_run = int(self.info.get("batch_groups") or groups)
+        self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
+        self.slot_q = [queue.Queue() for _ in range(self.batch)]
+        self.slot_busy = [False] * self.batch
+        self.slot_claims = set()
+        self.slot_releasing = set()
+        self._orphan_seen = {}
+        self.slot_held = [[] for _ in range(self.batch)]
+        self.slot_used = [0.0] * self.batch
+        self.slot_live = [None] * self.batch
+
+    def switch_model(self, args: list[str], ready_s: float | None) -> None:
+        """Load another GGUF in this process. The engine keeps parked conversations in memory. SWITCHED 0: refused,
+        this model stays. SWITCHED 1: the new model is ready. SWITCHED 2: the new one failed and the previous model
+        is ready again."""
+        if any(any(c in a for c in " \t\r\n") for a in args):
+            raise RuntimeError("an argument contains whitespace; this process cannot switch in place")
+        if self.proc is None or self.proc.poll() is not None:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+        try:
+            self.proc.stdin.write("SWITCH " + " ".join(args) + "\n")
+            self.proc.stdin.flush()
+        except OSError:
+            raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+        deadline = None if ready_s is None or ready_s == math.inf else time.monotonic() + ready_s
+
+        def take() -> str:
+            left = None if deadline is None else deadline - time.monotonic()
+            if left is not None and left <= 0:
+                raise EngineDied(f"the engine did not report the switch within {ready_s:g} s")
+            try:
+                line = self.lines.get(timeout=left)
+            except queue.Empty:
+                raise EngineDied(f"the engine did not report the switch within {ready_s:g} s") from None
+            if line is None:
+                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+            return line
+
+        status = None
+        reason = ""
+        while status is None:
+            line = take()
+            if line.startswith("SWITCHED "):
+                f = line.split(None, 2)
+                try:
+                    status = int(f[1])
+                except (IndexError, ValueError):
+                    raise EngineDied(f"the engine answered SWITCH with {line.strip()[:200]!r}") from None
+                reason = f[2].strip() if len(f) > 2 else ""
+            elif line.startswith(("INFO ", "WARN")):
+                continue
+            else:
+                raise EngineDied(f"the engine answered SWITCH with {line.strip()[:200]!r}")
+        if status == 0:
+            raise RuntimeError(reason or "the engine refused the switch")
+        info: dict = {}
+        while True:
+            line = take()
+            if line.startswith("INFO "):
+                for kv in line.split()[1:]:
+                    k, _, v = kv.partition("=")
+                    info[k] = int(v) if v.lstrip("-").isdigit() else v
+            elif line.startswith("READY"):
+                f = line.split()
+                self.max_context = int(f[1])
+                self.can_stop = "stop" in f[2:]
+                break
+            elif line.startswith("WARN"):
+                continue
+            else:
+                raise EngineDied(f"the engine answered SWITCH with {line.strip()[:200]!r}")
+        self.info = info
+        if self.info.get("engine"):
+            self.info["version"] = str(self.info["engine"])
+        self.known_ctx = self.max_context
+        self.ended = False
+        self.unloaded = False
+        if status == 2:
+            # READY above is the previous model. Its path and batch slots stay; the failed arguments are not it.
+            raise RuntimeError(reason or "the switch failed and the previous model was loaded again")
+        paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack", "--model")}
+        self.model_path = paths.get("--native") or paths.get("--model") or paths.get("--pack", self.model_path)
+        self.spawn = (self.spawn[0], list(args), *self.spawn[2:])
+        self._note_batch(args)
+        self.gen = self.__dict__.get("gen", 0) + 1
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
@@ -1113,9 +1294,14 @@ class StrataEngine:
             return None
 
     def unload(self):
-        """Release GPU/RAM between requests, retaining the spawn config for automatic reloading."""
+        """Release GPU/RAM between requests, retaining the spawn config for automatic reloading.  The runtime facts
+        of the last load (expert cache, free VRAM, parked conversations) go with it: an unloaded model has none, and
+        the Monitor must not keep showing the numbers of a process that has exited."""
         self.close()
         self.unloaded = True
+        for key in ("expert_slots", "expert_cache_mib", "expert_cache_full_mib", "vram_free_mib",
+                    "conversation_cache_mib", "conversation_cache_slots", "conversation_cache_min_free_mib"):
+            self.info.pop(key, None)
 
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
@@ -2290,9 +2476,15 @@ class StrataEngine:
                 continue
             raise out_of_step(line)
 
+    QUIT_TIMEOUT_S = 2.0     # the engine frees its memory itself on QUIT - normally well under a second
+    TERM_TIMEOUT_S = 3.0     # an engine that does not answer QUIT is terminated, then killed (< 10 s in all)
+    KILL_TIMEOUT_S = 3.0
+
     def close(self):
         """End the engine process: QUIT first (the engine frees its memory itself - unpinning tens of GB can take
-        a while), then terminate, then kill, each given 20 s.  Raises EngineStuck when it still runs after all three."""
+        a while), then TERM, then KILL, each with a short timeout.  POSIX: the signal goes to the child's process
+        group (it was started in its own session), so anything it started ends too.  Raises EngineStuck when it still
+        runs after all three."""
         if self.proc is None:
             return
         try:
@@ -2301,16 +2493,16 @@ class StrataEngine:
                     self.proc.stdin.write("QUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=20)
+                    self.proc.wait(timeout=self.QUIT_TIMEOUT_S)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
-                    self.proc.terminate()
-                    self.proc.wait(timeout=20)
+                    signal_group(self.proc, signal.SIGTERM)
+                    try:
+                        self.proc.wait(timeout=self.TERM_TIMEOUT_S)
+                    except subprocess.TimeoutExpired:
+                        signal_group(self.proc, signal.SIGKILL)
+                        self.proc.wait(timeout=self.KILL_TIMEOUT_S)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
-            try:
-                self.proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                raise EngineStuck("PolyStrata is still releasing GPU/RAM; retry unloading after it exits") from None
+            raise EngineStuck("PolyStrata is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
             pass
         finally:
@@ -2429,7 +2621,7 @@ class Vision:
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
-                          cwd=self.dir)
+                          cwd=self.dir, **spawn_kwargs())
         contain(self.proc)
         try:
             line = self._readline(VISION_READY_S, "the vision encoder did not start")
@@ -2440,7 +2632,7 @@ class Vision:
             proc, self.proc = self.proc, None
             self.stopped = True
             try:
-                proc.kill()
+                signal_group(proc, signal.SIGKILL)
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
@@ -2464,7 +2656,7 @@ class Vision:
             return got.get(timeout=timeout)
         except queue.Empty:
             try:
-                proc.kill()
+                signal_group(proc, signal.SIGKILL)
             except OSError:
                 pass
             raise RuntimeError(f"{what}: it said nothing for {timeout:.0f} s") from None
@@ -2480,10 +2672,7 @@ class Vision:
     def restart(self):
         """Start the encoder again after an unload (or if it died); the cache of encoded images is kept."""
         if self.proc is not None:
-            try:
-                self.proc.kill()
-            except OSError:
-                pass
+            signal_group(self.proc, signal.SIGKILL)
         self.proc = None
         self.stopped = True
         self._start()
@@ -2624,16 +2813,19 @@ class Vision:
         try:
             proc.stdin.write("QUIT\n")
             proc.stdin.flush()
-            proc.wait(timeout=10)
+            proc.wait(timeout=StrataEngine.QUIT_TIMEOUT_S)
         except Exception:
+            signal_group(proc, signal.SIGTERM)
             try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
+                proc.wait(timeout=StrataEngine.TERM_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                signal_group(proc, signal.SIGKILL)
+                try:
+                    proc.wait(timeout=StrataEngine.KILL_TIMEOUT_S)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            except (OSError, subprocess.SubprocessError):
+                signal_group(proc, signal.SIGKILL)
         self.stopped = True
 
     def shutdown(self):
@@ -3346,6 +3538,13 @@ class Service:
         # "switch_on_request" (opt-in) a request that names another installed model loads that one first.
         self.gate = ModelGate(lambda: config_key(self.config_path) if self.config_path else None)
         self.switch_on_request = False
+        # Phase 0 residency safety: a model that fails to start gets a cooldown instead of a retry by every request;
+        # `last_good` is the model that ran before the failure; the stats keep what each model was measured to use.
+        self.ready_timeout_s = SWITCH_READY_S             # model_settings() sets the model's own
+        self.switch_fail_cooldown_s = SWITCH_FAIL_COOLDOWN_S
+        self.release_wait_s = RELEASE_WAIT_S
+        self.last_good = None
+        self.model_stats: dict[str, dict] = {}            # config_key -> fails, cooldown_until, last_error, vram_mib
         self.counter = None                               # counter_for(): ((config, mtime), its counting Service)
         self._read_tokenizer(tokenizer)
 
@@ -3530,47 +3729,263 @@ class Service:
         tpl = tpath / "chat_template.jinja"
         return cfg, settings, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja")
 
+    @staticmethod
+    def _engine_pids(engine) -> list[int]:
+        """The PIDs of an engine's processes (a replica engine has one per card group), for per-process VRAM."""
+        engines = getattr(engine, "engines", None) or ([engine] if engine is not None else [])
+        out = []
+        for e in engines:
+            pid = getattr(getattr(e, "proc", None), "pid", None)
+            if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                out.append(pid)
+        return out
+
+    def gpu_process_mib(self) -> dict[int, int] | None:
+        """{pid: MiB} of the processes on the engine's card, from NVML, else `nvidia-smi`; None where that cannot be
+        read (AMD, macOS, or no driver tool).  Proves that an evicted engine's memory came back."""
+        index = int(getattr(self, "gpu_index", 0) or 0)
+        if getattr(self, "backend", None) == "hip":
+            return None
+        procs = nvml_process_mib(index)
+        return procs if procs is not None else nvidia_smi_process_mib(index)
+
+    @staticmethod
+    def _cfg_mib(cfg: dict, key: str) -> int | None:
+        v = cfg.get(key)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+            return None
+        return int(v)
+
+    def model_vram_need(self, target: dict, cfg: dict) -> tuple[int, str, str]:
+        """What the target model needs in VRAM, and how sure that is: (MiB, "config" | "measured" | "estimate",
+        the parts).  "vram_need_mib" in its run config is exact; a model that ran here before has the footprint it
+        was measured to take; otherwise its dense weights (the registry's GGUF figures, or "vram_dense_mib"), its
+        "vram_kv_mib", a cache floor and a reserve are added - a lower bound, since a model's KV at its context is
+        unknown to the registry."""
+        exact = self._cfg_mib(cfg, "vram_need_mib")
+        if exact:
+            return exact, "config", f"vram_need_mib={exact}"
+        key = config_key(target["config"])
+        seen = self._model_stat(key).get("vram_mib")
+        if seen:
+            return int(seen), "measured", f"measured last time={int(seen)}"
+        dense = self._cfg_mib(cfg, "vram_dense_mib")
+        if not dense:
+            gb = (target.get("vram_gb") or {}).get("least") if isinstance(target.get("vram_gb"), dict) else None
+            dense = int(float(gb) * 1e9 / 2 ** 20) if isinstance(gb, (int, float)) else 0
+        kv = self._cfg_mib(cfg, "vram_kv_mib") or 0
+        floor = self._cfg_mib(cfg, "vram_cache_floor_mib")
+        floor = VRAM_CACHE_FLOOR_MIB if floor is None else floor
+        reserve = self._cfg_mib(cfg, "vram_reserve_mib")
+        if reserve is None:
+            args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+            for i, a in enumerate(args[:-1]):
+                if a == "--vram-reserve-mib" and str(args[i + 1]).isdigit():
+                    reserve = int(args[i + 1])
+                    break
+        reserve = VRAM_SWITCH_RESERVE_MIB if reserve is None else reserve
+        need = dense + kv + floor + reserve
+        return need, "estimate", f"at least dense {dense} + kv {kv} + cache floor {floor} + reserve {reserve}"
+
+    def wait_for_release(self, pids, need_mib: int | None = None, free_before: int | None = None,
+                         expected_mib: int | None = None, deadline_s: float | None = None) -> bool:
+        """After an eviction, wait until the card shows the memory back: those PIDs gone (per-process usage) and, when
+        the free VRAM is readable, enough free for the next model (and `expected_mib` returned over `free_before`).
+        Short by design (release_wait_s, under 10 s).  True when it is proven, or when no reader can tell at all
+        (AMD/macOS: the old behaviour); False when a reader still shows the memory held at the deadline."""
+        pids = [p for p in (pids or []) if isinstance(p, int) and not isinstance(p, bool) and p > 0]
+        if not pids and need_mib is None and not expected_mib:
+            return True
+        deadline = time.monotonic() + (self.release_wait_s if deadline_s is None else deadline_s)
+        while True:
+            procs = self.gpu_process_mib() if pids else None
+            left = [p for p in pids if procs.get(p, 0) > 0] if procs is not None else []
+            free = self.free_vram_mib()
+            fits = free is None or ((need_mib is None or free >= need_mib) and
+                                    (not expected_mib or free_before is None or
+                                     free >= free_before + expected_mib - 256))
+            if not left and fits:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.2)
+
+    def _model_stat(self, key: str) -> dict:
+        return self.model_stats.setdefault(key, {"fails": 0, "cooldown_until": 0.0, "last_error": None,
+                                                 "vram_mib": None})
+
+    def _restore_in_background(self, engine, vision, key: str | None, name: str) -> None:
+        """A failed switch leaves the earlier model's process code, not its memory: start it again on a thread, so the
+        request that met the failure is answered at once (SwitchFailed) instead of waiting for a whole load.  The
+        next request would start it too; this keeps the server warm in between."""
+        if engine is None:
+            return
+
+        def restore():
+            if not self.fifo.acquire(timeout=60):
+                print(f"[strata] {name} is not loaded again yet: a request still runs", flush=True)
+                return
+            try:
+                if self.engine is not engine or (self.config_path and key and
+                                                 config_key(self.config_path) != key):
+                    return                          # another switch replaced it meanwhile
+                if getattr(engine, "alive", lambda: True)():
+                    return                          # a request already started it
+                for old in (vision, engine):
+                    if old is not None and hasattr(old, "restart") and not \
+                            (hasattr(old, "alive") and old.alive()):
+                        old.restart()
+                if key:
+                    stat = self._model_stat(key)
+                    stat["fails"], stat["cooldown_until"] = 0, 0.0
+                    self.last_good = key
+                print(f"[strata] {name} is loaded again", flush=True)
+            except Exception as e:  # noqa: BLE001 - the next request tries again and its error says why
+                print(f"[strata] {name} did not start again ({e}); the next request tries it", flush=True)
+            finally:
+                self.fifo.release()
+
+        threading.Thread(target=restore, name="restore-model", daemon=True).start()
+
+    def _encoders_back(self, vision, audio, name: str) -> None:
+        """An in-process switch that did not stick had already stopped the encoders. The decoder process is still
+        the previous model, so start those encoders again."""
+        for old in (vision, audio):
+            if old is None or not hasattr(old, "restart"):
+                continue
+            if hasattr(old, "alive") and old.alive():
+                continue
+            try:
+                old.restart()
+            except (OSError, RuntimeError) as err:
+                print(f"[strata] {name}'s encoder did not start again ({err})", flush=True)
+
+    def _poly_inplace(self, engine, cfg: dict) -> bool:
+        """True when both models are the same strata-poly binary, so it can load the next GGUF without exiting."""
+        if engine is None or not hasattr(engine, "switch_model"):
+            return False
+        spawn = getattr(engine, "spawn", None)
+        if not spawn or not spawn[0]:
+            return False
+        if Path(str(spawn[0])).stem.lower() not in ("strata-poly", "strata-glm"):
+            return False
+        if not poly_engine(cfg):
+            return False
+        try:
+            if os.path.realpath(spawn[0]) != os.path.realpath(engine_exe(cfg)):
+                return False
+            from serve import replicas as rp
+            if rp.gpu_groups(cfg):
+                return False
+        except (OSError, TypeError, KeyError, Exception):  # noqa: BLE001 - a replica config falls back to a new process
+            return False
+        args = list(cfg.get("args") or [])
+        return not any(any(c in str(a) for c in " \t\r\n") for a in args)
+
     def _switch_to(self, target: dict) -> None:
         """The switch, run by the gate (serve/model_gate.py) while no request runs.  One model is in memory at a time:
-        the one that is loaded is stopped first (its process ends, which gives back its VRAM, its pinned memory and its
-        file mappings), then the new one is started.  A model that does not start leaves the earlier one loaded
-        again (SwitchFailed says so).  #37: the new model runs with its own run config's settings (model_settings());
-        a config with a bad value is refused (ValueError) before anything is stopped."""
+        the new model's need is checked against the VRAM the old one will give back first (a model that cannot fit
+        leaves the old one running, 503 + Retry-After), then the old one is stopped and its release is confirmed
+        (process exit and the card's free VRAM), then the new one is started with its own "ready_timeout_s".  A model
+        that does not start gets a cooldown - every request for it is answered 503 until it ends, instead of retrying
+        the load - and the earlier model is started again on a background thread.  #37: the new model runs with its
+        own run config's settings (model_settings()); a config with a bad value is refused (ValueError) before
+        anything is stopped."""
         cfg, settings, tok, template = self.model_config(target)
+        key = config_key(target["config"])
+        stat = self._model_stat(key)
+        now = time.monotonic()
+        if stat["cooldown_until"] > now:
+            left = max(1, int(math.ceil(stat["cooldown_until"] - now)))
+            raise SwitchFailed(f"{target['id']} did not start {stat['fails']} time(s) in a row "
+                               f"({stat.get('last_error') or 'no reason was written down'}); it is not tried again "
+                               f"for {left} s", retry_after=left)
         if not self.fifo.acquire(timeout=self.switch_wait_s):
-            raise ModelBusy("a request is still running; switch when it has finished")
+            raise ModelBusy("a request is still running; switch when it has finished", retry_after=SWITCH_RETRY_AFTER_S)
         try:
             with self.status_lock:
                 if self.status.get("busy") or self.status.get("queued") or self.live_reqs:
-                    raise ModelBusy("a request is still running; switch when it has finished")
-            old_engine, old_vision, old_name = self.engine, self.vision, self.model
+                    raise ModelBusy("a request is still running; switch when it has finished",
+                                    retry_after=SWITCH_RETRY_AFTER_S)
+            old_engine, old_vision, old_audio, old_name = self.engine, self.vision, getattr(self, "audio", None), self.model
+            old_key = config_key(self.config_path) if self.config_path else None
             debug = self.memory_debug or settings["memory_debug"]
-            before = self.free_vram_mib() if debug else None
+            # 0.2: before anything is stopped, what the new model needs and what the card will then have
+            need, source, parts = self.model_vram_need(target, cfg)
+            # the audio encoder is its own process and holds about a gigabyte between clips: a switch back to the
+            # chat model must count it in, or the estimate sees less free VRAM than the switch will really have
+            pids = [*self._engine_pids(old_engine), *self._engine_pids(old_vision), *self._engine_pids(old_audio)]
+            free_now = self.free_vram_mib()
+            procs = self.gpu_process_mib() if pids else None
+            returned = sum(max(0, procs.get(p, 0)) for p in pids) if procs else 0
+            # an estimate is a lower bound: refuse on it only when a per-process reading shows what the eviction
+            # returns; without one (AMD, no driver tool) the old behaviour stays, as it does for the estimate alone
+            enforce = free_now is not None and (source != "estimate" or procs is not None)
+            if enforce and free_now is not None and free_now + returned < need:
+                print(f"[strata] not switching to {target['id']}: {parts} = {need} MiB, and only "
+                      f"{free_now + returned} MiB would be free after {old_name} stops", flush=True)
+                raise SwitchFailed(f"{target['id']} needs {need} MiB of VRAM ({parts}); only {free_now + returned} MiB "
+                                   f"would be free after {old_name} stops, so it was not unloaded - try again when "
+                                   "the GPU is less busy", retry_after=SWITCH_RETRY_AFTER_S)
+            if debug:
+                print(f"[strata] memory: {free_now} MiB free with {old_name}; {target['id']} needs {need} MiB "
+                      f"({source}: {parts}); after eviction {free_now + returned if free_now is not None else '?'} MiB",
+                      flush=True)
             print(f"[strata] switching the model: {old_name} -> {target['id']}", flush=True)
-            for old in (old_engine, old_vision):          # first: the two models do not fit in memory together
+            self.loading_name = target["id"]
+            self.set_phase("loading")                     # the GPU is loading a model, not idle: the bar says so
+            # strata-poly stays up and loads the next GGUF itself, so its parked chats stay in that process.
+            inplace = self._poly_inplace(old_engine, cfg)
+            for old in (() if inplace else (old_engine,)) + (old_vision, old_audio):
                 if old is not None and hasattr(old, "unload"):
                     old.unload()
-            freed = self.free_vram_mib() if debug else None
+            # 0.3: the processes that ended give their VRAM back before a load. An in-process switch frees the
+            # engine's own VRAM inside SWITCH, so its pid is not waited on.
+            need_wait = None if inplace else (need if enforce else None)
+            release_pids = ([*self._engine_pids(old_vision), *self._engine_pids(old_audio)] if inplace else pids)
+            if not self.wait_for_release(release_pids, need_wait, None if inplace else free_now,
+                                         None if inplace else (returned or None)):
+                print(f"[strata] {old_name} did not give its VRAM back in time; {target['id']} was not started",
+                      flush=True)
+                if inplace and getattr(old_engine, "alive", lambda: False)():
+                    self._encoders_back(old_vision, old_audio, old_name)
+                else:
+                    self._restore_in_background(old_engine, old_vision, old_key, old_name)
+                raise SwitchFailed(f"{target['id']} was not started: {old_name} did not release its VRAM in "
+                                   f"{self.release_wait_s:g} s; {old_name} is loaded again in the background",
+                                   retry_after=15)
+            free_before_start = self.free_vram_mib()
             try:
-                # start_model also returns the audio encoder. Stopping and starting it is model switching.
-                engine, vision, _audio, sampling_defaults, effort_end, groups = start_model(cfg, tok)
+                start_cfg = {**cfg, "ready_timeout_s": settings["ready_timeout_s"]}
+                # the keyword is only for the process that stays up; the test doubles of a fresh start
+                # take (cfg, tok) and must not see it
+                started = (start_model(start_cfg, tok, engine=old_engine) if inplace
+                           else start_model(start_cfg, tok))
+                engine, vision, audio, sampling_defaults, effort_end, groups = started
             except (Exception, SystemExit) as e:
-                print(f"[strata] {target['id']} did not start ({e}); starting {old_name} again ...", flush=True)
-                try:
-                    for old in (old_vision, old_engine):
-                        if old is not None and hasattr(old, "restart"):
-                            old.restart()
-                except Exception as again:
-                    raise SwitchFailed(f"{target['id']} did not start ({e}), and {old_name} did not start again "
-                                       f"({again}): no model is loaded") from None
-                raise SwitchFailed(f"{target['id']} did not start ({e}); {old_name} is loaded again") from None
-            for old in (old_engine, old_vision):          # the processes have ended; this closes their logs
+                stat["fails"] = int(stat.get("fails") or 0) + 1
+                stat["last_error"] = str(e)
+                stat["cooldown_until"] = time.monotonic() + float(self.switch_fail_cooldown_s)
+                restore = (f"{old_name} is loaded again in the background" if old_engine is not None
+                           else "no model is loaded")
+                print(f"[strata] {target['id']} did not start ({e}); {restore}", flush=True)
+                self.set_phase("completed")
+                if inplace and getattr(old_engine, "alive", lambda: False)():
+                    self._encoders_back(old_vision, old_audio, old_name)
+                else:
+                    self._restore_in_background(old_engine, old_vision, old_key, old_name)
+                raise SwitchFailed(f"{target['id']} did not start ({e}); {restore}", retry_after=int(
+                    math.ceil(self.switch_fail_cooldown_s))) from None
+            for old in (old_engine, old_vision, old_audio):   # ended processes; an in-process engine stays
+                if inplace and old is old_engine:
+                    continue
                 if old is not None and hasattr(old, "close"):
                     try:
                         old.close()
                     except (OSError, RuntimeError):
                         pass
             self.engine, self.tok, self.template, self.vision = engine, tok, template, vision
+            self.audio = audio
             self.model = cfg.get("model_name", target["id"])
             self.sampling_defaults = dict(sampling_defaults or {})
             self.effort_end = bool(effort_end)
@@ -3594,9 +4009,18 @@ class Service:
                 self.rate.clear()
                 self.last_timings = None
             self.last_request_at = time.time()
+            # what this model actually took, for the next switch's preflight; and it is the one to come back to
+            free_after = self.free_vram_mib()
+            if free_before_start is not None and free_after is not None:
+                used = max(0, free_before_start - free_after)
+                if used >= 64:
+                    stat["vram_mib"] = used
+            stat.update(fails=0, cooldown_until=0.0, last_error=None, last_ok_at=time.time())
+            self.last_good = key
+            self.set_phase("queued")                      # the request that asked for this model runs next
             if debug:
-                print(f"[strata] memory: {before} MiB of VRAM free with {old_name}, {freed} MiB after it stopped, "
-                      f"{self.free_vram_mib()} MiB with {self.model}", flush=True)
+                print(f"[strata] memory: {free_now} MiB of VRAM free with {old_name}, "
+                      f"{free_before_start} MiB after it stopped, {free_after} MiB with {self.model}", flush=True)
             print(f"[strata] the model is now {self.model} (context {engine.max_context} tokens)", flush=True)
         finally:
             self.fifo.release()
@@ -3772,6 +4196,10 @@ class Service:
             if key == "aliases":
                 self.set_aliases(value)
             else:
+                if key == "idle_unload_s" and value != getattr(self, "idle_unload_s", None):
+                    print(f"[strata] idle unload: {getattr(self, 'model', '?')} "
+                          + (f"unloads after {float(value):g} s without requests" if value else "never unloads"),
+                          flush=True)
                 setattr(self, key, value)
 
     def read_shared(self, config_path) -> None:
@@ -4090,15 +4518,24 @@ class Service:
         try:
             if not self.engine.alive():
                 return "not loaded"
+            stale = idle_for is not None and time.time() - getattr(self, "last_activity_at", 0) >= idle_for
             with self.status_lock:
-                if self.status.get("busy") or self.status.get("queued"):
+                if (self.status.get("busy") or self.status.get("queued")) and not stale:
                     return "busy"
+            if stale and (self.status.get("busy") or self.status.get("queued")):
+                print(f"[strata] idle unload: no token or event for {idle_for:.0f} s while a request is marked "
+                      "running; unloading the model", flush=True)
             if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
                 return "busy"
+            pids = [*self._engine_pids(self.engine), *self._engine_pids(self.vision)]
+            free_before = self.free_vram_mib() if pids else None
             self.engine.unload()
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
+            if not self.wait_for_release(pids, None, free_before):
+                print("[strata] the model's VRAM had not come back yet when the unload answered", flush=True)
+            self.set_phase("completed")
             print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
@@ -4124,6 +4561,8 @@ class Service:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
                     print(f"[strata] idle unload: {e}", flush=True)
+                except Exception as e:                  # never let one bad turn end the only idle watchdog
+                    print(f"[strata] idle unload failed ({e}); the watchdog keeps running", flush=True)
         self.idle_thread = threading.Thread(target=loop, daemon=True)
         self.idle_thread.start()
 
@@ -4363,6 +4802,8 @@ class Service:
         return {
             "service": "strata", "model": self.model,
             "loaded": self.loaded(), "auto_load": hasattr(self.engine, "restart"),
+            # Phase 0 residence: the model to come back to after a failed switch (None before the first one)
+            "last_good": self.last_good,
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
@@ -4860,9 +5301,14 @@ class Service:
         now = time.time()
         rows_done = rows_total = prompt_read = prompt_total = generated = max_tokens = None
         progress, detail = None, ""
+        if not self.loaded() and phase in ("encode", "prefill", "generate", "engine"):
+            phase = "completed"               # the last request's phase must not outlive the weights
         if phase == "completed" and s.get("queued"):
             phase = "queued"                  # a request is waiting (the model is loading or another one runs)
-        labels = {"queued": "Queued", "encode": "Encoding audio",
+        # Card-wide GPU percent is not the engine: the desktop composite uses the same GPU, and a loaded
+        # idle model still sits in VRAM. A finished request stays completed.
+        labels = {"queued": "Queued", "loading": "Loading the model", "engine": "Engine working",
+                  "encode": "Encoding audio",
                   "prefill": "Prefill (after audio)" if self.prefill_audio else "Prefill",
                   "generate": "Generating", "completed": "Completed", "error": "Error"}
         label = labels.get(phase, "Idle")
@@ -4899,6 +5345,12 @@ class Service:
             detail = ("loading the model" if not self.loaded()
                       else "waiting for the audio turn" if getattr(self, "audio", None) is not None
                       else "waiting for its turn")
+        if phase == "loading":
+            detail = self.loading_name or "the model is loading"
+        elif phase == "engine":
+            util = ((self.telemetry.snapshot().get("now") or {}).get("gpu_util") or 0) \
+                if getattr(self, "telemetry", None) is not None else 0
+            detail = f"GPU {util}% · cache or expert loading" if util else "cache or expert loading"
         return {"phase": phase, "progress": round(progress, 4) if progress is not None else None,
                 "progress_label": label, "progress_detail": detail,
                 "phase_started": int(started) if started else None,
@@ -4908,11 +5360,16 @@ class Service:
                 "generated": generated, "max_tokens": max_tokens}
 
     def _note(self, n, evs, st=None, rate=None):
+        self.last_activity_at = time.time()
         with self.status_lock:
             s = self.status if st is None else st
             s["generated"] = n
             if s.get("first_token") is None:
                 s["first_token"] = time.time()
+                self.phase, self.phase_at = "generate", time.time()
+                rec = getattr(self.request_trace, "record", None)
+                if rec is not None:
+                    rec["phase"] = "generate"
             (self.rate if rate is None else rate).append((time.time(), n))   # the live rate's window (RATE_WINDOW_S)
             for ev in evs:
                 if ev.kind == "reasoning":
@@ -5268,6 +5725,8 @@ class Service:
                             self.status.update(st)
                         self.last_request_at = time.time()
                         rate.clear()                    # the previous request's samples must not leak into this one
+                    if not par:
+                        self.set_phase("prefill", audio_prefill=False)   # one request at a time: reading its prompt
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
@@ -6639,13 +7098,20 @@ def make_handler(svc: Service):
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except ModelBusy as e:
-                self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
+                ra = getattr(e, "retry_after", None)
+                if ra:                                      # admission is full now, not a permanent refusal
+                    self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                               headers={"Retry-After": int(ra)})
+                else:
+                    self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                           "message": str(e)}})
             except SwitchFailed as e:                        # #38: the model the request named did not start
-                self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
-                           else {"error": {"type": "server_error", "message": str(e)}})
+                ra = getattr(e, "retry_after", None)
+                body = responses_error_body(str(e), "server_error") if path == "/v1/responses" \
+                    else {"error": {"type": "server_error", "message": str(e)}}
+                self._json(503, body, headers={"Retry-After": int(ra)} if ra else None)
             except (GpuBusy, EngineStarting) as e:
                 ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}},
@@ -6683,7 +7149,12 @@ def make_handler(svc: Service):
                         record["wallclock_s"] = round(time.perf_counter() - record["_clock"], 3)
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
+                        record["phase"] = record["state"] if record["state"] in ("error", "completed") else "completed"
+                    svc.set_phase(record["phase"])
                     svc.request_trace.record = None
+                elif svc.phase in ("encode", "prefill", "generate"):
+                    # the monitor record exists only with api_monitor; the bar must still leave the request's phase
+                    svc.set_phase("completed")
 
         def _audio(self, path):
             """POST /v1/audio/transcriptions and /v1/audio/translations: OpenAI's multipart form, the clip through the
@@ -6969,11 +7440,15 @@ def make_handler(svc: Service):
                 self._json(404, {"error": {"message": f"no model named {name!r}",
                                            "models": [e["id"] for e in svc.models()]}})
             except ModelBusy as e:
-                self._json(409, {"error": {"type": "busy", "message": str(e)}})
+                ra = getattr(e, "retry_after", None)
+                self._json(503 if ra else 409, {"error": {"type": "server_error" if ra else "busy", "message": str(e)}},
+                           headers={"Retry-After": int(ra)} if ra else None)
             except ValueError as e:
                 self._json(422, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except (SwitchFailed, GpuBusy, EngineStuck, RuntimeError, OSError) as e:
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                ra = getattr(e, "retry_after", None)
+                self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                           headers={"Retry-After": int(ra)} if ra else None)
 
         def _own_page(self, what) -> bool:
             """Only JSON (a form or a "simple" cross-site request can't send it without a CORS preflight, which this
@@ -7023,6 +7498,12 @@ def make_handler(svc: Service):
             if changed:
                 print(f"[strata] the Settings view changed {', '.join(changed)} in {Path(svc.config_path).name} "
                       f"(the earlier file: {bak.name}); used from the next start", flush=True)
+                if "idle_unload_s" in changed:           # #564: this one takes effect now, not at the next start
+                    idle = float(new.get("idle_unload_s") or 0)
+                    svc.apply_settings({"idle_unload_s": idle})
+                    svc.start_idle_unload()
+                    print(f"[strata] idle unload: the model {'unloads' if idle else 'never unloads'} "
+                          + (f"after {idle:g} s without requests" if idle else "by itself"), flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path), "changed": changed})
         def _foreign_origin(self) -> bool:
             """A web page of another origin sent this.  The Origin must be this server's own address (host and port),
@@ -7949,6 +8430,8 @@ def model_settings(cfg: dict, overrides: dict | None = None) -> dict:
         "reasoning_loop_recovery": loops,
         "idle_unload_s": over["idle_unload_s"] if "idle_unload_s" in over else
         number("idle_unload_s", float, "a number of seconds"),
+        # a switch waits this long for this model's READY (0: no limit); the global ENGINE_READY_S otherwise
+        "ready_timeout_s": number("ready_timeout_s", float, "a number of seconds") or SWITCH_READY_S,
         "min_free_vram_mib": over["min_free_vram_mib"] if "min_free_vram_mib" in over else
         number("min_free_vram_mib", int, "a whole number of MiB"),
         "before_load": over.get("before_load") or cfg.get("before_load") or None,
@@ -7978,11 +8461,25 @@ def engine_exe(cfg: dict) -> str:
     return cfg["exe"] if os.path.isabs(cfg["exe"]) else os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
 
 
-def start_model(cfg: dict, tok, lazy: bool = False):
+def model_ready_timeout(cfg: dict) -> float | None:
+    """How long a model's start waits for READY: its "ready_timeout_s", else the global ENGINE_READY_S.  A value <= 0
+    waits for ever (math.inf, so a restart keeps meaning the same)."""
+    v = cfg.get("ready_timeout_s")
+    if v is None:
+        return ENGINE_READY_S
+    try:
+        s = float(v)
+    except (TypeError, ValueError):
+        return ENGINE_READY_S
+    return math.inf if s <= 0 else s
+
+
+def start_model(cfg: dict, tok, lazy: bool = False, *, engine=None):
     """A run config's engine, started (with `lazy`: left for the first request to start), its vision encoder and its
     audio encoder: (engine, vision, audio, sampling defaults, the engine's arguments for an effort at the end or None,
     and the replica card groups).  SystemExit for
     a config that cannot be used, RuntimeError for an engine that does not start."""
+    ready_s = model_ready_timeout(cfg)
     vision = None
     audio = None
     env = child_env(cfg)
@@ -7990,30 +8487,40 @@ def start_model(cfg: dict, tok, lazy: bool = False):
     if sampling_defaults:
         pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
         print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
-    if cfg.get("vision"):
-        # relative paths are the config's cwd's, as for the engine below
-        vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                    if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                for k, v in cfg["vision"].items()}
-        if vcfg.get("elastic") is True and vcfg.get("gpu") and cfg.get("vram_elastic") is not True:
-            print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                  "encoder its VRAM): the encoder starts with the model instead", flush=True)
-            vcfg["elastic"] = False
-        print("the vision encoder starts with the first picture (elastic) ..." if Vision.elastic_of(vcfg) else
-              "loading the vision encoder ..." if not lazy else
-              "vision encoder unloaded; it starts with the model ...", flush=True)
-        vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                        env=vision_env(cfg, env), lazy=lazy)
-    if cfg.get("audio"):
-        # relative paths are the config's cwd's, as for the engine above; it runs on the CPU and takes no VRAM
-        acfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                    if k in ("exe", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
-                for k, v in cfg["audio"].items()}
-        print("the audio encoder starts with the first clip (CPU) ...", flush=True)
-        audio = Audio(acfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                      env=dict(env), lazy=True)
-    print("model unloaded; the first request loads it ..." if lazy else
-          "loading the model (the first start takes a minute or two) ...", flush=True)
+    kept = engine
+
+    def start_encoders() -> None:
+        nonlocal vision, audio
+        if cfg.get("vision"):
+            # relative paths are the config's cwd's, as for the engine below
+            vcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                        if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                    for k, v in cfg["vision"].items()}
+            if vcfg.get("elastic") is True and vcfg.get("gpu") and cfg.get("vram_elastic") is not True:
+                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
+                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
+                vcfg["elastic"] = False
+            print("the vision encoder starts with the first picture (elastic) ..." if Vision.elastic_of(vcfg) else
+                  "loading the vision encoder ..." if not lazy else
+                  "vision encoder unloaded; it starts with the model ...", flush=True)
+            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                            env=vision_env(cfg, env), lazy=lazy)
+        if cfg.get("audio"):
+            # relative paths are the config's cwd's, as for the engine above; it runs on the CPU and takes no VRAM
+            acfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                        if k in ("exe", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                    for k, v in cfg["audio"].items()}
+            print("the audio encoder starts with the first clip (CPU) ...", flush=True)
+            audio = Audio(acfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                          env=dict(env), lazy=True)
+
+    if kept is None:
+        start_encoders()
+    if engine is None:
+        print("model unloaded; the first request loads it ..." if lazy else
+              "loading the model (the first start takes a minute or two) ...", flush=True)
+    else:
+        print("[strata] the running engine loads the next model in this process", flush=True)
     warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
     if layer_split_of(cfg):
         try:
@@ -8038,11 +8545,19 @@ def start_model(cfg: dict, tok, lazy: bool = False):
         groups = rp.gpu_groups(cfg)
     except rp.ReplicaConfigError as e:
         raise SystemExit(f"[strata] config {e}")
-    if groups:
-        engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
+    if kept is not None:
+        engine.switch_model(engine_args(cfg) + (effort_end or []), ready_s)
+        try:
+            start_encoders()
+        except (OSError, RuntimeError) as e:
+            # SWITCH already replaced the weights. The decoder is the new model; say the encoder failed and go on.
+            print(f"[strata] the model switched, but an encoder did not start ({e})", flush=True)
+            vision, audio = None, None
+    elif groups:
+        engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, ready_s)
     else:
         engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
-                              env=env, lazy=lazy)
+                              env=env, lazy=lazy, ready_s=ready_s)
     engine.silence_s = silence                      # an attribute of its own: restart() keeps it
     warn_tight_ram(engine.info.get("arena_mib"))
     note = desktop_vram_note(cfg.get("backend"), engine.info.get("vram_free_mib"), engine.spawn[1],
@@ -8050,7 +8565,8 @@ def start_model(cfg: dict, tok, lazy: bool = False):
     if note:                                        # #560 #516: before --open starts a browser on that card
         print(note, flush=True)
     return engine, vision, audio, sampling_defaults, effort_end, groups
-def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool):
+def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool,
+                   ready_s: float | None = None):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
     from serve import replicas as rp
@@ -8066,7 +8582,7 @@ def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: lis
         rc = rp.replica_cfg(cfg, i, groups[i])
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                      env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None)
+                                      env=child_env(rc), lazy=lazy, cpus=cpus[i] if cpus else None, ready_s=ready_s)
         except BaseException as e:        # noqa: BLE001
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
@@ -8169,7 +8685,7 @@ def shutdown(svc: Service, httpd, hub=None) -> None:
             close()
         except KeyboardInterrupt:                       # a second Ctrl+C: don't wait for the engine to free its memory
             if getattr(engine, "proc", None):
-                engine.proc.kill()
+                signal_group(engine.proc, signal.SIGKILL)
     try:
         from serve import cache_drop
         cache_drop.drop_after_exit(engine)               # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
@@ -8353,6 +8869,7 @@ def main() -> int:
     svc.backend = cfg.get("backend")                    # "hip": the AMD cards' readings come from sysfs (#301)
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+        svc.last_good = config_key(a.config)            # the model a failed switch comes back to
         svc.models_root = Path(a.config).resolve().parent   # the other models' configs are beside this one
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.read_shared(a.config)

@@ -19,8 +19,12 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -184,6 +188,51 @@ public:
         s.seq = std::move(seq);
         s.prompt = len(s);
         s.stamp = ++clock_;
+    }
+
+    /// Keep every parked conversation in this process, under `signature`, and drop the one that is still only on
+    /// the device. The engine may then be destroyed. unshelve() of the same signature puts them back. A model
+    /// switch uses this so the chats survive the weights being freed, without a file.
+    void shelve(uint64_t signature) {
+        if (o_.park_mib > 0 && o_.park_slots > 0) park(slots_.size());
+        // Rows past the last checkpoint live only in the engine. park() copies up to that checkpoint when it can.
+        if (saved(cur()) < len(cur())) slots_[cur_] = Slot{};
+        Shelf shelf;
+        shelf.state_bytes = e_.state_bytes();
+        shelf.row_bytes = e_.row_bytes();
+        for (Slot& s : slots_)
+            if (!s.seq.empty()) shelf.slots.push_back(std::move(s));
+        const size_t n = shelf.slots.size();
+        slots_.assign(slots_.size(), Slot{});
+        cur_ = 0;
+        due_.clear();
+        after_.clear();
+        turn_ = -1;
+        auto& box = shelves();
+        if (n == 0) box.erase(signature);
+        else box[signature] = std::move(shelf);
+    }
+
+    /// Put back what shelve() kept for `signature`, when a checkpoint and a row are the same size. The engine is
+    /// reset: the next resume() chooses among the parked conversations. Nothing kept: 0.
+    size_t unshelve(uint64_t signature) {
+        auto& box = shelves();
+        auto it = box.find(signature);
+        if (it == box.end()) return 0;
+        Shelf shelf = std::move(it->second);
+        box.erase(it);
+        if (shelf.state_bytes != e_.state_bytes() || shelf.row_bytes != e_.row_bytes()) return 0;
+        const size_t n = shelf.slots.size();
+        e_.reset();
+        slots_.assign(std::max(slots_.size(), n + 1), Slot{});
+        for (size_t k = 0; k < n; ++k) slots_[k + 1] = std::move(shelf.slots[k]);
+        cur_ = 0;
+        clock_ = 0;
+        for (const Slot& s : slots_) clock_ = std::max(clock_, s.stamp);
+        due_.clear();
+        after_.clear();
+        turn_ = -1;
+        return n;
     }
 
     /// Between requests: what the parked conversations hold leaves the process.  On the laptop four parked
@@ -430,6 +479,17 @@ private:
     std::vector<Checkpoint> due_;   // inside()'s checkpoints, until read() makes them the conversation's
     std::vector<int64_t> after_;    // where the conversation's checkpoints are once that read is done
     int64_t turn_ = -1;             // turn_at()'s place in the prompt being read; -1: none
+
+    /// Host copies kept across an Engine being destroyed and another opened, in this process.
+    struct Shelf {
+        std::vector<Slot> slots;
+        size_t state_bytes = 0;
+        size_t row_bytes = 0;
+    };
+    static std::unordered_map<uint64_t, Shelf>& shelves() {
+        static std::unordered_map<uint64_t, Shelf> box;
+        return box;
+    }
 };
 
 }  // namespace strata::poly

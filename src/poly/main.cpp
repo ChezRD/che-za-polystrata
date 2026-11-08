@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <mutex>
@@ -324,6 +325,7 @@ struct CacheFlags {
     CacheOptions o;
     long long min_free_mib = 2560;   // parking leaves this much physical RAM free
     bool park_auto = false;          // --conversation-cache-mib auto: park_mib from the RAM free once loaded
+    uint64_t signature = 0;          // the model, context and KV format: the in-process shelf is told apart by it
 };
 
 struct Session {
@@ -542,7 +544,8 @@ struct Session {
 
 // GEN <max_new> [key=value ...] <id,id,...>, or GENI/GENA with the file of the prompt's pictures/audio ahead of
 // the ids and the key image_pad/audio_pad, the token whose runs in the ids are their places.  turn_at is the place
-// where the prompt's last turn begins (the server knows the template's turn tokens): a checkpoint goes there.
+// in the ids where the prompt's last turn begins (the server knows the template's turn tokens): a checkpoint goes
+// there.
 bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t& pad, int64_t& turn_at,
                std::string& pictures, std::vector<int32_t>& ids) {
     const bool geni = line.rfind("GENI ", 0) == 0;
@@ -602,10 +605,39 @@ struct Slot {
     Clock::time_point t0;
 };
 
-int serve(Session& ss) {
+struct Cmd {
+    Options o;
+    CacheFlags cache;
+    Sampling s;
+    bool want_serve = false;
+    long long max_new = 32;
+    int top_probs = 0, lookup = 3, image_pad = -1, check = 0;
+    std::string images;
+    std::vector<int32_t> ids, eos, follow;
+    std::string error;
+};
+
+bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching);
+
+struct SwapWord {
+    int code = 0;   ///< 0: this process just started. 1: SWITCH loaded this model. 2: SWITCH failed; this is the one before.
+    std::string why;
+};
+
+constexpr int kSwitch = 3;
+
+int serve(Session& ss, Cmd* next, const SwapWord& word) {
     Engine& engine = ss.engine;
     std::vector<Slot> slots((size_t) engine.sequences() - 1);
     engine.trim();
+    if (word.code == 1) {
+        std::printf("SWITCHED 1\n");
+    } else if (word.code == 2) {
+        std::string why = word.why;
+        for (char& ch : why)
+            if (ch == '\n' || ch == '\r') ch = ' ';
+        std::printf("SWITCHED 2 %s\n", why.c_str());
+    }
     std::printf("INFO context=%d expert_slots=%d expert_cache_mib=%lld pool_workers=%d conversation_cache_mib=%lld "
                 "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_free_mib=%lld vram_elastic=1 "
                 "batch_slots=%d engine=" STRATA_VERSION "\n",
@@ -805,6 +837,39 @@ int serve(Session& ss) {
             std::printf("SERR invalid 0 strata-poly keeps no disk sessions\n");
             std::fflush(stdout);
             continue;
+        }
+        // SWITCH <args>: drop this model's weights and load another in this same process. Parked conversations
+        // stay in memory, keyed by the model. The server sends the arguments it would have put after --serve.
+        // SWITCHED 0: refused, this model stays. After a return the process opens the next file and serve() says
+        // SWITCHED 1, or SWITCHED 2 and the previous model when that open fails.
+        if (line.rfind("SWITCH", 0) == 0 && (line.size() == 6 || line[6] == ' ')) {
+            if (writing()) {
+                std::printf("SWITCHED 0 batch slots are writing\n");
+                std::fflush(stdout);
+                continue;
+            }
+            std::string rest = line.size() > 7 ? line.substr(7) : std::string();
+            while (!rest.empty() &&
+                   (rest.back() == ' ' || rest.back() == '\t' || rest.back() == '\r' || rest.back() == '\n'))
+                rest.pop_back();
+            std::vector<std::string> tok;
+            for (size_t i = 0; i < rest.size();) {
+                while (i < rest.size() && rest[i] == ' ') ++i;
+                if (i >= rest.size()) break;
+                const size_t j = rest.find(' ', i);
+                tok.push_back(rest.substr(i, j == std::string::npos ? std::string::npos : j - i));
+                if (j == std::string::npos) break;
+                i = j + 1;
+            }
+            Cmd n;
+            if (!parse_args(tok, n, true)) {
+                std::printf("SWITCHED 0 %s\n", n.error.empty() ? "the arguments were not accepted" : n.error.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            ss.kept.shelve(ss.flags.signature);
+            if (next) *next = std::move(n);
+            return kSwitch;
         }
         if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0 && line.rfind("GENA ", 0) != 0) {
             std::printf("ERR expected: GEN <max_new> <id,id,...>, GENI <max_new> image_pad=<id> <file> <id,id,...> or "
@@ -1129,7 +1194,8 @@ void usage() {
                  "                         (default 2048, 0 = none)\n"
                  "  --conversation-cache-mib N   RAM for parked conversations, so that several can take turns\n"
                  "                         without being read again (default 0 = off; auto: 40%% of the RAM free\n"
-                 "                         once loaded, above the floor below, at most 8192)\n"
+                 "                         once loaded, above the floor below, at most 8192;\n"
+                 "                         deepseek2/gigachat_audio accepts only 0)\n"
                  "  --conversation-cache-slots N        parked conversations at most (default 4)\n"
                  "  --conversation-cache-min-tokens N   a conversation shorter than this is not parked (default 1024)\n"
                  "  --conversation-cache-min-free-mib N park only while this much physical RAM stays free (default\n"
@@ -1163,38 +1229,31 @@ void usage() {
                  "                         bit for bit; with guesses on, add --window 1 for a repeat everywhere\n");
 }
 
-}  // namespace
-
-// Windows holds the threads of a process it takes for background work to the efficiency cores (power throttling):
-// on a laptop with both kinds an answer after a long prompt came at 39 tokens/s where 58.  serve/winjob.py takes the
-// engines the server starts out of it; this does the same for an engine anything else starts.
-void no_power_throttling() {
-#ifdef _WIN32
-    for (const ULONG speed_and_timer : {0x1ul | 0x4ul, 0x1ul}) {   // Windows 10 knows the first bit only
-        PROCESS_POWER_THROTTLING_STATE off{PROCESS_POWER_THROTTLING_CURRENT_VERSION, speed_and_timer, 0};
-        if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &off, sizeof(off))) return;
-    }
-#endif
-}
-
-int main(int argc, char** argv) {
-    no_power_throttling();
-    Options o;
-    CacheFlags cache;
-    Sampling s;
-    bool want_serve = false;
-    long long max_new = 32;
-    int top_probs = 0, lookup = 3, image_pad = -1, check = 0;
-    std::string images;
-    std::vector<int32_t> ids, eos, follow;
-    for (int i = 1; i < argc; ++i) {
-        const std::string a = argv[i];
+bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching) {
+    Options& o = c.o;
+    CacheFlags& cache = c.cache;
+    Sampling& s = c.s;
+    bool& want_serve = c.want_serve;
+    long long& max_new = c.max_new;
+    int& top_probs = c.top_probs;
+    int& lookup = c.lookup;
+    int& image_pad = c.image_pad;
+    int& check = c.check;
+    std::string& images = c.images;
+    std::vector<int32_t>& ids = c.ids;
+    std::vector<int32_t>& eos = c.eos;
+    std::vector<int32_t>& follow = c.follow;
+    bool bad = false;
+    for (size_t i = 0; i < av.size(); ++i) {
+        const std::string a = av[i];
         auto val = [&]() -> const char* {
-            if (i + 1 >= argc) {
-                std::fprintf(stderr, "strata-poly: %s needs a value\n", a.c_str());
-                std::exit(2);
+            if (i + 1 >= av.size()) {
+                c.error = a + " needs a value";
+                std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                bad = true;
+                return "";
             }
-            return argv[++i];
+            return av[++i].c_str();
         };
         if (a == "--model") o.model = val();
         else if (a == "--serve") want_serve = true;
@@ -1203,9 +1262,11 @@ int main(int argc, char** argv) {
         else if (a == "--no-metal-optimize") o.metal_optimize = false;
         else if (a == "--metal-memory") {
             const std::string policy = val();
+            if (bad) return false;
             if (policy != "legacy" && policy != "balanced") {
-                std::fprintf(stderr, "strata-poly: --metal-memory requires legacy or balanced\n");
-                return 2;
+                c.error = "--metal-memory requires legacy or balanced";
+                std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
             }
             o.metal_balanced = policy == "balanced";
         }
@@ -1223,14 +1284,15 @@ int main(int argc, char** argv) {
         else if (a == "--kv-whole") o.kv_grow = false;
         else if (a == "--kv") {
             const std::string fmt = val();
+            if (bad) return false;
             if (fmt == "fp16") o.kv_format = KvFmt::kFp16;
             else if (fmt == "q8_0") o.kv_format = KvFmt::kQ8_0;
             else if (fmt == "int8") o.kv_format = KvFmt::kInt8;
             else if (fmt == "int8k") o.kv_format = KvFmt::kInt8K;
             else {
-                std::fprintf(stderr, "strata-poly: --kv %s: unknown format (use fp16, q8_0, int8 or int8k)\n",
-                             fmt.c_str());
-                std::exit(2);
+                c.error = "--kv " + fmt + ": unknown format (use fp16, q8_0, int8 or int8k)";
+                std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
             }
         }
         else if (a == "--window") o.window = std::atoi(val());
@@ -1257,6 +1319,8 @@ int main(int argc, char** argv) {
             const std::string v = val();
             cache.park_auto = v == "auto";
             cache.o.park_mib = cache.park_auto ? 0 : std::atoll(v.c_str());
+            o.conversation_cache_auto = cache.park_auto;
+            o.conversation_cache_mib = cache.o.park_mib;
         }
         else if (a == "--conversation-cache-slots") cache.o.park_slots = std::atoi(val());
         else if (a == "--conversation-cache-min-tokens") cache.o.park_min = std::atoll(val());
@@ -1272,24 +1336,30 @@ int main(int argc, char** argv) {
         else if (a == "--min-p") s.min_p = std::strtof(val(), nullptr);
         else if (a == "--seed") s.seed = std::strtoull(val(), nullptr, 10);
         else if (a == "--tokens" || a == "--eos-ids" || a == "--follow") {
-            if (!parse_ids(val(), a == "--tokens" ? ids : a == "--eos-ids" ? eos : follow)) {
-                std::fprintf(stderr, "strata-poly: %s takes token ids separated by commas\n", a.c_str());
-                return 2;
+            const char* v = val();
+            if (bad) return false;
+            if (!parse_ids(v, a == "--tokens" ? ids : a == "--eos-ids" ? eos : follow)) {
+                c.error = a + " takes token ids separated by commas";
+                std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
             }
         } else {
-            if (a != "--help" && a != "-h") std::fprintf(stderr, "strata-poly: unknown option %s\n", a.c_str());
-            usage();
-            return 2;
+            c.error = (a == "--help" || a == "-h") ? "help" : "unknown option " + a;
+            if (a != "--help" && a != "-h") std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+            if (!switching) usage();
+            return false;
         }
+        if (bad) return false;
     }
-    if (o.model.empty() || (!want_serve && ids.empty()) || max_new < 1) {
-        usage();
-        return 2;
+    if (o.model.empty() || max_new < 1 || (!switching && !want_serve && ids.empty())) {
+        if (!switching) usage();
+        c.error = o.model.empty() ? "--model is required" : "the arguments were not accepted";
+        return false;
     }
     if (o.batch < 0 || o.batch > 8 || check < 0 || check > o.batch || (check > 0 && (int) ids.size() <= check)) {
-        std::fprintf(stderr, "strata-poly: --batch takes 0 to 8, and --check-batch at most --batch prompts, each "
-                             "with tokens left of --tokens\n");
-        return 2;
+        c.error = "--batch takes 0 to 8, and --check-batch at most --batch prompts, each with tokens left of --tokens";
+        std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+        return false;
     }
     // --check-batch: K sequences growing together would take VRAM from the expert cache that the single runs had,
     // and an expert moved to the CPU rounds differently (issue 55).  Their attention rows get VRAM at load instead.
@@ -1300,14 +1370,73 @@ int main(int argc, char** argv) {
     if (cache.o.checkpoints < 0 || cache.o.every < 0 || cache.o.park_mib < 0 || cache.o.park_mib > most ||
         cache.o.park_slots < 0 || cache.o.park_slots > 1024 || cache.o.park_min < 0 || cache.min_free_mib < 0 ||
         cache.min_free_mib > most) {
-        std::fprintf(stderr, "strata-poly: a cache option is negative or too large\n");
-        return 2;
+        c.error = "a cache option is negative or too large";
+        std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+        return false;
     }
+    return true;
+}
 
+
+}  // namespace
+
+// Windows holds the threads of a process it takes for background work to the efficiency cores (power throttling):
+// on a laptop with both kinds an answer after a long prompt came at 39 tokens/s where 58.  serve/winjob.py takes the
+// engines the server starts out of it; this does the same for an engine anything else starts.
+void no_power_throttling() {
+#ifdef _WIN32
+    for (const ULONG speed_and_timer : {0x1ul | 0x4ul, 0x1ul}) {   // Windows 10 knows the first bit only
+        PROCESS_POWER_THROTTLING_STATE off{PROCESS_POWER_THROTTLING_CURRENT_VERSION, speed_and_timer, 0};
+        if (SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &off, sizeof(off))) return;
+    }
+#endif
+}
+
+// A name for what a saved conversation cache belongs to: the model file as the process sees it, and the shape of
+// what the cache holds.  A file saved with another model, another context, another KV format or another build of the
+// same model is refused rather than read into a cache whose rows are not the same size.  n_layer comes from the
+// model's block_count: Engine keeps its own count private, and row_bytes()/state_bytes() change with it anyway.
+uint64_t cache_signature(const Options& o, const Engine& e) {
+    uint64_t h = 1469598103934665603ull;   // FNV-1a
+    const auto mix = [&h](const void* p, size_t n) {
+        const uint8_t* b = (const uint8_t*) p;
+        for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    };
+    const auto number = [&mix](uint64_t v) { mix(&v, sizeof v); };
+    std::error_code ec;
+    std::filesystem::path model = std::filesystem::weakly_canonical(std::filesystem::path(o.model), ec);
+    if (ec) model = o.model;
+    const std::string name = model.string();
+    mix(name.data(), name.size());
+    const uintmax_t size = std::filesystem::file_size(model, ec);
+    number(ec ? UINT64_MAX : (uint64_t) size);
+    const auto mtime = std::filesystem::last_write_time(model, ec);
+    number(ec ? UINT64_MAX : (uint64_t) mtime.time_since_epoch().count());
+    number((uint64_t) (int) o.kv_format);
+    number((uint64_t) o.max_context);
+    number((uint64_t) e.meta_u("block_count", 0));
+    number((uint64_t) e.n_embd());
+    number((uint64_t) e.row_bytes());
+    number((uint64_t) e.state_bytes());
+    return h;
+}
+
+int main(int argc, char** argv) {
+    no_power_throttling();
+    std::vector<std::string> av;
+    for (int i = 1; i < argc; ++i) av.emplace_back(argv[i]);
+    Cmd cmd;
+    if (!parse_args(av, cmd, false)) return 2;
+
+    SwapWord word;
+    Cmd prev = cmd;
+    bool recovering = false;
+    for (;;) {
     std::unique_ptr<Engine> loaded;
     try {
         const Clock::time_point t0 = Clock::now();
-        loaded = Engine::open(o);
+        loaded = Engine::open(cmd.o);
+        recovering = false;
         Engine& engine = *loaded;
         std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU threads\n",
                      ms_since(t0) / 1000.0, engine.cached_experts(), engine.total_experts(), engine.cached_gib(),
@@ -1316,19 +1445,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata-poly: %lld MiB of RAM for the %.1f GiB of experts outside VRAM; the others "
                                  "come from the file cache when a token needs them (--ram-experts-mib, -1 for all)\n",
                          (long long) engine.ram_experts_mib(), engine.outside_gib());
-        if (o.cache_bias > 0)
+        if (cmd.o.cache_bias > 0)
             std::fprintf(stderr, "strata-poly: cache bias %.2f: a token that comes a few at a time routes with %.2f "
                                  "added to the score of each expert in VRAM; the weights stay the router's own\n",
-                         o.cache_bias, o.cache_bias);
-        if (o.skip_weight > 0)
+                         cmd.o.cache_bias, cmd.o.cache_bias);
+        if (cmd.o.skip_weight > 0)
             std::fprintf(stderr, "strata-poly: skip weight %.3f: an expert outside VRAM that every token of a window "
                                  "weighs under %.1f%% of its experts' weight is left out (in place of --tail-skip)\n",
-                         o.skip_weight, 100.0 * o.skip_weight);
-        else if (o.tail_skip > 0)
+                         cmd.o.skip_weight, 100.0 * cmd.o.skip_weight);
+        else if (cmd.o.tail_skip > 0)
             std::fprintf(stderr, "strata-poly: tail skip %d: an expert outside VRAM that every token of a window ranks "
                                  "at place %d or later among its experts is left out; STRATA_ROUTE_TAIL_SKIP=0 turns "
                                  "it off\n",
-                         o.tail_skip, o.tail_skip + 1);
+                         cmd.o.tail_skip, cmd.o.tail_skip + 1);
         // Pages on another node than the threads are read at about two thirds of the speed.  The file cache puts a
         // page on the node of whatever read it first, so a file read back by something else lands on any.
         const bool far = engine.numa_share() > 0.0 && engine.numa_share() < 0.95;
@@ -1339,52 +1468,83 @@ int main(int argc, char** argv) {
         else if (far)
             std::fprintf(stderr, "strata-poly: the experts' pages are on several NUMA nodes, %.0f%% on the fullest; "
                                  "the CPU reads the ones far from it more slowly\n", 100.0 * engine.numa_share());
-        if (eos.empty())
+        if (cmd.eos.empty())
             for (const char* key : {"tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id",
                                     "tokenizer.ggml.eom_token_id"}) {
                 const int64_t id = engine.meta_u(key, -1);
-                if (id >= 0 && std::find(eos.begin(), eos.end(), (int32_t) id) == eos.end()) eos.push_back((int32_t) id);
+                if (id >= 0 && std::find(cmd.eos.begin(), cmd.eos.end(), (int32_t) id) == cmd.eos.end())
+                    cmd.eos.push_back((int32_t) id);
             }
         // A fixed 8 GiB on a PC whose RAM the model's file already fills pushed that file out of the file cache.
         // Sized as Strata's engine sizes it (#3493); admit() still keeps min_free_mib free at every park.
-        if (cache.park_auto && want_serve && cache.o.checkpoints > 0 && cache.o.park_slots > 0) {
-            cache.o.park_mib = strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(),
-                                                                        cache.min_free_mib);
-            if (cache.o.park_mib > 0)
+        if (cmd.cache.park_auto && cmd.want_serve && cmd.cache.o.checkpoints > 0 && cmd.cache.o.park_slots > 0) {
+            cmd.cache.o.park_mib = strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(),
+                                                                            cmd.cache.min_free_mib);
+            cmd.o.conversation_cache_mib = cmd.cache.o.park_mib;
+            if (cmd.cache.o.park_mib > 0)
                 std::fprintf(stderr, "strata-poly: conversation cache sized from the free RAM: %lld MiB for up to %d "
                                      "parked conversations (--conversation-cache-mib N sets it, 0 turns it off)\n",
-                             (long long) cache.o.park_mib, cache.o.park_slots);
+                             (long long) cmd.cache.o.park_mib, cmd.cache.o.park_slots);
             else
                 std::fprintf(stderr, "strata-poly: conversation cache off: not enough free RAM to park conversations "
                                      "(--conversation-cache-mib N asks for one anyway)\n");
         }
-        Session ss(engine, eos, cache, lookup);
+        // The shelf is this model's, this context's and this KV format's.
+        cmd.cache.signature = cache_signature(cmd.o, engine);
         int rc = 0;
-        if (want_serve) {
-            rc = serve(ss);
-        } else if ((long long) ids.size() + max_new > engine.max_context()) {
-            throw std::runtime_error("the prompt and --max-new together exceed --max-context");
-        } else if (check > 0) {
-            rc = check_batch(engine, ids, check, max_new);
-        } else {
-            Pictures pictures;
-            if (!images.empty()) {
-                if (!engine.sees()) throw std::runtime_error("this model does not read pictures");
-                if (image_pad < 0) throw std::runtime_error("--images needs --image-pad");
-                const std::string wrong = take_pictures(images, image_pad, engine.n_embd(), ids, pictures);
-                if (!wrong.empty()) throw std::runtime_error(wrong);
+        Cmd next;
+        {
+            Session ss(engine, cmd.eos, cmd.cache, cmd.lookup);
+            const size_t back = ss.kept.unshelve(cmd.cache.signature);
+            if (back)
+                std::fprintf(stderr, "strata-poly: conversation cache: %zu conversation(s) kept in this process\n", back);
+            if (cmd.want_serve) {
+                rc = serve(ss, &next, word);
+            } else if ((long long) cmd.ids.size() + cmd.max_new > engine.max_context()) {
+                throw std::runtime_error("the prompt and --max-new together exceed --max-context");
+            } else if (cmd.check > 0) {
+                rc = check_batch(engine, cmd.ids, cmd.check, cmd.max_new);
+            } else {
+                Pictures pictures;
+                if (!cmd.images.empty()) {
+                    if (!engine.sees()) throw std::runtime_error("this model does not read pictures");
+                    if (cmd.image_pad < 0) throw std::runtime_error("--images needs --image-pad");
+                    const std::string wrong = take_pictures(cmd.images, cmd.image_pad, engine.n_embd(), cmd.ids, pictures);
+                    if (!wrong.empty()) throw std::runtime_error(wrong);
+                }
+                if (!cmd.follow.empty()) ss.follow = &cmd.follow;
+                rc = once(ss, cmd.ids, pictures, cmd.image_pad, cmd.max_new, cmd.s, cmd.top_probs);
             }
-            if (!follow.empty()) ss.follow = &follow;
-            rc = once(ss, ids, pictures, image_pad, max_new, s, top_probs);
         }
-        engine.save_profile();
+        if (rc == kSwitch) {
+            loaded->save_profile();
+            prev = cmd;
+            cmd = std::move(next);
+            cmd.want_serve = true;
+            word.code = 1;
+            word.why.clear();
+            recovering = true;
+            loaded.reset();
+            continue;
+        }
+        loaded->save_profile();
         return rc;
     } catch (const std::exception& e) {
+        if (recovering) {
+            std::fprintf(stderr, "strata-poly: switch failed: %s\n", e.what());
+            cmd = prev;
+            recovering = false;
+            word.code = 2;
+            word.why = e.what();
+            loaded.reset();
+            continue;
+        }
         std::fprintf(stderr, "strata-poly: %s\n", e.what());
-        if (want_serve) {
+        if (cmd.want_serve) {
             std::printf("ERR %s\n", e.what());
             std::fflush(stdout);
         }
         return 1;
+    }
     }
 }

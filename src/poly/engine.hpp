@@ -103,6 +103,10 @@ struct Options {
 #else
     KvFmt kv_format = KvFmt::kFp16;   ///< the K and V caches' format; fp16 by default (byte-identical path)
 #endif
+    /// --conversation-cache-mib, copied so open() can refuse parking for an architecture that has none.
+    /// 0: off. conversation_cache_auto: the flag was "auto".
+    int64_t conversation_cache_mib = 0;
+    bool conversation_cache_auto = false;
     int window = 0;               ///< the most tokens window() takes: the known one and guesses after it; 1: none;
                                   ///< 0: 8, or 4 where every guess keeps a copy of the recurrent state
     bool draft = true;            ///< run the block that guesses ahead, when there is one and window is above 1

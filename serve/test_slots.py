@@ -146,7 +146,7 @@ class Slots(unittest.TestCase):
         self.assertFalse(Path(self.dir.name, "x.bin").exists())
 
     def test_strata_poly_is_never_sent_a_session_command(self):
-        # issue 114: strata-poly keeps no disk sessions, and its answer to SAVE made the server end it
+        # issue 114: strata-poly keeps no disk sessions. The cache stays in the process across a model switch.
         spawn = self.engine.spawn
         self.engine.spawn = ("/opt/polystrata/engine-poly/strata-poly",) + spawn[1:]
         try:
@@ -457,6 +457,67 @@ class Slots(unittest.TestCase):
         self.svc.fifo.release()
         t.join(10)
         self.assertEqual(out["r"][0], 200)
+
+
+class _SwitchPipe:
+    def __init__(self, lines: queue.Queue, replies: list[str]):
+        self.lines = lines
+        self.replies = replies
+        self.sent: list[str] = []
+        self.stdin = self
+
+    def poll(self):
+        return None
+
+    def write(self, s):
+        self.sent.append(s)
+        for line in self.replies:
+            self.lines.put(line)
+
+    def flush(self):
+        pass
+
+
+class InProcessSwitch(unittest.TestCase):
+    def engine(self, replies: list[str]) -> StrataEngine:
+        e = StrataEngine.__new__(StrataEngine)
+        e.lines = queue.Queue()
+        e.proc = _SwitchPipe(e.lines, replies)
+        e.spawn = ("/opt/strata-poly", ["--model", "/models/tiel.gguf"], None)
+        e.model_path = "/models/tiel.gguf"
+        e.info = {"context": 8192, "batch_slots": 0}
+        e.gen = 3
+        e.max_context = 8192
+        e.can_stop = True
+        e.ended = False
+        e.unloaded = False
+        return e
+
+    def test_a_failed_switch_keeps_the_running_models_arguments(self):
+        e = self.engine([
+            "SWITCHED 2 cannot open that file\n",
+            "INFO context=8192 batch_slots=0 engine=test\n",
+            "READY 8192 stop\n",
+        ])
+        with self.assertRaisesRegex(RuntimeError, "cannot open that file"):
+            e.switch_model(["--model", "/models/missing.gguf"], 5)
+        self.assertEqual(e.model_path, "/models/tiel.gguf")
+        self.assertEqual(e.spawn[1], ["--model", "/models/tiel.gguf"])
+        self.assertEqual(e.gen, 3)
+        self.assertEqual(e.max_context, 8192)
+        self.assertTrue(e.proc.sent[0].startswith("SWITCH --model /models/missing.gguf\n"))
+
+    def test_a_switch_in_this_process_adopts_the_new_model(self):
+        e = self.engine([
+            "SWITCHED 1\n",
+            "INFO context=4096 batch_slots=0 engine=test\n",
+            "READY 4096 stop\n",
+        ])
+        e.switch_model(["--model", "/models/beta.gguf"], 5)
+        self.assertEqual(e.model_path, "/models/beta.gguf")
+        self.assertEqual(e.spawn[1], ["--model", "/models/beta.gguf"])
+        self.assertEqual(e.gen, 4)
+        self.assertEqual(e.max_context, 4096)
 
 
 if __name__ == "__main__":

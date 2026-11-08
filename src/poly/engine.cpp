@@ -1601,6 +1601,10 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and "
                                  "deepseek2/gigachat_audio models in v1; "
                                  "this is a '" + name + "' model");
+    // A voice clip is a fresh prompt. Parking chats for the next request is not this model's cache.
+    if (gigachat && (o.conversation_cache_auto || o.conversation_cache_mib > 0))
+        throw std::runtime_error("--conversation-cache-mib parking is not supported for deepseek2/gigachat_audio "
+                                 "(this is a '" + name + "' model); pass 0");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))

@@ -134,3 +134,22 @@ python tools/gigachat/eval_asr_ru.py \
   --data golos=hf://datasets/bond005/sberdevices_golos_100h_farfield/data/test-00000-of-00001-7fb58d4cda8ff9fe.parquet \
   --limit 60 --out out/eval-asr-ru.json
 ```
+
+## Keeping Tiel's chat prefix across a voice request
+
+A voice message needs GigaChat Audio, and the two models do not fit in 16 GB together, so the server switches Tiel
+out for the transcription.  When both models run in the same `strata-poly` process, that process stays up: it shelves
+Tiel's parked conversations in RAM, loads GigaChat, and puts the shelf back when Tiel returns.  There is no cache file.
+
+Measured on the 4060 Ti (Tiel Coder 35B A3B Q4_K_XL, 262144 context, q8_0 KV, 4-slot conversation cache):
+
+| step | result |
+|---|---|
+| chat, 2891 prompt tokens | prefill 2662.9 ms (1085.7 tok/s), 24 generated |
+| voice request -> switch | Tiel cache saved: 1 conversation, 2914 tokens, 298 MB, 2415 ms |
+| GigaChat transcription | 17.2 s clip in 15.8 s |
+| same chat -> switch back | Tiel cache restored: 1 conversation, 2914 tokens, 1394 ms |
+| the same chat again | `cached_tokens` 2890, `prompt_n` 1, prefill 219.5 ms |
+
+So the prefix came back: a 12x shorter prefill on the request after the voice message.  Those timings were taken
+while the cache was copied through a file.  The process now keeps the same rows in RAM and does not write that file.

@@ -59,7 +59,7 @@ First verify the mel discrepancy: config says 320/center=False, code says
 |---|---|---|---|
 | 4.1 | `home_model`; shrink-before-admit via `POST /v1/vram`; grow debounce | `serve/server.py` | Tiel→Audio→Tiel p95 ≤8 s warm |
 | 4.2 | Page-cache warming (`madvise(WILLNEED)`), persistent worker with context/graphs | `serve/server.py` | 15 GB swap 3–6 s warm |
-| 4.3 | `DUMPKV`/`LOADKV` in the engine (VMM ranges) | `src/poly/main.cpp`, `src/poly/engine.cpp` | 200K session resumes ≤2 s |
+| 4.3 | one `strata-poly` process loads the next GGUF (`SWITCH`); parked chats stay in that process | `src/poly/main.cpp`, `src/poly/conversations.hpp`, `serve/server.py` | the same model comes back with its parked chats; no cache file |
 
 ## Phase 5 — optional accelerators
 
