@@ -182,9 +182,11 @@
     <div class="about" id="requests-off" hidden>
       <div class="st-card">
         <span class="card-title">The API monitor is off</span>
-        <p class="muted">It keeps the last 100 requests' prompts and answers in memory, so it is off by default. To turn it
+        <p class="muted">It keeps recent requests' prompts and answers in memory, so it is off by default. To turn it
           on, add <code>"api_monitor": true</code> to the model's config file (<code>strata-&lt;model&gt;.json</code>) or
-          start the server with <code>--api-monitor</code>, then restart it.</p>
+          start the server with <code>--api-monitor</code>, then restart it. Retention is bounded by
+          <code>api_monitor_max_requests</code> (default 100), <code>api_monitor_max_chars</code> (262144) and
+          <code>api_monitor_max_bytes</code> (64 MiB; 0 = no cap).</p>
       </div>
     </div>
   </section>

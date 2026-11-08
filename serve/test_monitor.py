@@ -1,4 +1,6 @@
 """Request inspection through HTTP; no native model or GPU is required."""
+import contextlib
+import io
 import json
 import threading
 import time
@@ -10,7 +12,8 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.server import ByteTokenizer, EngineDied, MockEngine, Service, serve
+from serve.server import (API_MONITOR_DEFAULTS, ByteTokenizer, EngineDied, MockEngine, Service, api_monitor_settings,
+                          serve)
 
 
 class ReloadableEngine(MockEngine):
@@ -285,6 +288,209 @@ class ConversationCacheCard(unittest.TestCase):
         for el in ("cc-card", "cc-slots-text", "cc-mem-text", "cc-facts", "cc-note"):
             self.assertIn(f'id="{el}"', html)
             self.assertIn(f'"{el}"', js)
+
+
+class Retention(unittest.TestCase):
+    """The monitor's bounds: how many requests, how many characters of each field, and about how many bytes in all."""
+
+    def service(self, **limits):
+        tok = ByteTokenizer()
+        svc = Service(ReloadableEngine(tok, "Hello.", max_context=16384), tok,
+                      ChatTemplate(Path(__file__).parent / "chat_template.jinja"))
+        svc.api_monitor = True
+        for key, value in limits.items():
+            setattr(svc, f"api_monitor_{key}", value)
+        svc.api_requests = __import__("collections").deque(maxlen=svc.api_monitor_max_requests)
+        svc.api_requests_bytes = 0
+        return svc
+
+    def test_the_deque_follows_max_requests(self):
+        svc = self.service(max_requests=3)
+        for i in range(5):
+            record = svc.begin_request("/v1/chat/completions", {"messages": [{"role": "user", "content": str(i)}]})
+            with svc.status_lock:
+                svc.api_requests[-1]["state"] = "completed"
+        self.assertEqual(len(svc.api_requests), 3)
+        self.assertNotIn(record, list(svc.api_requests)[:2])
+        self.assertIs(svc.api_requests[-1], record)
+        # a new limit at runtime: the deque takes it, keeping the newest records
+        svc.api_monitor_max_requests = 2
+        svc.begin_request("/v1/chat/completions", {"messages": [{"role": "user", "content": "x"}]})
+        self.assertEqual(len(svc.api_requests), 2)
+        self.assertEqual(svc.api_requests.maxlen, 2)
+
+    def test_input_is_truncated_to_max_chars(self):
+        svc = self.service(max_chars=128)
+        record = svc.begin_request("/v1/chat/completions",
+                                   {"messages": [{"role": "user", "content": "x" * 5000}]})
+        self.assertEqual(len(record["input"]), 128)
+        self.assertTrue(record["input_truncated"])
+
+    def test_the_byte_cap_evicts_the_oldest_and_keeps_the_newest(self):
+        svc = self.service(max_requests=10, max_chars=2000, max_bytes=4096, keep_reasoning=False)
+        first = svc.begin_request("/v1/chat/completions", {"messages": [{"role": "user", "content": "a" * 2000}]})
+        second = svc.begin_request("/v1/chat/completions", {"messages": [{"role": "user", "content": "b" * 2000}]})
+        self.assertNotIn(first, list(svc.api_requests))
+        self.assertIs(svc.api_requests[-1], second)
+        self.assertLessEqual(svc.api_requests_bytes, svc.api_monitor_max_bytes)
+        # one record over the cap alone is trimmed instead of thrown away
+        svc.api_monitor_max_bytes = 1024
+        third = svc.begin_request("/v1/chat/completions", {"messages": [{"role": "user", "content": "c" * 5000}]})
+        self.assertIs(svc.api_requests[-1], third)
+        self.assertLessEqual(svc.api_requests_bytes, 1024)
+        self.assertLessEqual(len(third["input"]), 1024)
+        self.assertTrue(third["input_truncated"])
+
+    def test_append_counts_only_the_bytes_that_stay(self):
+        svc = self.service(max_chars=4, max_bytes=0)
+        record = svc.begin_request("/v1/chat/completions", {"messages": [{"role": "user", "content": "go"}]})
+        with svc.status_lock:
+            for piece in ("я", "я", "я", "a", "a", "a"):
+                svc._append_text(record, "output", piece, svc.api_monitor_max_chars)
+        self.assertEqual(record["output"], "яяяa")
+        self.assertTrue(record["output_truncated"])
+        self.assertEqual(svc.api_requests_bytes, sum(svc._record_bytes(r) for r in svc.api_requests))
+
+    def test_trim_cuts_utf8_bytes_on_a_character_boundary(self):
+        record = {"input": "я" * 100, "output": "", "reasoning": "", "response": ""}
+        Service._trim_record(record, 400)
+        self.assertEqual(record["input"], "я" * 72)
+        self.assertEqual(Service._record_bytes(record), 400)
+        self.assertTrue(record["input_truncated"])
+        mid = {"input": "я" * 10}
+        Service._trim_record(mid, 269)
+        self.assertEqual(mid["input"], "я" * 6)
+        self.assertLessEqual(Service._record_bytes(mid), 269)
+
+    def test_streamed_mixed_width_text_matches_the_byte_counter(self):
+        svc = self.service(max_chars=4, max_bytes=0)
+        svc.engine.script = svc.tok.encode("яяя" + "a" * 30)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            body = json.dumps({"messages": [{"role": "user", "content": "go"}], "max_tokens": 80,
+                               "stream": True, "reasoning_effort": "none"}).encode()
+            req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                self.assertEqual(r.status, 200)
+                r.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        record = svc.api_requests[-1]
+        self.assertEqual(record["output"], "яяяa")
+        self.assertTrue(record["output_truncated"])
+        self.assertEqual(svc.api_requests_bytes, sum(svc._record_bytes(rec) for rec in svc.api_requests))
+
+    def test_reasoning_can_be_left_out(self):
+        svc = self.service(keep_reasoning=False)
+        self.assertIs(svc.api_monitor_keep_reasoning, False)
+        self.assertEqual(svc.api_monitor_limits()["keep_reasoning"], False)
+        svc.engine.script = svc.tok.encode("Thought.</think>\nHello.")   # the thinking comes, the answer follows
+        # the HTTP path: a reply with thinking, kept as the output alone
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            body = json.dumps({"messages": [{"role": "user", "content": "Say hello."}], "max_tokens": 64,
+                               "reasoning_effort": "low"}).encode()
+            req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                r.read()
+            with urllib.request.urlopen(base + "/api/requests", timeout=10) as r:
+                listed = json.load(r)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        record = svc.request_records(listed["requests"][0]["id"])
+        self.assertEqual(record["reasoning"], "")
+        self.assertFalse(record["reasoning_truncated"])
+        self.assertIn("Hello.", record["output"])
+        self.assertEqual(listed["retention"], svc.api_monitor_max_requests)
+        self.assertEqual(listed["limits"], svc.api_monitor_limits())
+
+    def test_output_is_truncated_to_max_chars(self):
+        svc = self.service(max_chars=512)
+        svc.engine.script = svc.tok.encode("y" * 4000)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            body = json.dumps({"messages": [{"role": "user", "content": "go"}], "max_tokens": 4000}).encode()
+            req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                r.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        record = svc.request_records(svc.api_requests[-1]["id"])
+        self.assertLessEqual(len(record["output"]), 512)
+        self.assertLessEqual(len(record["response"]), 512)
+        self.assertTrue(record["output_truncated"] or record["response_truncated"])
+
+    def test_health_reports_the_limits(self):
+        svc = self.service(max_requests=7, max_chars=2048, max_bytes=0, keep_reasoning=False)
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        try:
+            with urllib.request.urlopen(base + "/health", timeout=10) as r:
+                health = json.load(r)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertTrue(health["api_monitor"])
+        self.assertEqual(health["limits"], {"max_requests": 7, "max_chars": 2048, "max_bytes": 0,
+                                            "keep_reasoning": False})
+
+
+class Config(unittest.TestCase):
+    def settings(self, cfg, forced=False):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            enabled, limits = api_monitor_settings(cfg, forced)
+        return enabled, limits, out.getvalue()
+
+    def test_off_and_the_old_true(self):
+        self.assertEqual(self.settings({})[:2], (False, API_MONITOR_DEFAULTS))
+        self.assertEqual(self.settings({"api_monitor": False})[:2], (False, API_MONITOR_DEFAULTS))
+        self.assertTrue(self.settings({"api_monitor": True})[0])
+        self.assertTrue(self.settings({}, forced=True)[0])
+
+    def test_the_object_form(self):
+        enabled, limits, _ = self.settings({"api_monitor": {"max_requests": 50, "max_chars": 65536,
+                                                            "max_bytes": 33554432, "keep_reasoning": False}})
+        self.assertTrue(enabled)
+        self.assertEqual(limits, {"max_requests": 50, "max_chars": 65536, "max_bytes": 33554432,
+                                  "keep_reasoning": False})
+
+    def test_object_keys_win_over_flat_keys(self):
+        _, limits, _ = self.settings({"api_monitor": {"max_chars": 4096}, "api_monitor_max_chars": 8192,
+                                      "api_monitor_max_requests": 9})
+        self.assertEqual((limits["max_chars"], limits["max_requests"]), (4096, 9))
+
+    def test_flat_keys_alone(self):
+        enabled, limits, _ = self.settings({"api_monitor": True, "api_monitor_max_requests": 5,
+                                            "api_monitor_max_bytes": 0})
+        self.assertTrue(enabled)
+        self.assertEqual((limits["max_requests"], limits["max_bytes"]), (5, 0))
+
+    def test_clamps_and_warnings(self):
+        _, limits, out = self.settings({"api_monitor": {"max_requests": 5000, "max_chars": 10,
+                                                        "max_bytes": 1 << 40, "keep_reasoning": "no"}})
+        self.assertEqual((limits["max_requests"], limits["max_chars"], limits["max_bytes"], limits["keep_reasoning"]),
+                         (1000, 1024, 1 << 30, True))
+        self.assertIn("out of range", out)
+        self.assertIn("expected true or false", out)
+        _, limits, out = self.settings({"api_monitor": {"max_requests": "many"}})
+        self.assertEqual(limits["max_requests"], 100)
+        self.assertIn("expected a whole number", out)
+
+    def test_an_invalid_form_says_so(self):
+        enabled, limits, out = self.settings({"api_monitor": "yes"})
+        self.assertFalse(enabled)
+        self.assertEqual(limits, API_MONITOR_DEFAULTS)
+        self.assertIn("expected true, false or an object", out)
 
 
 if __name__ == "__main__":

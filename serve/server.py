@@ -3480,10 +3480,17 @@ class Service:
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
         self.live_reqs: dict[int, tuple[dict, collections.deque]] = {}
-        # #332: the API request monitor (/api-monitor) keeps the last 100 requests' prompts and answers in memory,
-        # so it is off unless the config's "api_monitor" (or --api-monitor) turns it on
+        # #332: the API request monitor (/api-monitor) keeps the last requests' prompts and answers in memory, so it
+        # is off unless the config's "api_monitor" (or --api-monitor) turns it on.  What it may hold is bounded:
+        # this many requests, this many characters in each prompt/answer/reasoning field, and about this many bytes
+        # of all of them (0: no byte cap).  main() reads the values from the config.
         self.api_monitor = False
-        self.api_requests = collections.deque(maxlen=100)  # bounded I/O in memory; no headers or API keys
+        self.api_monitor_max_requests = 100
+        self.api_monitor_max_chars = 262144
+        self.api_monitor_max_bytes = 64 << 20
+        self.api_monitor_keep_reasoning = True
+        self.api_requests = collections.deque(maxlen=self.api_monitor_max_requests)
+        self.api_requests_bytes = 0                      # approximate: the kept strings' UTF-8 bytes + a fixed cost
         self.request_trace = threading.local()
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
@@ -4656,21 +4663,122 @@ class Service:
             reading = self.status.get("busy") and self.status.get("first_token") is None
         return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
 
+    def api_monitor_limits(self) -> dict:
+        """The monitor's retention, as GET /api/requests and GET /health report it."""
+        return {"max_requests": self.api_monitor_max_requests, "max_chars": self.api_monitor_max_chars,
+                "max_bytes": self.api_monitor_max_bytes, "keep_reasoning": self.api_monitor_keep_reasoning}
+
+    @staticmethod
+    def _record_bytes(record: dict) -> int:
+        """Approximate memory of one kept request: its strings as UTF-8 bytes plus a fixed cost for the rest."""
+        total = 256
+        for key in ("input", "output", "reasoning", "response"):
+            value = record.get(key)
+            if isinstance(value, str):
+                total += len(value.encode("utf-8", "replace"))
+        return total
+
+    def _enforce_api_bytes(self, keep=None) -> None:
+        """The deque's approximate size back under api_monitor_max_bytes: records not being written go oldest first;
+        `keep` (the request writing now) is never evicted - if it alone is over the cap its fields are truncated
+        instead.  The caller holds self.status_lock."""
+        cap = self.api_monitor_max_bytes
+        if not cap:
+            return
+        while self.api_requests_bytes > cap:
+            victim = next((r for r in self.api_requests if r is not keep), None)
+            if victim is None:
+                break
+            self.api_requests.remove(victim)
+            self.api_requests_bytes -= self._record_bytes(victim)
+        target = keep if keep is not None and keep in self.api_requests else \
+            (self.api_requests[-1] if self.api_requests else None)
+        if target is not None and self.api_requests_bytes > cap:
+            self.api_requests_bytes -= self._record_bytes(target)
+            self._trim_record(target, cap)
+            self.api_requests_bytes += self._record_bytes(target)
+
+    def _store_text(self, record: dict, name: str, text: str) -> None:
+        """Replace one counted string. The byte total moves by the UTF-8 size of the text now stored minus the size
+        of the text it replaces. The caller holds self.status_lock."""
+        old = record.get(name)
+        before = len(old.encode("utf-8", "replace")) if isinstance(old, str) else 0
+        record[name] = text
+        self.api_requests_bytes += len(text.encode("utf-8", "replace")) - before
+
+    def _append_text(self, record: dict, name: str, extra: str, limit: int) -> None:
+        """Append `extra` to a counted field, keeping at most `limit` characters. Only the characters that stay are
+        added to the byte total: a chunk that arrives after the field is full changes nothing. The caller holds
+        self.status_lock."""
+        if not extra:
+            return
+        current = record.get(name)
+        if not isinstance(current, str):
+            current = ""
+        room = limit - len(current)
+        if room <= 0:
+            record[name + "_truncated"] = True
+            return
+        if len(extra) > room:
+            extra = extra[:room]
+            record[name + "_truncated"] = True
+        record[name] = current + extra
+        self.api_requests_bytes += len(extra.encode("utf-8", "replace"))
+
+    @staticmethod
+    def _utf8_head(text: str, nbytes: int) -> str:
+        """The longest prefix of `text` whose UTF-8 encoding is at most `nbytes` bytes."""
+        if nbytes <= 0 or not text:
+            return ""
+        raw = text.encode("utf-8", "replace")
+        if len(raw) <= nbytes:
+            return text
+        cut = nbytes
+        while cut > 0 and raw[cut] & 0xC0 == 0x80:
+            cut -= 1
+        return raw[:cut].decode("utf-8", "replace")
+
+    @staticmethod
+    def _trim_record(record: dict, cap: int) -> None:
+        """One record made to fit `cap` bytes by shortening its longest field, marked truncated. The cut is in
+        UTF-8 bytes and stops on a character boundary."""
+        fields = [k for k in ("input", "output", "reasoning", "response")
+                  if isinstance(record.get(k), str) and record[k]]
+        while Service._record_bytes(record) > cap and fields:
+            name = max(fields, key=lambda k: len(record[k].encode("utf-8", "replace")))
+            raw_len = len(record[name].encode("utf-8", "replace"))
+            keep = raw_len - (Service._record_bytes(record) - cap)
+            shortened = Service._utf8_head(record[name], keep)
+            if len(shortened.encode("utf-8", "replace")) >= raw_len:
+                shortened = ""
+            record[name] = shortened
+            record[name + "_truncated"] = True
+            if not shortened:
+                fields.remove(name)
+
     def begin_request(self, path, req):
         """#332: a monitor record for this request, or None when the monitor is off (nothing is kept then)."""
         if not self.api_monitor:
             return None
+        limit = self.api_monitor_max_chars
         raw = json.dumps(req, ensure_ascii=False, indent=2)
         record = {"id": uuid.uuid4().hex[:12], "path": path, "model": req.get("model") or self.model,
                   "started_at": time.time(), "state": "queued", "stream": bool(req.get("stream")),
                   "response_format": (req.get("response_format") or {}).get("type")
                   if isinstance(req.get("response_format"), dict) else None,
-                  "input": raw[:262144], "input_truncated": len(raw) > 262144,
+                  "input": raw[:limit], "input_truncated": len(raw) > limit,
                   "output": "", "reasoning": "", "output_truncated": False, "reasoning_truncated": False,
-                  "queue_s": 0.0, "load_s": 0.0, "first_token_s": None,
+                  "queue_s": 0.0, "load_s": 0.0, "first_token_s": None, "phase": "queued",
                   "_clock": time.perf_counter()}
         with self.status_lock:
+            if self.api_requests.maxlen != self.api_monitor_max_requests:     # the config changed /api/requests
+                self.api_requests = collections.deque(self.api_requests, maxlen=self.api_monitor_max_requests)
+                self.api_requests_bytes = sum(self._record_bytes(r) for r in self.api_requests)
+            while self.api_requests.maxlen and len(self.api_requests) >= self.api_requests.maxlen:
+                self.api_requests_bytes -= self._record_bytes(self.api_requests.popleft())
             self.api_requests.append(record)
+            self.api_requests_bytes += self._record_bytes(record)
+            self._enforce_api_bytes(record)
         self.request_trace.record = record
         return record
 
@@ -4780,7 +4888,7 @@ class Service:
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
-        return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
+        text = "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
         return text + prometheus_api.audio_metrics(self.audio_status())
 
@@ -5086,9 +5194,6 @@ class Service:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             mark, before, around = self.image_marks
-
-            def one(text):
-                return self.tok.encode(text, parse_special=True)[0]
 
             pad, start = one(mark), one(before) if before else None
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
@@ -6754,10 +6859,14 @@ def make_handler(svc: Service):
                 with svc.status_lock:
                     self.record["http_status"] = code
                     raw = json.dumps(obj, ensure_ascii=False, indent=2)
-                    self.record.update(response=raw[:262144], response_truncated=len(raw) > 262144)
+                    limit = svc.api_monitor_max_chars
+                    kept = raw[:limit]
+                    svc._store_text(self.record, "response", kept)
+                    self.record["response_truncated"] = len(raw) > limit
                     for key in ("error", "usage", "timings"):
                         if key in obj:
                             self.record[key] = obj[key]
+                    svc._enforce_api_bytes(self.record)
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -6774,8 +6883,11 @@ def make_handler(svc: Service):
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
-                    limit = 262144
-                    self.record.update(response=text[:limit], response_truncated=len(text) > limit)
+                    limit = svc.api_monitor_max_chars
+                    kept = text[:limit]
+                    svc._store_text(self.record, "response", kept)
+                    self.record["response_truncated"] = len(text) > limit
+                    svc._enforce_api_bytes(self.record)
             self.send_response(code)
             self.send_header("Content-Type", content_type)
             self._cors()
@@ -6858,8 +6970,12 @@ def make_handler(svc: Service):
                     records = svc.request_records(request_id)
                     self._json(404 if records is None else 200,
                                {"error": {"message": "request no longer retained"}} if records is None else
-                               records if request_id else {"requests": records, "retention": 100, "persistent": False,
-                                                          "loaded": svc.loaded(), "auto_load": hasattr(svc.engine, "restart")})
+                               records if request_id else {"requests": records,
+                                                          "retention": svc.api_monitor_max_requests,
+                                                          "limits": svc.api_monitor_limits(),
+                                                          "persistent": False,
+                                                          "loaded": svc.loaded(),
+                                                          "auto_load": hasattr(svc.engine, "restart")})
                 return
             if path == "/settings":
                 if self._authorized():
@@ -6885,6 +7001,7 @@ def make_handler(svc: Service):
                 self._json(200, {"status": "ok", "max_context": svc.reported_ctx(), "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key),
                                  "image_generation": svc.images is not None, "api_monitor": svc.api_monitor,
+                                 "limits": svc.api_monitor_limits(),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/files/"):
                 # response_format url: the name (32 random hex digits) is the access, as an OpenAI image URL is
@@ -7581,15 +7698,17 @@ def make_handler(svc: Service):
                             content, reasoning = delta.get("text", ""), delta.get("thinking", "")
                             usage, timings = event.get("usage"), None
                         with svc.status_lock:
+                            limit = svc.api_monitor_max_chars
                             for name, value in (("output", content), ("reasoning", reasoning)):
+                                if name == "reasoning" and not svc.api_monitor_keep_reasoning:
+                                    continue
                                 if value:
-                                    combined = self.record[name] + value
-                                    self.record[name] = combined[:262144]
-                                    self.record[name + "_truncated"] |= len(combined) > 262144
+                                    svc._append_text(self.record, name, value, limit)
                             if usage:
                                 self.record["usage"] = usage
                             if timings:
                                 self.record["timings"] = timings
+                            svc._enforce_api_bytes(self.record)
                     yield item
             finally:
                 items.close()
@@ -8693,6 +8812,46 @@ def shutdown(svc: Service, httpd, hub=None) -> None:
         print(f"[strata] could not release the model files' cache: {e}", flush=True)
 
 
+API_MONITOR_DEFAULTS = {"max_requests": 100, "max_chars": 262144, "max_bytes": 64 << 20, "keep_reasoning": True}
+API_MONITOR_RANGE = {"max_requests": (1, 1000), "max_chars": (1024, 1048576), "max_bytes": (1 << 20, 1 << 30)}
+
+
+def api_monitor_settings(cfg: dict, forced: bool = False) -> tuple[bool, dict]:
+    """The API request monitor's switch and its retention, from `"api_monitor"`: true (the old form), false, or an
+    object {"max_requests", "max_chars", "max_bytes", "keep_reasoning"} (whose keys win over the flat
+    `api_monitor_*` ones).  --api-monitor still turns it on.  A value of the wrong kind is said and the default used;
+    a number outside its range is clamped.  max_bytes 0 means no byte cap."""
+    raw = cfg.get("api_monitor")
+    if raw is not None and not isinstance(raw, (bool, dict)):
+        print(f"[strata] config api_monitor={raw!r}: expected true, false or an object; the monitor stays off",
+              flush=True)
+    obj = raw if isinstance(raw, dict) else {}
+    enabled = bool(forced) or raw is True or isinstance(raw, dict)
+    flat = {key: cfg.get(f"api_monitor_{key}") for key in API_MONITOR_DEFAULTS}
+    limits = dict(API_MONITOR_DEFAULTS)
+    for key, default in API_MONITOR_DEFAULTS.items():
+        value = obj[key] if key in obj else flat[key]
+        if value is None:
+            continue
+        if key == "keep_reasoning":
+            if isinstance(value, bool):
+                limits[key] = value
+            else:
+                print(f"[strata] api_monitor.{key}={value!r}: expected true or false; using {default}", flush=True)
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            print(f"[strata] api_monitor.{key}={value!r}: expected a whole number; using {default}", flush=True)
+            continue
+        if key == "max_bytes" and value == 0:
+            limits[key] = 0
+            continue
+        low, high = API_MONITOR_RANGE[key]
+        limits[key] = min(high, max(low, value))
+        if limits[key] != value:
+            print(f"[strata] api_monitor.{key}={value}: out of range {low}..{high}; using {limits[key]}", flush=True)
+    return enabled, limits
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
@@ -8721,8 +8880,9 @@ def main() -> int:
                                          "the config)")
     ap.add_argument("--lazy", action="store_true", help="start the API unloaded (the engine and the vision encoder start with the first request)")
     ap.add_argument("--api-monitor", action="store_true",
-                    help="the API request monitor at /api-monitor: keeps the last 100 requests' prompts and answers in "
-                         "memory (also \"api_monitor\": true in the config; off by default)")
+                    help="the API request monitor at /api-monitor: keeps recent requests' prompts and answers in memory, "
+                         "bounded (also \"api_monitor\": true or {\"max_requests\", \"max_chars\", \"max_bytes\", "
+                         "\"keep_reasoning\"} in the config; off by default)")
     ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
                     help="unload the model after this many seconds without requests, so other programs (games, other "
                          "model servers) can use the VRAM; the next request loads it again (also \"idle_unload_s\" "
@@ -8832,10 +8992,20 @@ def main() -> int:
     if svc.allowed_hosts:
         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
-    svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+    svc.api_monitor, monitor = api_monitor_settings(cfg, a.api_monitor)
+    svc.api_monitor_max_requests = monitor["max_requests"]
+    svc.api_monitor_max_chars = monitor["max_chars"]
+    svc.api_monitor_max_bytes = monitor["max_bytes"]
+    svc.api_monitor_keep_reasoning = monitor["keep_reasoning"]
+    svc.api_requests = collections.deque(maxlen=svc.api_monitor_max_requests)
+    svc.api_requests_bytes = 0
     if svc.api_monitor:
-        print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
-              "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
+        size = ("no byte cap" if not svc.api_monitor_max_bytes else
+                f"about {svc.api_monitor_max_bytes / (1 << 20):.0f} MiB in all")
+        print(f"[strata] API request monitor on (/api-monitor): up to {svc.api_monitor_max_requests} requests, "
+              f"{svc.api_monitor_max_chars} characters of each prompt/answer, {size}, reasoning "
+              f"{'kept' if svc.api_monitor_keep_reasoning else 'not kept'}"
+              + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
         print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"

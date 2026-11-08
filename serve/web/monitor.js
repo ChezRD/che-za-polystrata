@@ -99,6 +99,7 @@ async function refresh() {
   try {
     const [status, history] = await Promise.all([api("/v1/status"), api("/api/requests")]);
     state = status; records = history.requests;
+    text("retention-note", `Last ${history.retention ?? 50} requests kept in memory until restart. Inputs and outputs stay on this machine.`);
     status.loaded = history.loaded; status.auto_load = history.auto_load;
     if (selected && !records.some(r => r.id === selected)) {
       selected = detail = null; $("selection").hidden = true; $("no-selection").hidden = false;

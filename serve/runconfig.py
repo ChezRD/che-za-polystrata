@@ -37,7 +37,11 @@ EDITABLE = [
     ("idle_unload_s", "num>=0", "Unload the model after this many seconds without requests (0 or empty: never)"),
     ("lazy_load", "bool", "Start without loading the model; the first request loads it (text only)"),
     ("engine_silence_s", "num>=0", "End a request when the engine says nothing for this long (default 300 s, 0 = wait)"),
-    ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
+    ("api_monitor", "bool", "Keep recent requests' prompts and answers in memory for /api-monitor (bounded by the keys below)"),
+    ("api_monitor_max_requests", "int>=0", "How many requests the API monitor keeps (default 100; 1..1000)"),
+    ("api_monitor_max_chars", "int>=0", "Longest prompt/answer/reasoning text kept per request (default 262144; 1024..1048576)"),
+    ("api_monitor_max_bytes", "int>=0", "Approximate total text the API monitor keeps (default 64 MiB; 0 = no cap)"),
+    ("api_monitor_keep_reasoning", "bool", "Keep reasoning text in the API monitor (default true)"),
     ("switch_on_request", "bool", "List every installed model in /v1/models and load the one a request names, the "
                                   "loaded one stopped first (#38; read from the config the server starts with)"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
