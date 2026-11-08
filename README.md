@@ -1,9 +1,9 @@
-<h1 align="center">PolyStrata</h1>
+<h1 align="center">Che'za-PolyStrata</h1>
 
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md) · [Türkçe](README.tr.md)
 
 <p align="center"><b>Run large AI models on your own PC</b><br>
-Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V and Kolibri 1 · free and open source</p>
+A fork of <a href="https://github.com/simplexai-labs/PolyStrata">PolyStrata</a> · Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder, MiniCPM-V and Kolibri 1 · free and open source</p>
 
 <p align="center"><img src="docs/media/speed.svg" width="820" alt="Tokens per second while writing an answer: 94 to 100 for Qwen3.6-35B-A3B on a laptop with an 8 GB card, 394 to 395 on an RTX 5090"></p>
 
@@ -14,7 +14,7 @@ Qwen3.8-Flash-Next, GLM 5.3 Flash, DeepSeek V4 Flash, LFM2.5, Flint, Qwen3.6, Cl
 <sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with <a href="https://github.com/Niko1221/Strata">Strata</a> (Qwen3.8-Flash-Next IQ3_S, 128K context) ·
 <a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
 
-PolyStrata runs large AI models on a normal PC, models that usually need a server. They chat, write code and work
+Che'za-PolyStrata runs large AI models on a normal PC, models that usually need a server. They chat, write code and work
 with your apps and coding agents. Nothing leaves your PC.
 
 It runs twelve models, on two engines:
@@ -47,11 +47,13 @@ with an 8 GB card as well.
 - **[Kolibri 1](docs/models/kolibri.md)** by Aleph Alpha, which writes German as well as English: a file of 29 to 48 GB,
   most of which stays in RAM beside a small card.
 
-The server can change between installed models while it runs ([how](docs/BACKENDS.md#changing-the-model)).
+It also runs GigaChat Audio on the same engine as those eleven. strata-poly decodes with MLA, a side process encodes the clip, and the server accepts a transcription, a translation or audio in a chat.
 
-PolyStrata was created by [VecSzn](https://github.com/VecSzn).
+The server can change between installed models while it runs ([how](docs/BACKENDS.md#changing-the-model)). strata-poly loads the next model in the same process, and a conversation parked there stays in memory.
+
+Che'za-PolyStrata is a fork of [PolyStrata](https://github.com/simplexai-labs/PolyStrata), created by [VecSzn](https://github.com/VecSzn).
 PolyStrata is built on [Strata](https://github.com/Niko1221/Strata) by Niko1221.
-Why it is a separate repo, AMD and smaller cards, fine-tunes and other questions: [FAQ](docs/FAQ.md).
+Why PolyStrata is a separate repo from Strata, AMD and smaller cards, fine-tunes and other questions: [FAQ](docs/FAQ.md).
 
 ## How fast is it?
 
@@ -138,6 +140,7 @@ memory to other programs and have the engine read them from the SSD again later.
 
 The engine also needs 350 to 400 MiB less VRAM for reading prompts: the expert cache takes it (Qwen3.6 keeps 2,712
 experts in VRAM instead of 2,444), or `--vram-reserve-mib` leaves it to other programs.
+On the qwen35moe models, `--kv k8v4` keeps the keys as Q8_0 and stores the values as Q4_0 after the head's Hadamard rotation, so each token takes a smaller KV cell than `q8_0`.
 How it works and how it was measured: [docs/BACKENDS.md](docs/BACKENDS.md#less-of-the-pcs-ram-and-vram).
 
 ## What you need
@@ -168,7 +171,7 @@ What Qwen3.6, Clover, Ornith 1.5, Gemma 4, Tiel Coder and MiniCPM-V each need an
 Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
 
 ```text
-Set up PolyStrata on this PC for me: https://github.com/simplexai-labs/PolyStrata - follow docs/AI_SETUP.md in that repository.
+Set up Che'za-PolyStrata on this PC for me: https://github.com/ChezRD/che-za-polystrata - follow docs/AI_SETUP.md in that repository.
 ```
 
 It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
@@ -177,7 +180,7 @@ you how to connect your apps. AI tools can also install, start and stop PolyStra
 
 ### Or do it yourself
 
-[Download PolyStrata](https://github.com/simplexai-labs/PolyStrata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
+[Download Che'za-PolyStrata](https://github.com/ChezRD/che-za-polystrata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
 **Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the PolyStrata folder.
 
 **Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once
@@ -208,7 +211,7 @@ All twelve are in the installer's list of models. `./setup.sh --family glm`, `de
 > close the window. The window shows what PolyStrata is doing.
 
 **Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates PolyStrata without starting it. Updating, Docker,
+its window to stop the model. `./start.sh strata-<model>.json` starts one config on its own: it reads the port from the file and runs the engine that file names. `UPDATE.bat` (`./update.sh`) updates PolyStrata without starting it. Updating, Docker,
 several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
 
 **Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
@@ -250,6 +253,7 @@ All twelve models are used the same way: the same app, the same API.
     ([why](docs/FAQ.md#can-i-use-it-with-claude-code-codex-or-other-apps))).
   - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
     ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
+  - A clip for GigaChat Audio: transcription, translation, or audio in a chat, at the same base URL.
 - **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
   fastest. High is best for hard questions.
 - **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
@@ -296,7 +300,7 @@ Restart PolyStrata (`START-HERE.bat` or `./setup.sh`) after the change. To undo,
 - **It says port 8080 is already in use.** PolyStrata is already running. Look for its window.
 
 More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/simplexai-labs/PolyStrata/issues) and attach `strata-<model>.log` from the PolyStrata folder. Found a
+[issue](https://github.com/ChezRD/che-za-polystrata/issues) and attach `strata-<model>.log` from this project's folder. Found a
 security problem? Report it privately: [SECURITY.md](SECURITY.md).
 
 ## How does it work?
@@ -327,8 +331,8 @@ Ornith 1.5 is by ornith-ai, in
 [u/Sensitive_Song4219](https://www.reddit.com/r/LocalLLM/comments/1x22inc/comment/pf3r111/) found that it runs on PolyStrata.
 MiniCPM-V 4.7 35B-A3B is by [OpenBMB](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B-gguf), in their own
 quantization; [iMilnb](https://github.com/iMilnb) brought it to PolyStrata.
-PolyStrata is built on
+Che'za-PolyStrata is a fork of PolyStrata, created by [VecSzn](https://github.com/VecSzn). PolyStrata is built on
 [Strata](https://github.com/Niko1221/Strata) by Niko1221 and its contributors, and uses parts of
 [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). PolyStrata is open source under the [MIT License](LICENSE). A few
+[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Che'za-PolyStrata is open source under the [MIT License](LICENSE). A few
 parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
