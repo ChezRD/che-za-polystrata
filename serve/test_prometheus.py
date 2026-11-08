@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.prometheus import BUCKETS, Latencies, render, wants_prometheus  # noqa: E402
+from serve.prometheus import BUCKETS, Latencies, audio_metrics, render, wants_prometheus  # noqa: E402
 from serve.server import ByteTokenizer, MockEngine, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,6 +175,49 @@ class Batched(unittest.TestCase):
         self.assertEqual(after["vllm:e2e_request_latency_seconds_count"], 3)
         self.assertEqual(after["vllm:time_to_first_token_seconds_count"], 3)
         self.assertEqual(svc.metrics()["totals"]["requests"], 3)          # the JSON agrees
+
+
+class Audio(unittest.TestCase):
+    """The audio encoder's strata_audio_* families, from GET /v1/status's `audio` block."""
+
+    AUDIO = {"enabled": True, "encoder": "running", "model": "gigachat-audio-enc-mixed.gguf", "device": "cuda:0",
+             "encoding": False, "gpu_util_pct": 87, "vram_mib": 1180, "workspace_mib": 463,
+             "requests": {"transcribe": 12, "translate": 3, "errors": 1}, "audio_seconds": 143.2, "rows": 895,
+             "last": {"task": "transcribe", "language": "ru", "duration_s": 8.12, "rows": 51, "encode_ms": 6498,
+                      "prefill_ms": 300, "decode_ms": 900, "rtf": 0.8, "at": 1793895828},
+             "latency_ms": {"p50": 1200, "p95": 2400}, "queue": 0,
+             "encode_ms_total": 15000.0, "encode_count": 2}
+
+    def test_the_families(self):
+        m = {"engine": {"model": "m", "max_context": 1000}, "live": {"state": "idle"}, "totals": {},
+             "audio": self.AUDIO}
+        got = parse(render(m, Latencies().snapshot()))
+        lab = 'model="gigachat-audio-enc-mixed.gguf"'
+        self.assertEqual(got[("strata_audio_encoder_up", lab + ',device="cuda:0"')], 1)
+        self.assertEqual(got[("strata_audio_encoder_gpu_utilization", lab + ',device="cuda:0"')], 87)
+        self.assertEqual(got[("strata_audio_encoder_vram_mib", lab + ',device="cuda:0"')], 1180)
+        self.assertEqual(got[("strata_audio_prefill_seconds", lab + ',device="cuda:0"')], 0.3)
+        self.assertEqual(got[("strata_audio_decode_seconds", lab + ',device="cuda:0"')], 0.9)
+        self.assertEqual(got[("strata_audio_requests_total", lab + ',task="transcribe"')], 12)
+        self.assertEqual(got[("strata_audio_requests_total", lab + ',task="translate"')], 3)
+        self.assertEqual(got[("strata_audio_errors_total", lab)], 1)
+        self.assertEqual(got[("strata_audio_seconds_total", lab)], 143.2)
+        self.assertEqual(got[("strata_audio_rows_total", lab)], 895)
+        self.assertEqual(got[("strata_audio_encode_seconds", lab + ',quantile="0.5"')], 1.2)
+        self.assertEqual(got[("strata_audio_encode_seconds", lab + ',quantile="0.95"')], 2.4)
+        self.assertEqual(got[("strata_audio_encode_seconds_sum", lab)], 15.0)
+        self.assertEqual(got[("strata_audio_encode_seconds_count", lab)], 2)
+        self.assertAlmostEqual(got[("strata_audio_rtf", lab)], 0.8)
+        self.assertEqual(got[("strata_audio_queue", lab)], 0)
+
+    def test_a_stopped_encoder_is_up_0(self):
+        got = parse(audio_metrics({**self.AUDIO, "encoder": "stopped"}))
+        self.assertEqual(got[("strata_audio_encoder_up",
+                              'model="gigachat-audio-enc-mixed.gguf",device="cuda:0"')], 0)
+
+    def test_no_audio_section_has_no_samples(self):
+        self.assertEqual(audio_metrics({"enabled": False}), "")
+        self.assertEqual(audio_metrics({}), "")
 
 
 if __name__ == "__main__":

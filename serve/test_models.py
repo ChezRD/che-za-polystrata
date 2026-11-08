@@ -145,7 +145,7 @@ class Switch(unittest.TestCase):
         self.svc.config_path, self.svc.models_root = str(self.a), self.root
         self.new = Stopped(self.tok, "Hi.")
         patches = [mock.patch.object(S, "load_tokenizer", lambda p: self.tok),
-                   mock.patch.object(S, "start_model", lambda cfg, tok, lazy=False: (self.new, None, {"top_k": 5}, None, []))]
+                   mock.patch.object(S, "start_model", lambda cfg, tok, lazy=False: (self.new, None, None, {"top_k": 5}, None, []))]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -197,7 +197,7 @@ class Switch(unittest.TestCase):
 
         def start(cfg, tok, lazy=False):
             started.append(cfg)
-            return Stopped(tok, "Hi."), None, S.sampling_defaults_from_config(cfg), None, []
+            return Stopped(tok, "Hi."), None, None, S.sampling_defaults_from_config(cfg), None, []
         p = mock.patch.object(S, "start_model", start)
         p.start()
         self.addCleanup(p.stop)
@@ -379,7 +379,7 @@ class OnRequest(unittest.TestCase):
             if cfg["model_name"] in self.fails:
                 raise RuntimeError("no VRAM")
             self.started.append((cfg["model_name"], time.time()))
-            return Stopped(tok, f"x</think>\n\nI am {cfg['model_name']}."), None, {}, None, []
+            return Stopped(tok, f"x</think>\n\nI am {cfg['model_name']}."), None, None, {}, None, []
         for p in (mock.patch.object(S, "load_tokenizer", lambda p: self.tok), mock.patch.object(S, "start_model", start)):
             p.start()
             self.addCleanup(p.stop)
@@ -598,7 +598,7 @@ class Start(unittest.TestCase):
                                                  *argv]), \
                     mock.patch.object(S, "load_tokenizer", lambda p: tok), \
                     mock.patch.object(S, "start_model", lambda cfg, tok, lazy=False:
-                                      (Stopped(tok), None, S.sampling_defaults_from_config(cfg), None, None)), \
+                                      (Stopped(tok), None, None, S.sampling_defaults_from_config(cfg), None, None)), \
                     mock.patch.object(S, "serve", serve_it), \
                     mock.patch.object(S.time, "sleep", sleep), mock.patch.object(S.signal, "signal"), \
                     contextlib.redirect_stdout(out):

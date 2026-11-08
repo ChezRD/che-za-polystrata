@@ -405,4 +405,52 @@ void dsv4_attend(const float* q, const uint16_t* raw, int ring, int window, cons
 /// y[g][t] = x[t][g] for `rows` tokens of `groups` groups of n values; with back, y[t][g] = x[g][t].
 void permute_groups(const float* x, float* y, int n, int groups, int rows, bool back, void* stream);
 
+// ---- MLA in absorbed form (DeepSeek V2/V3, GigaChat Audio): a latent key of rank values and a rope key of
+// n_rot values, a query that has its no-rope part absorbed into the latent, and the latent as the value.
+
+/// For the tokens from position `pos`: q is n_head * (rank + n_rot) a token, the rank absorbed latent values then
+/// the n_rot turned query values.  Each token attends the keys 0 to its own position: key k is the cache row k,
+/// `rank` latent values then `n_rot` rope values, copied to `keys` as floats.  The keys beyond a token's position
+/// are zeroed, and a recorded launch (`at`) reads each token's position from the card: `room` is then the most keys
+/// a token has, and the launch is sized for it.  `chunk` tokens a pass; keys holds chunk * the most keys a token has
+/// * (rank + n_rot) floats, score chunk * n_head * the most keys.
+/// out: n_head * rank a token, the attention-weighted latents.  With lat_q8/kpe_q8 (codes not null) that cache is
+/// read as ggml Q8_0.  Throws std::runtime_error.
+void mla_attend(void* blas, const float* q, const uint16_t* lat, const uint16_t* kpe, int64_t pos, int rows,
+                float* keys, float* score, int chunk, float* out, int rank, int n_rot, int n_head, float scale,
+                void* stream, const long long* at = nullptr, int room = 0, Kvq8 lat_q8 = {}, Kvq8 kpe_q8 = {});
+/// The fused form of mla_attend(): the cache rows are read straight from the Q8_0 (or fp16) latent and rope key
+/// into fp16 shared-memory tiles, with no float key copy; QK and PV run on m16n8k16 tensor cores, the softmax in
+/// fp32.  A block covers all 32 heads of a token and one of `splits` key ranges; `part` holds splits * rows * 32 *
+/// 512 floats of partial sums and `stats` splits * rows * 32 * 2 of (max, sum), which a combine kernel weighs.
+/// `cap` bounds a token's keys (a recorded launch passes its `room`; the block reads the token's position from
+/// `at`).  Only the 32-head 512+64 layout is fused; throws std::invalid_argument otherwise and
+/// std::runtime_error if the tile does not fit the card's shared memory.
+void mla_attend_fused(const float* q, const uint16_t* lat, const uint16_t* kpe, int64_t pos, int rows, float* out,
+                      float* part, float* stats, int rank, int n_rot, int n_head, float scale, int splits, int cap,
+                      void* stream, const long long* at = nullptr, int first = 0, Kvq8 lat_q8 = {},
+                      Kvq8 kpe_q8 = {});
+/// The absorbed MLA's per-head products in one launch a head instead of a block an output row: y[h][o] =
+/// sum_i w[h][o][i] * x[h][i] for n_head heads, w BF16 and x fp32, both n_head blocks back to back.  n_in is 4 to
+/// 1024, in 4s; a decode token only (a prompt batch keeps the engine's matrix product).
+void mla_head_gemv_bf16(const void* w, const float* x, float* y, int n_head, int n_in, int n_out, void* stream);
+/// The same, with the weights in the file's Q8_0 or Q6_K layout (no bf16 copy: half the bytes a token).
+void mla_head_gemv_q8(const void* w, const float* x, float* y, int n_head, int n_in, int n_out, void* stream);
+void mla_head_gemv_q6k(const void* w, const float* x, float* y, int n_head, int n_in, int n_out, void* stream);
+/// Splits a token's n_head * (nope + n_rot) query into the nope values of each head (qn) and its n_rot turned
+/// values (qpe), both head-major.
+void mla_split_q(const float* q, float* qn, float* qpe, int nope, int n_rot, int n_head, int rows, void* stream);
+/// Packs the absorbed latent query and the rope query into mla_attend()'s rank + n_rot values a head.
+void mla_pack_q(const float* qabs, const float* qpe, float* q, int rank, int n_rot, int n_head, int rows,
+                void* stream);
+/// Splits the rank + n_rot values a token that kv_a_mqa gives into the latent (rank) and the rope key (n_rot).
+void mla_split_kv(const float* kv, float* lat, float* kpe, int rank, int n_rot, int rows, void* stream);
+/// The legacy fused attn_kv_b: per head, the nope rows of W_UK and then the vd rows of W_UV, each `rank` values
+/// wide.  qabs[t][h][l] = sum_i w[h][i][l] * qn[t][h][i].  w is F32 or BF16, in the layout the file has it.
+void mla_absorb_fused(const float* qn, const void* w, uint32_t type, float* qabs, int nope, int rank, int n_head,
+                      int rows, int group_stride, void* stream);
+/// The fused attn_kv_b's value side: vout[t][h][v] = sum_l w[h][nope + v][l] * kqv[t][h][l].
+void mla_vb_fused(const float* kqv, const void* w, uint32_t type, float* vout, int rank, int vd, int n_head,
+                  int rows, int group_stride, int nope, void* stream);
+
 }  // namespace strata::poly

@@ -253,7 +253,7 @@ class StartModel(unittest.TestCase):
             cfg = {"exe": "strata", "args": [], "gpu": [0, 1], "replicas": 2}
             with mock.patch.object(server.subprocess, "Popen",
                                    lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
-                engine, vision, sampling_defaults, effort_end, groups = server.start_model(cfg, ByteTokenizer())
+                engine, vision, audio, sampling_defaults, effort_end, groups = server.start_model(cfg, ByteTokenizer())
             try:
                 self.assertEqual(groups, [[0], [1]])
                 self.assertIsInstance(engine, ReplicaEngine)

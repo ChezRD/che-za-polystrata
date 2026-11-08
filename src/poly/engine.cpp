@@ -9,6 +9,7 @@
 #include "kolibri1.hpp"
 #include "lfm2moe.hpp"
 #include "flint.hpp"
+#include "gigachat.hpp"
 #include "mmq.hpp"
 #include "qwen35.hpp"
 #include "runtime.hpp"
@@ -1594,8 +1595,11 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     const std::string name = arch ? arch->s : std::string();
     // Clover is a qwen35moe model trained to also guess a block of tokens at once (Qwen35)
     const bool qwen35 = name == "qwen35moe" || name == "clover_moe";
-    if (o.kv_format == KvFmt::kQ8_0 && !qwen35 && name != "kolibri1" && name != "flint" && name != "lfm2moe")
-        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint and lfm2moe models in v1; "
+    const bool gigachat = name == "deepseek2" || name == "gigachat_audio";
+    if (o.kv_format == KvFmt::kQ8_0 && !qwen35 && name != "kolibri1" && name != "flint" && name != "lfm2moe"
+        && !gigachat)
+        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and "
+                                 "deepseek2/gigachat_audio models in v1; "
                                  "this is a '" + name + "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
@@ -1609,6 +1613,7 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         if (name == "glm5-next" || name == "glm5next") return std::make_unique<Glm5Next>();   // Unsloth: no hyphen
         if (qwen35) return std::make_unique<Qwen35>();
         if (name == "gemma4") return std::make_unique<Gemma4>();
+        if (gigachat) return std::make_unique<GigaChatAudio>();
         if (name == "deepseek4") return std::make_unique<DeepSeek4>();
         if (name == "lfm2moe") return std::make_unique<Lfm2Moe>();
         if (name == "flint") return std::make_unique<Flint>();

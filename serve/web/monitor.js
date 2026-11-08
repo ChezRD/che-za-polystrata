@@ -15,6 +15,10 @@ if (host) {
 const seconds = n => typeof n === "number" ? `${n.toFixed(2)} s` : "—";
 const speed = n => typeof n === "number" ? n.toFixed(1) : "—";
 const active = r => !["completed", "error", "disconnected"].includes(r.state);
+const isAudio = r => (r.path || "").includes("/audio/");
+const audioTask = r => (r.path || "").includes("/audio/translations") ? "translate" :
+  (r.path || "").includes("/audio/transcriptions") ? "transcribe" : null;
+const millis = n => typeof n === "number" ? `${(n / 1000).toFixed(2)} s` : "—";
 function text(id, value) { const el = $(id); if (el.textContent !== String(value)) el.textContent = value; }
 async function api(path, body) {
   const response = await fetch(path, {cache:"no-store", headers:{...(apiKey ? {Authorization:`Bearer ${apiKey}`} : {}), ...(body !== undefined ? {"Content-Type":"application/json"} : {})}, ...(body !== undefined ? {method:"POST", body:JSON.stringify(body)} : {})});
@@ -28,7 +32,8 @@ async function api(path, body) {
 function notice(message) { $("error").hidden = !message; text("error", message || ""); }
 function list() {
   const query = $("search").value.toLowerCase(), filter = $("filter").value;
-  const visible = records.filter(r => `${r.id} ${r.path} ${r.model}`.toLowerCase().includes(query) && (filter === "all" || (filter === "active" ? active(r) : r.state === filter)));
+  const visible = records.filter(r => `${r.id} ${r.path} ${r.model}`.toLowerCase().includes(query) &&
+    (filter === "all" ? true : filter === "active" ? active(r) : filter === "audio" ? isAudio(r) : r.state === filter));
   const nextStamp = JSON.stringify([visible, selected]);
   if (stamp === nextStamp) return;
   stamp = nextStamp;
@@ -44,7 +49,8 @@ function list() {
     button.dataset.request = r.id; button.setAttribute("aria-label", `Request ${r.id}`); button.setAttribute("aria-pressed", String(selected === r.id));
     const row = document.createElement("div"); row.className = "row";
     const time = document.createElement("span"); time.textContent = new Date(r.started_at * 1000).toLocaleTimeString();
-    const tag = document.createElement("span"); tag.className = `tag ${r.state}`; tag.textContent = r.state;
+    const tag = document.createElement("span"); tag.className = `tag ${r.state}`;
+    tag.textContent = isAudio(r) && r.phase ? r.phase : r.state;
     row.append(time, tag);
     const endpoint = document.createElement("div"); endpoint.className = "endpoint"; endpoint.textContent = `POST ${r.path}`;
     const meta = document.createElement("div"); meta.className = "small";
@@ -77,6 +83,16 @@ async function showDetail() {
   text("detail-prompt", value.usage?.prompt_tokens ?? value.usage?.input_tokens ?? "—");
   text("detail-tokens", value.usage?.completion_tokens ?? value.usage?.output_tokens ?? "—");
   text("detail-speed", speed(value.timings?.predicted_per_second)); text("detail-format", value.response_format || "text");
+  const a = value.audio || {};
+  text("detail-audio-duration", typeof a.duration_s === "number" ? `${a.duration_s.toFixed(2)} s` : "—");
+  text("detail-audio-rows", a.rows ?? "—");
+  text("detail-audio-encode", millis(a.encode_ms));
+  text("detail-audio-prefill", millis(a.prefill_ms));       // the decoder reads the prompt, audio rows included
+  text("detail-audio-decode", millis(a.decode_ms));
+  text("detail-audio-device", a.device || "—");
+  text("detail-audio-rtf", typeof a.rtf === "number" ? `${a.rtf.toFixed(2)}×` : "—");
+  text("detail-audio-task", a.task || audioTask(value) || "—");
+  text("detail-audio-language", a.language || "—");
   $("detail-error").hidden = !value.error; text("detail-error", value.error?.message || ""); content();
 }
 async function refresh() {
@@ -95,6 +111,48 @@ async function refresh() {
     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
     const last = records.find(r => !active(r));
     text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));
+    const audio = status.audio || {};
+    const audioRecords = records.filter(isAudio);
+    const transcribe = audio.requests?.transcribe ?? audioRecords.filter(r => audioTask(r) === "transcribe").length;
+    const translate = audio.requests?.translate ?? audioRecords.filter(r => audioTask(r) === "translate").length;
+    const lastAudio = task => audio.last && (!task || audio.last.task === task) ? audio.last :
+      audioRecords.filter(r => !task || audioTask(r) === task).map(r => r.audio).find(Boolean);
+    const audioLast = task => {
+      const x = lastAudio(task);
+      if (!x) return "No request yet";
+      const bits = [];
+      if (typeof x.duration_s === "number") bits.push(`${x.duration_s.toFixed(1)} s audio`);
+      if (typeof x.encode_ms === "number") bits.push(`${(x.encode_ms / 1000).toFixed(1)} s encode`);
+      if (bits.length) return bits.join(" · ");
+      return task ? `${task} done` : "Done";
+    };
+    const audioState = audio.encoder || (audio.enabled === false ? "off" : audioRecords.length ? "idle" : "");
+    text("audio-state", audioState ? audioState[0].toUpperCase() + audioState.slice(1) : "—");
+    $("audio-encoder").className = `value ${audioState === "running" || audioState === "busy" ? "loaded" : ""}`;
+    text("audio-model", audio.model || "—");
+    // Device, live GPU utilization, VRAM, and while a long file runs: what it has done so far.
+    const gpuBits = [];
+    if (audio.device) gpuBits.push(audio.device);
+    if (audio.encoding) {
+      const done = typeof audio.rows_done === "number" ? audio.rows_done : 0;
+      const totalRows = typeof audio.rows_total === "number" ? audio.rows_total : null;
+      let line = `Encoding… ${Math.round((audio.encode_ms_live || 0) / 1000)} s`;
+      line += totalRows ? `, ${done}/${totalRows} rows` : done ? `, ${done} rows` : "";
+      if (typeof audio.gpu_util_pct === "number") line += `, GPU ${audio.gpu_util_pct}%`;
+      gpuBits.unshift(line);
+    } else {
+      if (typeof audio.gpu_util_pct === "number") gpuBits.push(`GPU ${audio.gpu_util_pct}%`);
+      if (typeof audio.vram_mib === "number") gpuBits.push(`${(audio.vram_mib / 1024).toFixed(1)} GB VRAM`);
+    }
+    text("audio-live", gpuBits.length ? gpuBits.join(" · ") : "—");
+    text("audio-transcribe", transcribe); text("audio-transcribe-last", audioLast("transcribe"));
+    text("audio-translate", translate); text("audio-translate-last", audioLast("translate"));
+    const rtf = lastAudio()?.rtf;
+    text("audio-rtf", typeof rtf === "number" ? `${rtf.toFixed(2)}×` : "—");
+    const total = audio.audio_seconds ?? audioRecords.reduce((n, r) => n + (r.audio?.duration_s || 0), 0);
+    text("audio-total", typeof total === "number" && total > 0 ? `${total.toFixed(1)} s processed` : "Audio processed");
+    text("audio-hint", !audio.enabled && !audioRecords.length ? "No audio requests yet" :
+      `${audioRecords.length} recent audio request${audioRecords.length === 1 ? "" : "s"}`);
     $("load").disabled = operating || Boolean(inflight) || status.loaded; $("unload").disabled = operating || Boolean(inflight) || !status.loaded;
     list(); if (selected) await showDetail();
     text("updated", `Live · updated ${new Date().toLocaleTimeString()}`);

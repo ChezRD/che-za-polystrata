@@ -16,10 +16,13 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 from __future__ import annotations
 
 import ast
+import base64
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import threading
 import uuid
 from collections import OrderedDict
@@ -133,6 +136,7 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+AUDIO_PARTS = ("input_audio", "audio")
 
 # Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
@@ -166,6 +170,10 @@ def _has_image(content) -> bool:
     return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
 
 
+def _has_audio(content) -> bool:
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in AUDIO_PARTS for p in content)
+
+
 def _image_source(part: dict) -> str:
     """An image part's source as one string: a data: URL, an http(s) URL or a local file path.
     OpenAI: {"type": "image_url", "image_url": {"url": ...}} (or "image_url": "..."), Responses-style
@@ -183,9 +191,9 @@ def _image_source(part: dict) -> str:
 
 
 def _parts_of(content):
-    """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
-    template's list form - text items and image items, in order - whose image items carry their source."""
-    if not _has_image(content):
+    """Message content for the template: a string when there is no image or audio (unchanged behaviour), otherwise
+    the template's list form - text, image and audio items, in order - whose media items carry their source."""
+    if not _has_image(content) and not _has_audio(content):
         return _text_of(content)
     items = []
     for part in content:
@@ -193,16 +201,56 @@ def _parts_of(content):
             continue
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
+        elif part.get("type") in AUDIO_PARTS:
+            items.append(_audio_item(part))
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
+
+
+def _audio_item(part: dict) -> dict:
+    """An audio content part -> {"type": "audio", "source", "format", "name"}.  OpenAI:
+    {"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}; Anthropic-shaped (or a local
+    file): {"type": "audio", "source": {"type": "base64", "format": "wav", "data": ...}} or
+    {"type": "audio", "source": "/path/a.wav"} (or "path": ...)."""
+    fmt = str(part.get("format") or "").lower().lstrip(".")
+    name = part.get("filename") or part.get("name")
+    if part.get("type") == "audio":
+        src = part.get("source")
+        if isinstance(src, dict):
+            if src.get("type") == "base64":
+                fmt = str(src.get("format") or src.get("media_type") or fmt or "wav").lower().removeprefix("audio/")
+                return {"type": "audio", "format": fmt, "name": name,
+                        "source": f"data:audio/{fmt};base64,{src.get('data', '')}"}
+            src = src.get("url") or src.get("path") or src.get("data") or ""
+        if not isinstance(src, str):
+            src = str(part.get("path") or part.get("audio") or "")
+        return {"type": "audio", "source": src, "format": fmt or _audio_format_of(src),
+                "name": name or (Path(src).name if src and not src.startswith(("data:", "http")) else None)}
+    ia = part.get("input_audio")
+    if isinstance(ia, str):
+        ia = {"data": ia}
+    if not isinstance(ia, dict):
+        ia = {}
+    fmt = str(ia.get("format") or fmt or "wav").lower().lstrip(".")
+    return {"type": "audio", "format": fmt, "name": name,
+            "source": f"data:audio/{fmt};base64,{ia.get('data', '')}"}
+
+
+def _audio_format_of(source: str) -> str:
+    """A source's format from what it says of itself: a data: URL's media type, or a path's suffix."""
+    if source.startswith("data:"):
+        media = source[5:].split(";", 1)[0].split(",", 1)[0]
+        return media.removeprefix("audio/").lower() or "wav"
+    suffix = Path(source.split("?", 1)[0]).suffix.lower().lstrip(".")
+    return suffix or "wav"
 
 
 # The blocks a messages request may carry: text, the image parts, thinking, tool_use and tool_result.
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + AUDIO_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
 
 
 def _check_parts(content, path: str, kinds):
@@ -235,6 +283,68 @@ def images_of(messages: list[dict]) -> list[str]:
     <|vision_start|><|image_pad|><|vision_end|> per image item, message by message)."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
+
+
+def audios_of(messages: list[dict]) -> list[dict]:
+    """The audio items of the rendered conversation, in prompt order: each is {"type": "audio", "source", "format",
+    "name"} (see _audio_item).  The template writes one file envelope per item, in that order."""
+    return [item for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") == "audio"]
+
+
+AUDIO_URL_MAX = 512 << 20       # what load_audio() reads of one clip
+
+
+def load_audio(source: str) -> bytes:
+    """A clip's bytes from a data: URL or a local file path.  A ValueError (a 400 that says so) for a URL this does
+    not fetch and for a file that cannot be read."""
+    if source.startswith("data:"):
+        try:
+            return base64.b64decode(source.split(",", 1)[1])
+        except (IndexError, ValueError) as e:
+            raise ValueError(f"the audio's data: URL could not be read ({e})") from None
+    if source.startswith(("http://", "https://")):
+        raise ValueError("an audio URL is not read: send the clip as a data: URL or a local file path")
+    path = source[7:] if source.startswith("file://") else source
+    if path and os.path.isfile(path):
+        try:
+            if os.path.getsize(path) > AUDIO_URL_MAX:
+                raise ValueError(f"the audio file is over {AUDIO_URL_MAX >> 20} MiB")
+            return Path(path).read_bytes()
+        except OSError as e:
+            raise ValueError(f"the audio could not be read from {path} ({e})") from None
+    raise ValueError("an audio must be a data: URL or a local file path")
+
+
+def audio_wav(part: dict, directory: Path, number: int = 0) -> Path:
+    """An audio item as a WAV file in `directory`: the bytes are written as they are when they are RIFF/WAVE,
+    otherwise converted with ffmpeg (mp3/flac/ogg/m4a/...), and a 400 that says what to do when it is not
+    installed."""
+    data = load_audio(part.get("source", ""))
+    out = Path(directory) / f"audio-{number}.wav"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        out.write_bytes(data)
+        return out
+    fmt = (part.get("format") or _audio_format_of(part.get("source", "")) or "unknown").lower()
+    if fmt in ("wav", "wave"):
+        raise ValueError("the audio says it is WAV but its bytes are not a RIFF/WAVE file")
+    exe = shutil.which("ffmpeg")
+    if not exe:
+        raise ValueError(f"the audio is {fmt}, and this server converts it to WAV with ffmpeg, which is not "
+                         "installed: send a WAV file, or install ffmpeg")
+    src = Path(directory) / f"audio-{number}.{re.sub(r'[^a-z0-9]', '', fmt) or 'bin'}"
+    src.write_bytes(data)
+    try:
+        done = subprocess.run([exe, "-v", "error", "-y", "-i", str(src), "-vn", "-acodec", "pcm_s16le", "-f", "wav",
+                               str(out)], capture_output=True, text=True, timeout=600)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise ValueError(f"the audio could not be converted to WAV (ffmpeg: {e})") from None
+    finally:
+        src.unlink(missing_ok=True)
+    if done.returncode != 0 or not out.is_file() or out.stat().st_size <= 44:
+        detail = (done.stderr or "").strip().splitlines()
+        raise ValueError("the audio could not be converted to WAV" + (f" (ffmpeg: {detail[-1]})" if detail else ""))
+    return out
 
 
 # #537: a literal <think> / </think> inside a message's text is plain text, not the model's reasoning markers.  The
@@ -551,11 +661,11 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         role = m.get("role")
         if role == "developer":
             role = "system"
-        # an image is read in a user, tool or assistant message; the system prompt takes text only, as _text_of reads
-        images = role in ("user", "tool", "assistant")
+        # an image or an audio clip is read in a user, tool or assistant message; the system prompt takes text only
+        media = role in ("user", "tool", "assistant")
         content = _check_parts(m.get("content"), f"messages[{i}].content",
-                               TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
-        out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
+                               TEXT_PARTS + IMAGE_PARTS + AUDIO_PARTS if media else TEXT_PARTS)
+        out = {"role": role, "content": _parts_of(content) if media else _text_of(content)}
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
         if role == "tool" and m.get("tool_call_id"):    # which call it answers: a template may name the tool by it
@@ -635,7 +745,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
-        if m.get("role") == "user" and _has_image(content) and not any(
+        if m.get("role") == "user" and (_has_image(content) or _has_audio(content)) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
@@ -645,7 +755,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if kind == "text":
                 text.append(block.get("text", ""))
                 parts.append(block)
-            elif kind in IMAGE_PARTS:
+            elif kind in IMAGE_PARTS or kind in AUDIO_PARTS:
                 parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
@@ -656,11 +766,12 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS)),
+                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS + AUDIO_PARTS)),
                                  **({"tool_call_id": block["tool_use_id"]} if block.get("tool_use_id") else {})})
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
-            out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
+            out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) or _has_audio(parts)
+                   else "".join(text)}
             if reasoning:
                 out["reasoning_content"] = "".join(reasoning)
             if calls:

@@ -289,12 +289,18 @@ function renderTotals(t) {
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   // model state
-  const on = live.queued > 0 ? "queued" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
   const prog = $("state-progress");
-  let label = "Waiting for a request", detail = "", pct = 0;
-  if (live.state === "reading") {
-    label = "Reading prompt";
+  const encoding = live.phase_name === "encode" || live.state === "encoding";
+  const on = live.queued > 0 ? "queued" : encoding ? "encoding" : live.state;
+  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+  let label = "Waiting for a request", detail = "", pct = 0, indeterminate = false;
+  if (encoding) {
+    label = live.progress_label || "Encoding audio";
+    detail = live.progress_detail || "";
+    prog.dataset.tone = "info";
+    if (typeof live.progress === "number") pct = 100 * live.progress; else indeterminate = true;
+  } else if (live.state === "reading") {
+    label = live.progress_label && live.progress_label.includes("audio") ? live.progress_label : "Reading prompt";
     prog.dataset.tone = "info";
     if (live.prompt_total) {
       pct = (100 * live.prompt_read) / live.prompt_total;
@@ -313,7 +319,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   }
   $("state-label").textContent = label;
   $("state-detail").textContent = detail;
-  $("state-bar").style.width = `${pct}%`;
+  $("state-bar").style.width = indeterminate ? "0%" : `${pct}%`;
+  prog.classList.toggle("is-indeterminate", indeterminate);
 
   // the eight cards
   const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;

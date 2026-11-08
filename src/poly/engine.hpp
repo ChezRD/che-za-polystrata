@@ -93,6 +93,9 @@ struct Options {
                                   ///< the file cache when another program wants the memory (Linux: up to ulimit -l)
     bool stay_near = true;       ///< with several NUMA nodes, keep the CPU threads on the one that holds the experts
     bool graphs = true;           ///< a token's fixed launches are recorded once, a CUDA graph a layer, and replayed
+    bool mla_fused = false;       ///< a decode token's absorbed MLA reads the q8_0 latent cache straight into fp16
+                                  ///< tensor-core tiles (kernels_mla.cu: mla_attend_fused) instead of copying the
+                                  ///< keys to floats and running two fp32 GEMMs; a prompt still uses the old path
     bool kv_grow = true;          ///< the attention caches get VRAM as the sequence grows, where the card can map it
                                   ///< so; false: for the whole context at load, as the expert cache gets the rest
 #if defined(STRATA_GPU_METAL)

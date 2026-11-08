@@ -4,7 +4,8 @@
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+non-stream), POST /v1/audio/transcriptions and /v1/audio/translations (OpenAI multipart audio), GET /v1/models,
+GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
 Image generation (optional, when the config has an "images" section): POST /v1/images/generations (OpenAI's shape,
 plus seed and steps) runs stable-diffusion.cpp's sd-cli for Qwen-Image-2.1-Turbo, one job at a time on the GPU the
 text engine uses (serve/images.py).
@@ -60,8 +61,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            forced_call, gemma_model_turn, images_of, literal_tags, mark_think_literals,
-                            openai_to_messages, tool_choice_of, unmark_think_literals)
+                            audio_wav, audios_of, forced_call, gemma_model_turn, images_of, literal_tags,
+                            mark_think_literals, openai_to_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import models as registry  # noqa: E402
@@ -72,6 +73,11 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve import audio as audio_api  # noqa: E402
+from serve.audio import Audio, AudioCancelled  # noqa: E402
+from serve import transcribe as transcribe_api  # noqa: E402
+from serve import segment as segment_api  # noqa: E402
+from serve import prometheus as prometheus_api  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -135,6 +141,14 @@ def write_temporary(path: Path, parts: list) -> None:
     with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
         for part in parts:
             f.write(Path(part).read_bytes())
+
+
+def write_bytes_temporary(path: Path, parts: list) -> None:
+    """write_temporary() for bytes already in memory (an audio request's SVE1 records)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0) | getattr(os, "O_SHORT_LIVED", 0)
+    with os.fdopen(os.open(path, flags, 0o600), "wb") as f:
+        for part in parts:
+            f.write(part)
 # #458: the trailing effort turn ("effort_position": "end"); low is the template's own sentence, medium (which the
 # template says nothing for: no xhigh sentence is medium there) says it, since the xhigh one stays at the top
 EFFORT_TURN = "<|im_start|>system\n{}<|im_end|>\n"
@@ -1247,9 +1261,10 @@ class StrataEngine:
         seed = sampling.get("seed")
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
-        pad = sampling.get("image_pad")                 # an image request's (Service.run()); strata skips the key
-        if isinstance(pad, int) and not isinstance(pad, bool):
-            keys += f" image_pad={pad}"
+        for name in ("image_pad", "audio_pad"):         # an image/audio request's (Service.run()); strata skips the key
+            pad = sampling.get(name)
+            if isinstance(pad, int) and not isinstance(pad, bool):
+                keys += f" {name}={pad}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -1624,6 +1639,7 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        audio = (sampling or {}).get("audio_pad")
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1759,7 +1775,8 @@ class StrataEngine:
                         holding, born = True, self.gen                  # (the engine it now has the control lines of)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                    head = f"BGENA {slot} {left}{keys} {embeddings}" if audio is not None else \
+                        f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
                     live = {"slot": slot, "state": "reading", "prompt_tokens": len(prompt), "generated": 0,
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
@@ -2011,7 +2028,9 @@ class StrataEngine:
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         keys = self.sampling_keys(sampling or {}) + self.turn_key(ids)
-        head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
+        audio = (sampling or {}).get("audio_pad")
+        head = (f"GENA {int(max_new)}{keys} {embeddings}" if audio is not None else
+                f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}")
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -3218,8 +3237,16 @@ def budget_tokens(value) -> int | None:
 class Service:
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "qwen3.8-flash-next",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
-                 fit_max_tokens: bool = False):
+                 fit_max_tokens: bool = False, audio: Audio | None = None):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.audio = audio                              # the audio encoder (strata-audio), started by the first clip
+        # The phase one request is in, for /v1/status.activity.phase and the request records:
+        # queued | encode | prefill | generate | completed | error.  "encode" is the audio encoder alone,
+        # "prefill" the decoder reading the prompt (the audio rows included), "generate" its token loop.
+        self.phase = "completed"
+        self.loading_name = None
+        self.last_activity_at = time.time()      # the last token/event; an idle unload may override a stale busy flag
+        self.phase_at = time.time()
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.drop_oldest = False                      # #17 (opt-in): a conversation too long loses its oldest turns
         self.truncate_middle = False                  # opt-in: keep a prompt's beginning and ending when it will not fit
@@ -3525,7 +3552,8 @@ class Service:
                     old.unload()
             freed = self.free_vram_mib() if debug else None
             try:
-                engine, vision, sampling_defaults, effort_end, groups = start_model(cfg, tok)
+                # start_model also returns the audio encoder. Stopping and starting it is model switching.
+                engine, vision, _audio, sampling_defaults, effort_end, groups = start_model(cfg, tok)
             except (Exception, SystemExit) as e:
                 print(f"[strata] {target['id']} did not start ({e}); starting {old_name} again ...", flush=True)
                 try:
@@ -4248,6 +4276,11 @@ class Service:
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
+        act = self.activity_view()                       # phase and real progress (encode/prefill/generate)
+        live.update({k: v for k, v in act.items() if k not in ("generated", "max_tokens", "phase")})
+        live["phase_name"] = act["phase"]
+        if act["phase"] == "encode":
+            live["state"] = "encoding"                   # the bar's own state: the encoder, not the decoder
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         par = int(getattr(self.engine, "batch", 0) or 0)
@@ -4272,7 +4305,8 @@ class Service:
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now}
+                tel["static"], "history": tel["history"], "time": now,
+                "audio": self.audio_status()}
 
     def prometheus(self) -> str:
         """GET /metrics/prometheus: the totals and what is running in Prometheus' text format, under llama-server's
@@ -4309,6 +4343,7 @@ class Service:
         ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
+        return text + prometheus_api.audio_metrics(self.audio_status())
 
     def v1_status(self) -> dict:
         """GET /v1/status: what this server is and does, for a client that would rather ask than guess (a front-end
@@ -4339,9 +4374,12 @@ class Service:
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images, "available": images, "error": None},
+            "audio": self.audio_status(),
             "image_generation": self.images.status() if self.images is not None else {"enabled": False},
-            "activity": {"requests": totals["requests"] + int(busy), "in_flight": int(busy) + int(s.get("queued") or 0),
-                         "last_request_at": int(last_at) if last_at else None},
+            "activity": {**{"requests": totals["requests"] + int(busy),
+                            "in_flight": int(busy) + int(s.get("queued") or 0),
+                            "last_request_at": int(last_at) if last_at else None},
+                         **self.activity_view()},
             "last_timings": last_t,
             "vram": dict((getattr(self.engine, "info", {}) or {}).get("vram") or {},
                          elastic=bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic"))),
@@ -4495,6 +4533,36 @@ class Service:
             self.prompts.forget(ids)
 
 
+    def audio_messages(self, messages, audios) -> tuple[list[dict], list[str]]:
+        """The messages with each audio item in the template's file form, and the item names in prompt order.
+        The reference processor (`_to_template_messages`) writes `<file_placeholder_audio_N>` where the clip stood,
+        plus an `embed_files` entry per clip; the template then writes one
+        `<|file|>{"id": ..., "name": ..., "type": "audio"}[audio_token]<|/file|>` in its place."""
+        names = [str(a.get("name") or f"audio_{k}.wav") for k, a in enumerate(audios)]
+        out, k = [], 0
+        for m in messages:
+            content = m.get("content")
+            if not (isinstance(content, list) and any(isinstance(p, dict) and p.get("type") == "audio"
+                                                      for p in content)):
+                out.append(m)
+                continue
+            parts, embed = [], []
+            for item in content:
+                if item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif item.get("type") == "audio":
+                    fid = f"audio_{k}"
+                    parts.append(f"<file_placeholder_{fid}>")
+                    embed.append({"id": fid, "name": names[k], "type": "audio"})
+                    k += 1
+            m = {key: v for key, v in m.items() if key not in ("content", "embed_files", "file_placeholders")}
+            m["content"] = "".join(parts)
+            if embed:
+                m["embed_files"] = embed
+                m["file_placeholders"] = True
+            out.append(m)
+        return out, names
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -4504,6 +4572,23 @@ class Service:
         fetched = self._note_unreadable_tool_images(messages, cancel)
         if self.preserve_thinking and kwargs.get("preserve_thinking") is not False:
             messages = self.restore_reasoning(messages)
+        # A request's clips, in prompt order.  Each takes the template's file form (<file_placeholder_audio_N> where
+        # it stood and an embed_files entry), so the template writes the envelope and one [audio_token] for it; the
+        # reference processor does the same (`_to_template_messages`).  Decoding and encoding wait for their turn
+        # below, so nothing here touches the engine.
+        audios = audios_of(messages)
+        audio_names = []
+        if audios:
+            if self.audio is None:
+                raise ValueError("this server was started without the audio encoder (add an \"audio\" section to the "
+                                 "model's config), so it cannot read audio")
+            if images_of(messages):
+                raise ValueError("a request cannot carry both images and audio")
+            if "embed_files" not in getattr(self.template, "source", ""):
+                raise ValueError("this model's chat template does not read audio")
+            messages, audio_names = self.audio_messages(messages, audios)
+        self.status["max_tokens_requested"] = bool(kwargs.get("max_tokens") or kwargs.get("max_completion_tokens")
+                                                   or kwargs.get("max_new_tokens"))
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
         if self.drop_oldest:
             messages, ids = self.drop_oldest_turns(messages, tools, kwargs, ids, max_new)
@@ -4515,7 +4600,47 @@ class Service:
             ids = self.truncate_prompt_middle(ids, max_new)
         self.embeddings.path = None
         self.embeddings.keys = None
-        if images:
+        self.embeddings.kind = None
+        self.embeddings.rows = 0
+
+        def one(text):
+            return self.tok.encode(text, parse_special=True)[0]
+
+        if audio_names:
+            # The clips are decoded and converted first, then encoded in the same turn as the requests (one FIFO):
+            # the encoder and the engine never run together, and CPU or not it must not overlap a request.
+            directory = Path(tempfile.mkdtemp(prefix="strata-audio-in-"))
+            try:
+                paths = [audio_wav(item, directory, k) for k, item in enumerate(audios)]
+                self.warm_stop.set()
+                self.set_phase("queued")
+                with self._turn(cancel):
+                    self.set_phase("encode")
+                    try:
+                        clips = self.audio.encode_all(paths, cancel)
+                    except AudioCancelled:
+                        raise ClientGone() from None
+                self.set_phase("prefill", audio_prefill=True)   # the rows exist: the decoder reads them from here
+                pad = one(audio_api.AUDIO_TOKEN)
+                # The reference's expand_audio_tokens: one stamp every 60 s at secs*6.25 + 8j, the duration after.
+                ids, runs = audio_api.expand_audio_tokens(
+                    ids, pad, [c[1] for c in clips], [max(0, c[3] // 1000) for c in clips],
+                    audio_api.timing_lut(self.tok))
+                # The engine reads one SVE1 record per contiguous run of pads (an HH:MM:SS stamp splits a clip's
+                # rows), so the request's file carries the clip's rows cut at those runs, in prompt order.
+                records = [audio_api.split_records(c[0], r) for c, r in zip(clips, runs)]
+                combined = combined_embeddings_path(self.audio.dir, sum(len(r) for r in records))
+                self.embeddings.path = combined
+                self.embeddings.pad = pad
+                self.embeddings.kind = "audio"
+                self.embeddings.keys = [hashlib.sha256(f"{Path(c[0]).stem}:{off}:{count}".encode()).hexdigest()[:16]
+                                        for c, rr in zip(clips, runs) for off, count in rr]
+                self.embeddings.rows = sum(c[1] for c in clips)
+                write_bytes_temporary(combined, records)
+            finally:
+                shutil.rmtree(directory, ignore_errors=True)
+            self.last_image_at = time.time()
+        elif images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -4610,7 +4735,12 @@ class Service:
             write_temporary(combined, [p for p, _ in encoded])
         if req is not None and req.get("strata_prefix") is not None:
             req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
-        return ids, kwargs.get("enable_thinking", True) is not False, max_new
+        thinking = kwargs.get("enable_thinking", True) is not False
+        if self.audio is not None and audio_names:
+            # The audio model has no reasoning: its answer is the transcript, whatever a client's default says (the
+            # shared Chat settings' effort included).
+            thinking = False
+        return ids, thinking, max_new
 
     PREFIX_END = "\u0001strata-prefix-end\u0001"          # marks where a message's shared part ends in the rendered prompt
 
@@ -4694,6 +4824,89 @@ class Service:
         if path is not None:
             Path(path).unlink(missing_ok=True)
 
+    prefill_audio = False            # the running prefill reads audio rows (the encoder's rows are its prompt)
+
+    def set_phase(self, phase: str, audio_prefill: bool | None = None) -> None:
+        """The request phase the status page, /api/requests and the Monitor show: queued | encode | prefill |
+        generate | completed | error.  One request runs at a time; the phase is the newest one.  `audio_prefill`
+        names where the prompt came from, so the bar says "Prefill (after audio)" only when it did."""
+        if audio_prefill is not None:
+            self.prefill_audio = bool(audio_prefill)
+        with self.status_lock:
+            self.phase, self.phase_at = phase, time.time()
+            rec = getattr(self.request_trace, "record", None)
+            if rec is not None:
+                rec["phase"] = phase                     # the request list and the Monitor's tag
+            if phase == "prefill" and not getattr(self.engine, "batch", 0):
+                # a new prefill starts: the engine's (read, total) must not carry the previous request's numbers
+                self.engine.progress = None
+
+    def audio_status(self) -> dict:
+        """The encoder's `audio` block, told whether a request is between its phases right now (so the previous
+        request's GPU numbers are not shown as this one's)."""
+        if self.audio is None:
+            return {"enabled": False}
+        return self.audio.status(active=self.phase in ("encode", "prefill", "generate"))
+
+    def activity_view(self) -> dict:
+        """The newest request's phase and its real progress, for /v1/status.activity and the Monitor bar.
+        `encode` counts the audio encoder's rows (strata-audio's PROGRESS lines), `prefill` the decoder's prompt
+        read (the engine's PP counters, the audio rows included), `generate` the request's own tokens against its
+        cap.  A value that is not known is None, never 0, and a phase never reports 1.0 for itself: the bar is
+        indeterminate rather than lying.  Completed requests carry no counters at all."""
+        with self.status_lock:
+            s = dict(self.status)
+            phase, started = self.phase, self.phase_at
+        now = time.time()
+        rows_done = rows_total = prompt_read = prompt_total = generated = max_tokens = None
+        progress, detail = None, ""
+        if phase == "completed" and s.get("queued"):
+            phase = "queued"                  # a request is waiting (the model is loading or another one runs)
+        labels = {"queued": "Queued", "encode": "Encoding audio",
+                  "prefill": "Prefill (after audio)" if self.prefill_audio else "Prefill",
+                  "generate": "Generating", "completed": "Completed", "error": "Error"}
+        label = labels.get(phase, "Idle")
+        if phase == "encode" and getattr(self, "audio", None) is not None:
+            a = self.audio.progress()
+            rows_done, rows_total = a.get("rows_done"), a.get("rows_total")
+            if rows_total:
+                progress = min(0.999, max(0.0, float(rows_done or 0) / float(rows_total)))
+            detail = f"{rows_done or 0} / {rows_total} rows" if rows_total else "starting"
+            if a.get("gpu_util_pct") is not None:
+                detail += f", GPU {a['gpu_util_pct']}%"
+        elif phase == "prefill":
+            prompt_total = int(s.get("prompt_tokens") or 0)
+            pr = getattr(self.engine, "progress", None)
+            if pr:
+                prompt_read = int(pr[0])
+                prompt_total = prompt_total or int(pr[1])
+            elif prompt_total:
+                prompt_read = 0
+            if prompt_total:
+                prompt_total = max(prompt_total, prompt_read)
+                progress = min(0.999, max(0.0, prompt_read / prompt_total))
+                detail = f"{prompt_read} / {prompt_total} tokens"
+        elif phase == "generate":
+            generated = int(s.get("generated") or 0)
+            max_tokens = int(s.get("max_tokens") or 0) or None
+            if max_tokens and s.get("max_tokens_requested"):
+                progress = min(0.999, max(0.0, generated / max_tokens))
+                detail = f"{generated} / {max_tokens} tokens"
+            else:                                        # a transcript has no length until it ends
+                max_tokens = None
+                detail = f"{generated} tokens"
+        elif phase == "queued":
+            detail = ("loading the model" if not self.loaded()
+                      else "waiting for the audio turn" if getattr(self, "audio", None) is not None
+                      else "waiting for its turn")
+        return {"phase": phase, "progress": round(progress, 4) if progress is not None else None,
+                "progress_label": label, "progress_detail": detail,
+                "phase_started": int(started) if started else None,
+                "phase_elapsed_s": round(now - started, 1) if started else None,
+                "rows_done": rows_done, "rows_total": rows_total,
+                "prompt_read": prompt_read, "prompt_total": prompt_total,
+                "generated": generated, "max_tokens": max_tokens}
+
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
@@ -4751,6 +4964,127 @@ class Service:
         finally:
             if ka is not None:
                 ka.release()
+
+    def transcribe(self, ids, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
+        """The audio endpoints' path: the model's answer as text alone, with no reasoning state and no tool-call
+        parser (the transcript is the answer).  Yields ("text", delta), ("ping", None) while the engine is quiet and
+        ("done", {...}) at the end."""
+        ka = self.keep_awake
+        if ka is not None:
+            ka.acquire()
+        emb, self.embeddings.path = getattr(self.embeddings, "path", None), None
+        kind, self.embeddings.kind = getattr(self.embeddings, "kind", None), None
+        if emb:                                         # strata-poly finds the rows by their token
+            sampling = {**(sampling or {}),
+                        ("audio_pad" if kind == "audio" else "image_pad"): self.embeddings.pad}
+        self.warm_stop.set()
+        n, finish, timings = 0, "length", None
+        try:
+            got = False
+            while not got:                              # the same turn as every request: one at a time
+                got = self.fifo.acquire(timeout=QUEUE_BEAT_S)
+                if got:
+                    break
+                if cancel.is_set():
+                    return
+                yield "ping", None
+            try:
+                self.ensure_loaded()
+                with self.status_lock:
+                    self.status.update(busy=True, phase="transcribing the audio", prompt_tokens=len(ids),
+                                       generated=0, started=time.time(), first_token=None, tool=None, tail="",
+                                       max_tokens=max_new)
+                self.set_phase("prefill", audio_prefill=True)   # the decoder reads the prompt, audio rows included
+                detok = Detokenizer(self.tok)
+                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb)
+                try:
+                    for t in gen:
+                        if t is None:                   # a heartbeat while the engine reads the prompt
+                            yield "ping", None
+                            continue
+                        n += 1
+                        if t in self.stop_ids:          # the turn's end token: not text, and the answer is done
+                            finish = "stop"
+                            break
+                        piece = detok.push(t)
+                        if piece:
+                            with self.status_lock:
+                                self.status["generated"] = n
+                                if self.status.get("first_token") is None:
+                                    self.status["first_token"] = time.time()
+                                    self.phase, self.phase_at = "generate", time.time()
+                                    rec = getattr(self.request_trace, "record", None)
+                                    if rec is not None:
+                                        rec["phase"] = "generate"
+                            yield "text", piece
+                finally:
+                    try:
+                        gen.close()                     # STOP + drain to this request's DONE
+                    except EngineSilent as e:
+                        finish = "error"
+                        self._say_died(e)
+                        if not cancel.is_set():
+                            raise
+                finish = "cancel" if cancel.is_set() else ("stop" if n < max_new else "length")
+                last = getattr(self.engine, "last", None) or {}
+                timings = request_timings(len(ids), n, last)
+                yield "done", {"finish": finish, "completion_tokens": n, "timings": timings,
+                               "reused": int(last.get("reused") or 0)}
+            finally:
+                self.fifo.release()
+                with self.status_lock:
+                    self.status["busy"] = False
+                    self.status.pop("tail", None)
+                    self.status.pop("tool", None)
+        finally:
+            if emb:
+                Path(emb).unlink(missing_ok=True)
+            if ka is not None:
+                ka.release()
+
+    def transcribe_audio(self, wav: Path, task: str, language: str | None = None, prompt: str | None = None,
+                         max_new: int = 0, temperature: float = 0.0, cancel=None,
+                         target_language: str | None = None, note: bool = True,
+                         timestamps: bool = False, bound_source: str = "") -> tuple[str, dict, dict | None]:
+        """One audio endpoint's request: the clip and the instruction through prepare() (the same FIFO and audio
+        turn as a chat request), then Service.transcribe() - no reasoning, no output parser.  -> (answer, stats,
+        the `audio` facts the monitor and /v1/status keep; None when there is no encoder).  `language` is the source
+        hint of a translation (or the language a transcription asks for); `target_language` its target."""
+        started = time.perf_counter()
+        requested = max_new
+        messages = [{"role": "user", "content": [
+            {"type": "audio", "source": str(wav), "format": "wav", "name": Path(wav).name},
+            {"type": "text", "text": transcribe_api.instruction(task, language, prompt, target_language,
+                                                                timestamps=timestamps)},
+        ]}]
+        ids, _, max_new = self.prepare(messages, None, {"enable_thinking": False}, max_new, cancel=cancel)
+        source = bound_source or (f"requested {requested}" if requested else "context room")
+        print(f"[strata] audio {task}: output bound {max_new} tokens"
+              f" ({source}); "
+              f"context {getattr(self.engine, 'known_ctx', 0)}, prompt {len(ids)} tokens", flush=True)
+        rows = int(getattr(self.embeddings, "rows", 0) or 0)
+        sampling = {"temperature": float(temperature)} if temperature and temperature > 0 else {}
+        parts: list[str] = []
+        done: dict = {}
+        for kind, x in self.transcribe(ids, max_new, sampling, cancel):
+            if kind == "text":
+                parts.append(x)
+            elif kind == "done":
+                done = x
+        text = "".join(parts).strip()
+        # The model sometimes writes its turn terminator as text; a transcript is never the terminator.
+        for end in ("</s>", "<|message_sep|>", "<|role_sep|>", "<|/file|>"):
+            while text.endswith(end):
+                text = text[:-len(end)].rstrip()
+        text = transcribe_api.clean_answer(text)
+        facts = None
+        if self.audio is not None:
+            timings = done.get("timings") or {}
+            facts = self.audio.note(task, language, audio_api.wav_seconds(wav) or 0.0, rows,
+                                    (time.perf_counter() - started) * 1000.0,
+                                    prefill_ms=timings.get("prompt_ms"), decode_ms=timings.get("predicted_ms"),
+                                    update=note)
+        return text, done, facts
 
     def remember_reasoning(self, text: str, reasoning: str):
         """#25: an answer's thinking, by its text, for a client that sends the answer back without it (the chat page,
@@ -4848,8 +5182,10 @@ class Service:
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
-        if emb:                                         # strata-poly finds the images' rows by their token
-            sampling = {**(sampling or {}), "image_pad": self.embeddings.pad}
+        kind, self.embeddings.kind = getattr(self.embeddings, "kind", None), None
+        if emb:                                         # strata-poly finds the rows by their token
+            sampling = {**(sampling or {}),
+                        ("audio_pad" if kind == "audio" else "image_pad"): self.embeddings.pad}
         self.warm_stop.set()                            # a warm read (start_warm()) gives way
         if self.warm_start and tools and not emb:
             self.keep_start(ids)
@@ -5973,6 +6309,21 @@ def make_handler(svc: Service):
             self.end_headers()
             self.wfile.write(body)
 
+        def _text(self, code: int, text: str, content_type: str = "text/plain; charset=utf-8"):
+            """A plain-body answer (the audio endpoints' `text`, `srt` and `vtt` formats)."""
+            body = text.encode("utf-8")
+            if self.record is not None:
+                with svc.status_lock:
+                    self.record["http_status"] = code
+                    limit = 262144
+                    self.record.update(response=text[:limit], response_truncated=len(text) > limit)
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self._cors()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def _authorized(self) -> bool:
             if not svc.api_key:
                 return True
@@ -6191,6 +6542,9 @@ def make_handler(svc: Service):
                                headers={"Retry-After": int(ra)} if ra else None)
                 return
             try:
+                if path in ("/v1/audio/transcriptions", "/v1/audio/translations"):
+                    self._audio(path)
+                    return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
@@ -6330,6 +6684,163 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+
+        def _audio(self, path):
+            """POST /v1/audio/transcriptions and /v1/audio/translations: OpenAI's multipart form, the clip through the
+            audio encoder and GigaChat's plain-text answer in the requested response_format."""
+            task = "translate" if path.endswith("/translations") else "transcribe"
+            fields, files = transcribe_api.parse_multipart(self.headers.get("Content-Type", ""), self._body())
+            model = (fields.get("model") or "").strip()
+            if not model:
+                raise ValueError("model is required (the installed model's name, e.g. gigachat-audio-10b-a1.8b)")
+            upload = files.get("file") or files.get("audio")
+            if upload is None:
+                raise ValueError("file is required: send the clip as multipart/form-data (curl: -F file=@a.wav)")
+            filename, data = upload
+            fmt = (fields.get("response_format") or "json").strip().lower()
+            if fmt not in transcribe_api.FORMATS:
+                raise ValueError(f"response_format={fmt!r}: one of {', '.join(transcribe_api.FORMATS)}")
+            language = transcribe_api.check_language(fields.get("language"))
+            target_language = transcribe_api.check_language(fields.get("target_language"), "target_language") \
+                if task == "translate" else None
+            if task == "translate" and target_language is None:
+                target_language = "en"
+            max_tokens = transcribe_api.parse_max_tokens(fields.get("max_tokens"))
+            timestamps = transcribe_api.parse_timestamps(fields.get("timestamps"))
+            model_times = transcribe_api.parse_model_timestamps(fields.get("model_timestamps"))
+            asked = [v for k, v in fields.items() if k.startswith("timestamp_granularities")]
+            granularities = [g.strip() for v in asked for g in v.split(",") if g.strip()]
+            want_cues = transcribe_api.wants_cues(timestamps, fmt, granularities)
+            if fmt in ("srt", "vtt") and not want_cues:
+                raise ValueError(f"response_format={fmt} needs timestamps: omit timestamps or send timestamps=true")
+            temperature = transcribe_api.parse_temperature(fields.get("temperature"))
+            self.record = svc.begin_request(path, {"model": model, "response_format": fmt, "language": language,
+                                                   "target_language": target_language,
+                                                   "filename": filename, "temperature": temperature})
+            directory = Path(tempfile.mkdtemp(prefix="strata-audio-in-"))
+            try:
+                wav = transcribe_api.upload_to_wav(data, filename, directory)
+                duration = audio_api.wav_seconds(wav) or 0.0
+                self.cancel = threading.Event()
+                self._watch_client(self.cancel)
+                started = time.time()
+                seg_seconds = segment_api.check_segment_seconds(fields.get("segment_seconds"))
+                overlap = segment_api.check_overlap_seconds(fields.get("overlap_seconds"), seg_seconds)
+                cues = None
+                silent = transcribe_api.is_silent(wav)
+                with svc.use_model(model, self.cancel):     # the model the form names, loaded if it is not
+                    svc.load()
+                    plan = segment_api.plan(wav, seg_seconds, overlap) if duration > seg_seconds else \
+                        ([segment_api.Part(0.0, duration)] if duration > 0 else [])
+                    want_times = model_times
+                    if silent:                              # no speech: the model would invent a refusal
+                        text, done, cues, plan = "", {"completion_tokens": 0, "timings": {}}, \
+                            ([] if want_cues else None), []
+                        facts = {"task": task, "language": language, "duration_s": duration, "rows": 0,
+                                 "encode_ms": 0, "prefill_ms": 0, "decode_ms": 0,
+                                 "rtf": 0.0 if duration else None}
+                        print(f"[strata] audio {task}: {duration:.1f} s without speech (silence, tone or noise), no transcription",
+                              flush=True)
+                    elif len(plan) > 1:
+                        paths = segment_api.write_parts(wav, plan, directory)
+                        texts, raw, rows, chunks, device = [], [], 0, 0, None
+                        enc = pref = dec = tokens = 0.0
+                        for i, (part, path) in enumerate(zip(plan, paths)):
+                            # A part's own length bounds its answer: 8 tokens a second is twice the measured rate,
+                            # so a loop on noise stops here instead of running to the context limit.
+                            bound = max_tokens or max(128, min(32768, int(round(part.seconds * 8)) + 128))
+                            t, d, f = svc.transcribe_audio(path, task, language, fields.get("prompt"), bound,
+                                                           temperature, self.cancel,
+                                                           target_language=target_language, note=False,
+                                                           timestamps=want_times,
+                                                           bound_source=f"{bound} from {part.seconds:.0f} s")
+                            tm = d.get("timings") or {}
+                            raw.append(t)
+                            texts.append(transcribe_api.plain_text(t))
+                            tokens += float(d.get("completion_tokens") or 0)
+                            pref += float(tm.get("prompt_ms") or 0.0)
+                            dec += float(tm.get("predicted_ms") or 0.0)
+                            if f:
+                                enc += float(f.get("encode_ms") or 0.0)
+                                rows += int(f.get("rows") or 0)
+                                chunks += int(f.get("chunks") or 0)
+                                device = f.get("device") or device
+                            print(f"[strata] audio part {i + 1}/{len(plan)} "
+                                  f"[{part.start:.2f},{part.end:.2f}] ({part.seconds:.2f} s): "
+                                  f"encode {float((f or {}).get('encode_ms') or 0):.0f} ms, "
+                                  f"prefill {float(tm.get('prompt_ms') or 0):.0f} ms, "
+                                  f"decode {float(tm.get('predicted_ms') or 0):.0f} ms, "
+                                  f"{int(d.get('completion_tokens') or 0)} tokens", flush=True)
+                        text, audit, kept = segment_api.stitch_parts(
+                            texts, overlap, warn=lambda m: print(f"[strata] audio stitch: {m}", flush=True))
+                        if want_cues:
+                            cues = segment_api.timed_cues(raw, plan, kept, audit)
+                        for i, a in enumerate(audit):
+                            print(f"[strata] audio boundary {i + 1}/{len(audit)}: {a['method']}, "
+                                  f"cut {a['cut']} words, matched {a['matched']}, "
+                                  f"head-before-match {a['before']}, tail-after-match {a['after']}, "
+                                  f"recovered {a.get('recovered', 0)} ({a.get('recovered_text', '')!r}); "
+                                  f"prev tail {a['prev_tail']!r} | next head {a['next_head']!r} | "
+                                  f"kept {a['kept_head']!r}", flush=True)
+                        done = {"completion_tokens": int(tokens),
+                                "timings": {"prompt_ms": pref, "predicted_ms": dec}}
+                        if svc.audio is not None:
+                            facts = svc.audio.note(task, language, duration, rows,
+                                                   (time.time() - started) * 1000.0,
+                                                   prefill_ms=pref, decode_ms=dec, encode_ms=enc, chunks=chunks)
+                            if device:
+                                facts["device"] = device
+                        else:
+                            facts = {"task": task, "language": language, "duration_s": duration, "rows": rows,
+                                     "encode_ms": int(round(enc)), "prefill_ms": int(round(pref)),
+                                     "decode_ms": int(round(dec)),
+                                     "rtf": round(enc / 1000.0 / duration, 3) if duration else None}
+                    else:
+                        bound = max_tokens or max(128, min(32768, int(round(duration * 8)) + 128))
+                        text, done, facts = svc.transcribe_audio(wav, task, language, fields.get("prompt"),
+                                                                 bound, temperature, self.cancel,
+                                                                 target_language=target_language,
+                                                                 timestamps=want_times,
+                                                                 bound_source=f"{bound} from {duration:.0f} s")
+                        if duration > 0 and want_cues:
+                            cues = segment_api.timed_cues([text], [segment_api.Part(0.0, duration)])
+                elapsed = time.time() - started
+                if self.record is not None and facts is not None:
+                    self.record["audio"] = {k: facts[k] for k in
+                                            ("task", "language", "duration_s", "rows", "device", "encode_ms",
+                                             "prefill_ms", "decode_ms", "rtf") if k in facts}
+                    for k in ("gpu_util_pct", "vram_mib"):
+                        if facts.get(k) is not None:
+                            self.record["audio"][k] = facts[k]
+                timings = done.get("timings") or {}
+                speed = f", {timings['predicted_per_second']:.0f} tok/s" if timings.get("predicted_per_second") else ""
+                print(f"[strata] audio {task}: {duration:.1f} s of audio in {elapsed:.1f} s, "
+                      f"{done.get('completion_tokens', 0)} tokens{speed}, {fmt}, language "
+                      f"{transcribe_api.language_of(text, language)}", flush=True)
+            except Exception:
+                if svc.audio is not None:
+                    svc.audio.note_error()
+                raise
+            finally:
+                shutil.rmtree(directory, ignore_errors=True)
+            if fmt == "text":
+                self._text(200, transcribe_api.plain_text(text) + "\n")
+            elif fmt == "srt":
+                body = transcribe_api.srt_cues(cues) if cues is not None else transcribe_api.srt(text, duration)
+                self._text(200, body, "application/x-subrip; charset=utf-8")
+            elif fmt == "vtt":
+                body = transcribe_api.vtt_cues(cues) if cues is not None else transcribe_api.vtt(text, duration)
+                self._text(200, body, "text/vtt; charset=utf-8")
+            elif fmt == "verbose_json":
+                body = transcribe_api.verbose_json_cues(task, text, duration, language, cues, target_language) \
+                    if cues is not None else \
+                    transcribe_api.verbose_json(task, text, duration, language, granularities,
+                                                target_language=target_language)
+                if not want_cues:
+                    body.pop("segments", None)      # by default the endpoint answers with text alone
+                self._json(200, body)
+            else:
+                self._json(200, {"text": transcribe_api.plain_text(text)})
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
@@ -7468,11 +7979,12 @@ def engine_exe(cfg: dict) -> str:
 
 
 def start_model(cfg: dict, tok, lazy: bool = False):
-    """A run config's engine, started (with `lazy`: left for the first request to start), and its vision encoder:
-    (engine, vision, sampling defaults, the engine's arguments for an effort at the end or None, and the replica
-    card groups).  SystemExit for
+    """A run config's engine, started (with `lazy`: left for the first request to start), its vision encoder and its
+    audio encoder: (engine, vision, audio, sampling defaults, the engine's arguments for an effort at the end or None,
+    and the replica card groups).  SystemExit for
     a config that cannot be used, RuntimeError for an engine that does not start."""
     vision = None
+    audio = None
     env = child_env(cfg)
     sampling_defaults = sampling_defaults_from_config(cfg)
     if sampling_defaults:
@@ -7492,6 +8004,14 @@ def start_model(cfg: dict, tok, lazy: bool = False):
               "vision encoder unloaded; it starts with the model ...", flush=True)
         vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                         env=vision_env(cfg, env), lazy=lazy)
+    if cfg.get("audio"):
+        # relative paths are the config's cwd's, as for the engine above; it runs on the CPU and takes no VRAM
+        acfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                    if k in ("exe", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
+                for k, v in cfg["audio"].items()}
+        print("the audio encoder starts with the first clip (CPU) ...", flush=True)
+        audio = Audio(acfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                      env=dict(env), lazy=True)
     print("model unloaded; the first request loads it ..." if lazy else
           "loading the model (the first start takes a minute or two) ...", flush=True)
     warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
@@ -7529,7 +8049,7 @@ def start_model(cfg: dict, tok, lazy: bool = False):
                              linux_desktop()) if not groups else None
     if note:                                        # #560 #516: before --open starts a browser on that card
         print(note, flush=True)
-    return engine, vision, sampling_defaults, effort_end, groups
+    return engine, vision, audio, sampling_defaults, effort_end, groups
 def start_replicas(cfg: dict, groups: list[list[int]], exe: str, effort_end: list[str], lazy: bool):
     """Opt-in data-parallel replicas (serve/replicas.py): one StrataEngine per card group, each with its own cards, log
     and CPU cores, started together; the ReplicaEngine in front spreads the requests."""
@@ -7640,8 +8160,9 @@ def default_model_name(cfg: dict) -> str:
 def shutdown(svc: Service, httpd, hub=None) -> None:
     """Ctrl+C / SIGTERM: stop serving, then end the engine and the vision encoder that run now - after a switch not the
     ones the server started with (#37) - and the MCP servers PolyStrata started."""
-    engine, vision = svc.engine, svc.vision
+    engine, vision, audio = svc.engine, svc.vision, getattr(svc, "audio", None)
     closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
+               audio.shutdown if audio else None,
                hub.close if hub is not None else None]
     for close in filter(None, closers):
         try:
@@ -7734,15 +8255,15 @@ def main() -> int:
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
-        engine, vision, sampling_defaults, effort_end, groups = start_model(cfg, tok, a.lazy or cfg.get("lazy_load") is True)
+        engine, vision, audio, sampling_defaults, effort_end, groups = start_model(cfg, tok, a.lazy or cfg.get("lazy_load") is True)
     else:
         effort_end = None
-        engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+        engine, vision, audio, sampling_defaults = MockEngine(tok, a.script or [
+            "Thinking about it.</think>\n\nHello from the mock engine."]), None, None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's
     tpl = tpath / "chat_template.jinja"
     svc = Service(engine, tok, ChatTemplate(tpl if tpl.exists() else ROOT / "serve/chat_template.jinja"),
-                  model_name=default_model_name(cfg), vision=vision,
+                  model_name=default_model_name(cfg), vision=vision, audio=audio,
                   sampling_defaults=sampling_defaults)
     svc.overrides, svc.cfg_overrides = overrides, cfg_overrides
     svc.apply_settings(settings)

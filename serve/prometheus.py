@@ -60,6 +60,80 @@ def _num(v, default=0):
     return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
 
 
+def audio_metrics(a: dict) -> str:
+    """The `strata_audio_*` families for one `Audio` (the `audio` block of GET /v1/status), or "" when this model has
+    no audio encoder.  `encode_seconds` is `strata-audio` alone (the Conformer, CPU or CUDA), the quantiles from the
+    encoder's own `OK` lines; `prefill_seconds` and `decode_seconds` are the decoder's two phases of the last
+    request; `rtf` is the encode against the clip's length.  The GPU families exist only where they were sampled."""
+    if not a or not a.get("enabled"):
+        return ""
+    model = str(a.get("model") or "").replace("\\", "\\\\").replace('"', '\\"')
+    lab = f'model="{model}"'
+    out: list[str] = []
+
+    def family(name: str, kind: str, help_: str, samples: list[str]):
+        if not samples:
+            return
+        out.append(f"# HELP {name} {help_}\n# TYPE {name} {kind}")
+        out.extend(samples)
+
+    up = 1 if a.get("encoder") == "running" else 0
+    dev = str(a.get("device") or "cpu").replace("\\", "\\\\").replace('"', '\\"')
+    family("strata_audio_encoder_up", "gauge", "1 while the audio encoder process runs.",
+           [f'strata_audio_encoder_up{{{lab},device="{dev}"}} {up}'])
+    # The GPU families exist only where they were sampled: the CPU path reports no device numbers.
+    if a.get("gpu_util_pct") is not None:
+        family("strata_audio_encoder_gpu_utilization", "gauge",
+               "GPU busy over the last encode, percent (or the live value while it runs).",
+               [f'strata_audio_encoder_gpu_utilization{{{lab},device="{dev}"}} {_num(a.get("gpu_util_pct"))}'])
+    if a.get("vram_mib") is not None:
+        family("strata_audio_encoder_vram_mib", "gauge", "VRAM the encoder holds, MiB.",
+               [f'strata_audio_encoder_vram_mib{{{lab},device="{dev}"}} {_num(a.get("vram_mib"))}'])
+    if a.get("workspace_mib") is not None:
+        family("strata_audio_encoder_workspace_mib", "gauge", "VRAM the encoder's graph buffers take, MiB.",
+               [f'strata_audio_encoder_workspace_mib{{{lab},device="{dev}"}} {_num(a.get("workspace_mib"))}'])
+    last = a.get("last") or {}
+    if last.get("prefill_ms") is not None:
+        family("strata_audio_prefill_seconds", "gauge",
+               "The last audio request's decoder prefill (the prompt with the audio rows).",
+               [f'strata_audio_prefill_seconds{{{lab},device="{dev}"}} {round(last["prefill_ms"] / 1000, 6)}'])
+    if last.get("decode_ms") is not None:
+        family("strata_audio_decode_seconds", "gauge", "The last audio request's decoder token loop.",
+               [f'strata_audio_decode_seconds{{{lab},device="{dev}"}} {round(last["decode_ms"] / 1000, 6)}'])
+    if a.get("encoding") and a.get("encode_ms_live") is not None:
+        family("strata_audio_encode_live_seconds", "gauge", "How long the clip being encoded has taken so far.",
+               [f'strata_audio_encode_live_seconds{{{lab},device="{dev}"}} '
+                f'{round(_num(a.get("encode_ms_live")) / 1000, 3)}'])
+        if a.get("rows_done") is not None:
+            family("strata_audio_rows_done", "gauge", "Rows the clip being encoded has finished.",
+                   [f'strata_audio_rows_done{{{lab},device="{dev}"}} {_num(a.get("rows_done"))}'])
+    req = a.get("requests") or {}
+    family("strata_audio_requests_total", "counter", "Finished audio requests, by task.",
+           [f'strata_audio_requests_total{{{lab},task="{task}"}} {_num(req.get(task))}'
+            for task in ("transcribe", "translate")])
+    family("strata_audio_errors_total", "counter", "Audio requests that failed after their form was read.",
+           [f"strata_audio_errors_total{{{lab}}} {_num(req.get('errors'))}"])
+    family("strata_audio_seconds_total", "counter", "Audio transcribed or translated, in seconds.",
+           [f"strata_audio_seconds_total{{{lab}}} {round(_num(a.get('audio_seconds')), 3)}"])
+    family("strata_audio_rows_total", "counter", "Audio encoder rows the requests read.",
+           [f"strata_audio_rows_total{{{lab}}} {_num(a.get('rows'))}"])
+    lat = a.get("encode_latency_ms") or a.get("latency_ms") or {}
+    samples = [f'strata_audio_encode_seconds{{{lab},quantile="0.5"}} {round(p / 1000, 6)}'
+               for p in [lat.get("p50")] if isinstance(p, (int, float)) and not isinstance(p, bool)]
+    samples += [f'strata_audio_encode_seconds{{{lab},quantile="0.95"}} {round(p / 1000, 6)}'
+                for p in [lat.get("p95")] if isinstance(p, (int, float)) and not isinstance(p, bool)]
+    count = _num(a.get("encode_count"))
+    if count:
+        samples += [f"strata_audio_encode_seconds_sum{{{lab}}} {round(_num(a.get('encode_ms_total')) / 1000, 6)}",
+                    f"strata_audio_encode_seconds_count{{{lab}}} {count}"]
+    family("strata_audio_encode_seconds", "summary", "The audio encoder alone for a whole request.", samples)
+    family("strata_audio_rtf", "gauge", "The last audio request's real-time factor (encode seconds / audio seconds).",
+           [f"strata_audio_rtf{{{lab}}} {last['rtf']}"] if isinstance(last.get("rtf"), (int, float)) else [])
+    family("strata_audio_queue", "gauge", "Audio requests waiting for the audio turn.",
+           [f"strata_audio_queue{{{lab}}} {_num(a.get('queue'))}"])
+    return "\n".join(out) + "\n" if out else ""
+
+
 def render(m: dict, lat: dict) -> str:
     """The text for one scrape.  `m` is Service.metrics(), `lat` Latencies.snapshot()."""
     model = str((m.get("engine") or {}).get("model") or "strata").replace("\\", "\\\\").replace('"', '\\"')
@@ -103,6 +177,9 @@ def render(m: dict, lat: dict) -> str:
         out.append(f'{name}_bucket{{{lab},le="+Inf"}} {n}')
         out.append(f"{name}_sum{{{lab}}} {round(total, 6)}\n{name}_count{{{lab}}} {n}")
     strata(m, out, lab)
+    audio = audio_metrics(m.get("audio") or {})
+    if audio:
+        out.append(audio.rstrip("\n"))
     return "\n".join(out) + "\n"
 
 

@@ -540,14 +540,16 @@ struct Session {
     }
 };
 
-// GEN <max_new> [key=value ...] <id,id,...>, or GENI with the file of the prompt's pictures ahead of the ids and
-// the key image_pad, the token whose runs in the ids are the pictures' places.  turn_at is the place in the ids
+// GEN <max_new> [key=value ...] <id,id,...>, or GENI/GENA with the file of the prompt's pictures/audio ahead of
+// the ids and the key image_pad/audio_pad, the token whose runs in the ids are their places.  turn_at is the place
 // where the prompt's last turn begins (the server knows the template's turn tokens): a checkpoint goes there.
 bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t& pad, int64_t& turn_at,
                std::string& pictures, std::vector<int32_t>& ids) {
     const bool geni = line.rfind("GENI ", 0) == 0;
+    const bool gena = line.rfind("GENA ", 0) == 0;
+    const bool embeddings = geni || gena;
     char* p = nullptr;
-    max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &p, 10);
+    max_new = std::strtoll(line.c_str() + (embeddings ? 5 : 4), &p, 10);
     if (max_new < 1) return false;
     pad = -1;
     turn_at = -1;
@@ -573,11 +575,12 @@ bool parse_gen(const std::string& line, long long& max_new, Sampling& s, int32_t
         else if (key == "penalty_present") s.penalty_present = std::strtof(v, nullptr);
         else if (key == "seed") s.seed = std::strtoull(v, nullptr, 10);
         else if (key == "image_pad") pad = (int32_t) std::atoi(v);
+        else if (key == "audio_pad") pad = (int32_t) std::atoi(v);
         else if (key == "turn_at") turn_at = std::strtoll(v, nullptr, 10);
         // other keys belong to the other engine and are skipped
     }
     pictures.clear();
-    if (geni) {
+    if (embeddings) {
         const char* end = std::strchr(p, ' ');
         if (!end || end == p || pad < 0) return false;
         pictures.assign(p, (size_t) (end - p));
@@ -735,8 +738,8 @@ int serve(Session& ss) {
         admit = -1;
         gives_to = -1;
         long long admit_max = 0;
-        if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
-            const bool img = line[4] == 'I';
+        if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0 || line.rfind("BGENA ", 0) == 0) {
+            const bool img = line[4] == 'I' || line[4] == 'A';
             char* e1 = nullptr;
             const long b = std::strtol(line.c_str() + (img ? 6 : 5), &e1, 10);
             char* e2 = nullptr;
@@ -748,7 +751,7 @@ int serve(Session& ss) {
             }
             admit = (int) b;
             admit_max = mn;
-            line = std::string(img ? "GENI 1" : "GEN 1") + e2;
+            line = std::string(img ? (line[4] == 'A' ? "GENA 1" : "GENI 1") : "GEN 1") + e2;
         }
         long long max_new = 0;
         Sampling s;
@@ -803,8 +806,9 @@ int serve(Session& ss) {
             std::fflush(stdout);
             continue;
         }
-        if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
-            std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> image_pad=<id> <file> <id,id,...>\n");
+        if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0 && line.rfind("GENA ", 0) != 0) {
+            std::printf("ERR expected: GEN <max_new> <id,id,...>, GENI <max_new> image_pad=<id> <file> <id,id,...> or "
+                        "GENA <max_new> audio_pad=<id> <file> <id,id,...>\n");
             std::fflush(stdout);
             continue;
         }
@@ -826,8 +830,9 @@ int serve(Session& ss) {
             continue;
         }
         std::string wrong;
+        const bool audio = line.rfind("GENA ", 0) == 0;   // audio rows are embeddings too: any model that reads them
         if (file.empty()) pictures = Pictures{};
-        else if (!engine.sees()) wrong = "this model does not read pictures";
+        else if (!audio && !engine.sees()) wrong = "this model does not read pictures";
         else wrong = take_pictures(file, pad, engine.n_embd(), ids, pictures);
         if (!wrong.empty()) {
             std::printf("ERR %s\n", wrong.c_str());
@@ -1084,6 +1089,8 @@ void usage() {
                  "                         131072 for Qwen3.6, Ornith and Tiel, all of it for the others; 0 = all)\n"
                  "  --no-graphs            launch a token's kernels one by one (default: a layer's are recorded once\n"
                  "                         as a CUDA graph and replayed)\n"
+                 "  --mla-fused            GigaChat Audio's absorbed MLA reads the q8_0 latent cache straight into\n"
+                 "                         fp16 tensor-core tiles instead of copying keys to floats (default: off)\n"
                  "  --kv-whole             give the attention caches VRAM for the whole context at load (default: as\n"
                  "                         the conversation grows, the expert cache having the rest until then)\n"
                  "  --kv fmt               the K and V attention caches' format, opt-in: fp16 (default,\n"
@@ -1212,6 +1219,7 @@ int main(int argc, char** argv) {
         else if (a == "--any-node") o.stay_near = false;
         else if (a == "--lock-experts") o.lock_experts = true;
         else if (a == "--no-graphs") o.graphs = false;
+        else if (a == "--mla-fused") o.mla_fused = true;
         else if (a == "--kv-whole") o.kv_grow = false;
         else if (a == "--kv") {
             const std::string fmt = val();
