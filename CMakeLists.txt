@@ -2237,6 +2237,14 @@ if(STRATA_NATIVE_EXPERTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP) AND NOT S
     target_link_libraries(poly_kv_q8_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                                   Threads::Threads)
     add_test(NAME poly_kv_q8_test COMMAND poly_kv_q8_test)
+    # the Q4_0 KV cache kernels (store_q4 / store_q4_at) and the Hadamard rotation (fwht_rows) against a host
+    # reference (GPU, synthetic, no model)
+    add_executable(poly_kv_q4_test src/poly/kv_q4_test.cpp src/poly/kernels.cu)
+    target_include_directories(poly_kv_q4_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                       ${_strata_gpu_include_directories})
+    target_link_libraries(poly_kv_q4_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
+                                                  Threads::Threads)
+    add_test(NAME poly_kv_q4_test COMMAND poly_kv_q4_test)
   endif()
   # --kv int8/int8k's kernels (store_int8 / attend_int8) against ggml's own quantizer and against attend() over the
   # same numbers in fp16.  The reference is ggml-cpu's quantize_row_q8_0_ref, hence the ggml links; under HIP the

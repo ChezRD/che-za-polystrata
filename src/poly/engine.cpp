@@ -1605,6 +1605,9 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     if (gigachat && (o.conversation_cache_auto || o.conversation_cache_mib > 0))
         throw std::runtime_error("--conversation-cache-mib parking is not supported for deepseek2/gigachat_audio "
                                  "(this is a '" + name + "' model); pass 0");
+    // K8V4 is the qwen35moe reader: Q8_0 keys (q8_0's own) and rotated Q4_0 values (qwen35.cpp).
+    if (o.kv_format == KvFmt::kK8V4 && !qwen35)
+        throw std::runtime_error("--kv k8v4 is supported for qwen35moe models; this is a '" + name + "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))

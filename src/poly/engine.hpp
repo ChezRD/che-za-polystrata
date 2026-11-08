@@ -45,8 +45,11 @@ struct Likeliest;
 /// deltas in two arrays, which a reader can take four codes to a load, and int8k keeps only the keys' side
 /// quantized.  q8_0 is qwen35moe's; int8 and int8k are Gemma 4's - the two readers are not the same arithmetic,
 /// so a model has one or the other rather than a choice between them.  Auto is resolved from model
-/// geometry before allocation on Metal; other backends default to fp16.
-enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3 };
+/// geometry before allocation on Metal; other backends default to fp16.  k8v4 is qwen35moe's too: the keys stay
+/// Q8_0 (their scores are the q8_0 ones), the values are rotated by the head's Hadamard matrix and stored as
+/// Q4_0 (18 bytes a 32-value block), and the attention's output is rotated back before the gate - 832 bytes a
+/// cell against q8_0's 1,088 for heads of 256 and two KV heads.
+enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kK8V4 = 4 };
 
 struct Options {
 #if defined(STRATA_GPU_METAL)
@@ -236,6 +239,8 @@ public:
     /// (both sides, or the keys' side alone under int8k).
     bool int8() const { return opt_.kv_format == KvFmt::kInt8 || opt_.kv_format == KvFmt::kInt8K; }
     bool int8k() const { return opt_.kv_format == KvFmt::kInt8K; }
+    /// The keys in Q8_0 (exactly q8_0's), the values rotated and in Q4_0: --kv k8v4.
+    bool k8v4() const { return opt_.kv_format == KvFmt::kK8V4; }
 
     /// Forget the sequence.
     void reset();

@@ -1160,7 +1160,10 @@ void usage() {
                  "                         the conversation grows, the expert cache having the rest until then)\n"
                  "  --kv fmt               the K and V attention caches' format, opt-in: fp16 (default,\n"
                  "                         unchanged); q8_0 (ggml Q8_0 blocks: half the KV VRAM, slightly\n"
-                 "                         different answers; qwen35moe's, kolibri1's and Flint's); int8 / int8k (Gemma 4's:\n"
+                 "                         different answers; qwen35moe's, kolibri1's and Flint's); k8v4 (qwen35moe's:\n"
+                 "                         keys as q8_0, values rotated by the head's Hadamard matrix and in\n"
+                 "                         Q4_0: 832 bytes a cell against q8_0's 1,088 at 256 values and two\n"
+                 "                         KV heads); int8 / int8k (Gemma 4's:\n"
                  "                         the same Q8_0 rule with the codes and their deltas in two arrays, so a\n"
                  "                         reader takes four codes to a load; int8k keeps the keys' side\n"
                  "                         quantized and the values' in fp16)\n"
@@ -1287,10 +1290,11 @@ bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching) {
             if (bad) return false;
             if (fmt == "fp16") o.kv_format = KvFmt::kFp16;
             else if (fmt == "q8_0") o.kv_format = KvFmt::kQ8_0;
+            else if (fmt == "k8v4") o.kv_format = KvFmt::kK8V4;
             else if (fmt == "int8") o.kv_format = KvFmt::kInt8;
             else if (fmt == "int8k") o.kv_format = KvFmt::kInt8K;
             else {
-                c.error = "--kv " + fmt + ": unknown format (use fp16, q8_0, int8 or int8k)";
+                c.error = "--kv " + fmt + ": unknown format (use fp16, q8_0, k8v4, int8 or int8k)";
                 std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
                 return false;
             }

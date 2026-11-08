@@ -70,6 +70,11 @@ private:
         uint16_t* k_scales = nullptr;
         int8_t*   v_codes  = nullptr;
         uint16_t* v_scales = nullptr;
+        // k8v4 (opt-in): the keys are the q8_0 ones (k_codes/k_scales), the values are rotated by the head's
+        // Hadamard matrix and stored as Q4_0's nibbles and scales, in two arrays as q8_0's are:
+        // n_kv*(head_dim/32) blocks of 16 bytes, and as many fp16 scales a row.  v_codes/v_scales stay null.
+        uint8_t*  v_q4        = nullptr;
+        uint16_t* v_q4_scales = nullptr;
         Dev sh_gate_inp;   ///< the shared expert's gate
     };
 

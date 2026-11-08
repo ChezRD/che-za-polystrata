@@ -27,6 +27,12 @@ bool fattn_fits(int dim, int n_head, int kv_heads, int rows, size_t scratch_floa
 bool fattn_q8(const float* q, Kvq8 kq8, Kvq8 vq8, int64_t pos, int n, float* out, int dim, int n_head, int kv_heads,
               float scale, float* scratch, size_t scratch_floats, void* stream);
 
+/// fattn_q8() over K8V4: q8_0 keys and Q4_0 values (Kvq4).  The values are dequantized into the scratch like the
+/// q8_0 ones, so the MMA kernel reads both as fp16; the caller rotates the values before storing them and the
+/// output back afterwards.
+bool fattn_k8v4(const float* q, Kvq8 kq8, Kvq4 vq4, int64_t pos, int n, float* out, int dim, int n_head,
+                int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream);
+
 /// fattn_q8() over an fp16 cache (keys and vals, kv_heads * dim halves a row).
 bool fattn_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64_t pos, int n, float* out, int dim,
                int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream);
@@ -43,6 +49,11 @@ bool fdec_fits(int dim, int n_head, int kv_heads, int rows, size_t scratch_float
 /// with others. scratch holds the splits' results; false, with nothing enqueued, where fdec_fits() is false.
 bool fdec_q8(const float* q, Kvq8 kq8, Kvq8 vq8, int64_t pos, int n, const long long* at, int room, float* out,
              int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream);
+
+/// fdec_q8() over K8V4: q8_0 keys (read exactly as fdec_q8() reads them) and Q4_0 values, dequantized in
+/// registers as the product takes them, so the whole cache is never turned into fp16.
+bool fdec_k8v4(const float* q, Kvq8 kq8, Kvq4 vq4, int64_t pos, int n, const long long* at, int room, float* out,
+               int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream);
 
 /// fdec_q8() over an fp16 cache (keys and vals, kv_heads * dim halves a row), read where it lies.
 bool fdec_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64_t pos, int n, const long long* at,
