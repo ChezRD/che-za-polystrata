@@ -146,6 +146,23 @@ class CarryOver(unittest.TestCase):
             self.assertEqual(new["args"], ["--expert-profile", "/data/expert-profile.bin"])
             same = {"args": ["--expert-profile", "/old/expert-profile.bin"]}
             self.assertEqual(setup.carry_over(same, new), [])
+            # a save path inside a repository does not come back over the pack path setup now writes
+            repo = {"args": ["--expert-profile", "/repo/data/expert-profile.bin",
+                             "--expert-profile-save", "/repo/data/expert-profile-iq2_xs.bin"]}
+            pack = {"args": ["--expert-profile", "/cache/packs/iq2_xs/expert-profile.bin",
+                             "--expert-profile-save", "/cache/packs/iq2_xs/expert-profile.bin"]}
+            self.assertEqual(setup.carry_over(repo, pack), [])
+            self.assertEqual(setup.flag_value(pack["args"], "--expert-profile-save"),
+                             "/cache/packs/iq2_xs/expert-profile.bin")
+
+    def test_the_seed_is_copied_into_the_pack_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            pack = Path(d) / "iq2_xs"
+            first = setup.install_expert_profile(pack, "expert-profile.bin")
+            self.assertEqual(first, pack / "expert-profile.bin")
+            self.assertTrue(first.is_file())
+            first.write_bytes(b"learned")
+            self.assertEqual(setup.install_expert_profile(pack, "expert-profile.bin").read_bytes(), b"learned")
 
     def test_a_missing_mmproj_is_not_carried(self):
         old = {"vision": {"mmproj": "/nowhere/mmproj-Q8_0.gguf", "gpu": True}}

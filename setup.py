@@ -5347,6 +5347,18 @@ def flag_value(args: list, flag: str):
     return None
 
 
+def install_expert_profile(pack: Path, name: str = "expert-profile.bin") -> Path:
+    """The profile this install reads and writes: a file in the model's pack, in the data folder. On this PC that
+    folder is the Hugging Face cache. The copy in the repository is only the seed. A file already in the pack stays,
+    so a ranking the engine saved is not replaced by the seed on the next setup."""
+    profile = Path(pack) / name
+    shipped = ROOT / "data" / name
+    if shipped.is_file() and not profile.exists():
+        profile.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(shipped, profile)
+    return profile
+
+
 def carry_profile_args(old: dict, cfg: dict) -> list[str]:
     """#775: a learned expert profile the user wired in by hand (--expert-profile <their file>, --expert-profile-save
     <file>) survives a setup run: setup writes the shipped profile, which a measured one of their own beats (2.5-3.1x at
@@ -8609,8 +8621,9 @@ def main() -> int:
         # (a 4-shard file: the engine finds the PLE table's shard itself from shard 1, the measured setup)
         model_args = ["--pack", str(pack), "--native", str(shards[0]),
                       *(["--ple-gguf", str(ple)] if len(shards) <= 2 else [])]
+    profile = install_expert_profile(pack, fam.get("profile", "expert-profile.bin"))
     args = [*model_args,
-            "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
+            "--expert-profile", str(profile), "--expert-profile-save", str(profile), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
     if scaling is not None:     # the resolved config: explicit flags as given, or the automatic yarn+factor

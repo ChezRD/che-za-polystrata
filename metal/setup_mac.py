@@ -354,8 +354,9 @@ def engine_args(pack: Path, shards: list, rt: Path, ctx: int, stream: bool = Fal
     args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(shards[1])]
     if shards[0].name.endswith("-metal.gguf"):         # the repacked file: it is its own dense GGUF
         args += ["--native-dense-gguf", str(shards[0])]
+    profile = pack / "expert-profile.bin"             # the pack is in the data folder, not the repository
     args += [
-            "--expert-profile", str(ROOT / "data" / "expert-profile.bin"), "--expert-cache", "64",
+            "--expert-profile", str(profile), "--expert-profile-save", str(profile), "--expert-cache", "64",
             "--prefill", "auto", "--spec", str(STREAM_SPEC if stream and mtp else 2)]
     args += ["--suffix-draft", "0"] if stream else []
     args += ["--mtp", str(rt)] if mtp else []
@@ -985,8 +986,9 @@ def main(argv=None) -> int:
     cfg = mac_config(exe, engine_args(pack, shards, rt, ctx, stream, info["ram_gb"]), pack, f"{fam['name']}-{model.lower()}", tag, port)
     if ready:
         cfg["args"] += ["--native-dense-gguf", str(rp["dense"]), "--embd-gguf", str(rp["embd"])]
-    if fam.get("profile"):
-        cfg["args"][cfg["args"].index("--expert-profile") + 1] = str(ROOT / "data" / fam["profile"])
+    profile = S.install_expert_profile(pack, fam.get("profile") or "expert-profile.bin")
+    for flag in ("--expert-profile", "--expert-profile-save"):
+        cfg["args"][cfg["args"].index(flag) + 1] = str(profile)
     if a.parallel is not None:
         cfg["parallel"] = max(1, a.parallel)
     cfg["env"] = {"STRATA_METAL_STREAM": "1" if stream else "0"}   # the engine follows setup's measured choice
