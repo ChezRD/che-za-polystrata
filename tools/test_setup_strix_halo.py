@@ -123,7 +123,7 @@ class Gfx1103Switches(unittest.TestCase):
         engine keeps gfx1103 out of its own arch defaults, so setup writes this set."""
         src = (ROOT / "src/core/arch_defaults.cpp").read_text(encoding="utf-8")
         tail = src.split("gfx_arch_is_gfx1151(gcn_arch)) return t;", 1)[1]
-        block = tail.rsplit("t = {", 1)[1].split("};", 1)[0]              # the gfx1151 switch table
+        block = tail[tail.index("t = {"):].split("};", 1)[0]              # the gfx1151 switch table (the first one: the arch defaults, not the batch table below it)
         gfx1151 = dict(re.findall(r'\{"(STRATA_[A-Z0-9_]+)",\s*"([^"]+)"\}', block))
         self.assertIn("STRATA_HCD_EXACT", gfx1151)                       # the parse found the gfx1151 block
         self.assertEqual(setup.GFX1103_SWITCHES,
@@ -140,7 +140,7 @@ class Gfx1150Switches(unittest.TestCase):
         engine keeps gfx1150 out of its own arch defaults (src/core/arch_defaults_test.cpp), so setup writes this set."""
         src = (ROOT / "src/core/arch_defaults.cpp").read_text(encoding="utf-8")
         tail = src.split("gfx_arch_is_gfx1151(gcn_arch)) return t;", 1)[1]
-        block = tail.rsplit("t = {", 1)[1].split("};", 1)[0]              # the gfx1151 switch table
+        block = tail[tail.index("t = {"):].split("};", 1)[0]              # the gfx1151 switch table (the first one: the arch defaults, not the batch table below it)
         gfx1151 = dict(re.findall(r'\{"(STRATA_[A-Z0-9_]+)",\s*"([^"]+)"\}', block))
         self.assertIn("STRATA_HCD_EXACT", gfx1151)                       # the parse found the gfx1151 block
         self.assertEqual(setup.GFX1150_SWITCHES,
