@@ -20,6 +20,11 @@ offers the same steps as tools.
 - How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
   the [paper](docs/paper/Strata-Paper.pdf).
 - AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+- The engine is synced from Strata as a unit: `src/`, `include/`, `metal/`, `sycl/`, `cmake/`, `tests/`, `CMakeLists.txt`
+  and the `third_party/ggml` headers. A branch named `upstream-engine-<tag>` holds one snapshot commit made on the last
+  common base, and `main` merges it; the server, installer, tools, docs and the app stay out of that snapshot. The
+  previous snapshot is the merge base for the next sync. Metal is merged by code (upstream reworked it heavily) but
+  cannot be built or run without a Mac, so say what was not tested.
 - Text taken from the Strata project names that project. After merging from it,
   `python tools/polystrata_names.py` writes PolyStrata again; its first lines say what it leaves alone.
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
