@@ -1,3 +1,32 @@
+// The CUDA function-space qualifiers and the few launch/kernel spellings the shared sources use.  On Metal they say
+#include "cuda_launch.h"
+// nothing: a "kernel" here is an MSL function compiled at run time and dispatched by the host runtime, so the qualifiers
+// are empty and __forceinline__ is plain inline.  Part of the metal_compat layer (M5 Max, 2026-10-23).
+#ifndef __host__
+#define __host__
+#endif
+#ifndef __device__
+#define __device__
+#endif
+#ifndef __global__
+#define __global__
+#endif
+#ifndef __shared__
+#define __shared__
+#endif
+#ifndef __constant__
+#define __constant__
+#endif
+#ifndef __forceinline__
+#define __forceinline__ inline
+#endif
+#ifndef __launch_bounds__
+#define __launch_bounds__(...)
+#endif
+#ifndef __restrict__
+#define __restrict__
+#endif
+
 // metal/include/metal_compat/cuda_runtime.h - the CUDA runtime names the host files use, on Metal.
 //
 // The HIP build's approach (include/strata/hip_compat/cuda_runtime.h maps every cudaX the host code calls to hipX),
@@ -77,7 +106,7 @@ inline cudaError_t cudaDeviceGetAttribute(int* v, cudaDeviceAttr a, int d) {
 }
 inline cudaError_t cudaDeviceCanAccessPeer(int* v, int d, int p) { return strata::gpu::device_can_access_peer(v, d, p); }
 inline cudaError_t cudaDeviceEnablePeerAccess(int p, unsigned f) { return strata::gpu::device_enable_peer_access(p, f); }
-inline cudaError_t cudaDeviceDisablePeerAccess(int) { return strata::gpu::compat_detail::bad(); }
+inline cudaError_t cudaDeviceDisablePeerAccess(int) { return cudaSuccess; }   // a Mac has one GPU: nothing to disable
 
 // ---- memory and copies
 template <class T> inline cudaError_t cudaMalloc(T** p, size_t n) { return strata::gpu::malloc_device(p, n); }
@@ -107,8 +136,9 @@ inline cudaError_t cudaMemcpy2D(void* d, size_t dp, const void* s, size_t sp, si
 inline cudaError_t cudaMemcpyPeerAsync(void* d, int dd, const void* s, int sd, size_t n, cudaStream_t st = nullptr) {
     return strata::gpu::memcpy_peer_async(d, dd, s, sd, n, st);
 }
-inline cudaError_t cudaMemcpyPeer(void*, int, const void*, int, size_t) {
-    return strata::gpu::compat_detail::bad();
+inline cudaError_t cudaMemcpyPeer(void* d, int dd, const void* s, int sd, size_t n) {
+    const cudaError_t e = cudaMemcpyPeerAsync(d, dd, s, sd, n, nullptr);
+    return e != cudaSuccess ? e : cudaDeviceSynchronize();
 }
 
 // ---- streams, events, host functions
@@ -158,4 +188,11 @@ inline cudaError_t cudaGraphExecDestroy(cudaGraphExec_t x) { return strata::gpu:
 
 inline cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* x, cudaGraph_t g, unsigned long long f) {
     return strata::gpu::graph_instantiate(x,g,f);
+}
+
+// occupancy query: the Metal runtime decides its own threadgroup limits, so answer "one block" and let the caller size grids
+template <typename K, typename... A>
+static inline strata::gpu::Error cudaOccupancyMaxActiveBlocksPerMultiprocessor(int* n, K&&, int, A&&...) {
+    if (n) *n = 1;
+    return strata::gpu::kSuccess;
 }
