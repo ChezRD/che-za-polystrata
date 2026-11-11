@@ -1605,9 +1605,10 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     if (gigachat && (o.conversation_cache_auto || o.conversation_cache_mib > 0))
         throw std::runtime_error("--conversation-cache-mib parking is not supported for deepseek2/gigachat_audio "
                                  "(this is a '" + name + "' model); pass 0");
-    // K8V4 is the qwen35moe reader: Q8_0 keys (q8_0's own) and rotated Q4_0 values (qwen35.cpp).
-    if (o.kv_format == KvFmt::kK8V4 && !qwen35)
-        throw std::runtime_error("--kv k8v4 is supported for qwen35moe models; this is a '" + name + "' model");
+    // K8V4 is qwen35moe's and Flint's: Q8_0 keys (q8_0's own) and rotated Q4_0 values.
+    if (o.kv_format == KvFmt::kK8V4 && !qwen35 && name != "flint")
+        throw std::runtime_error("--kv k8v4 is supported for qwen35moe and flint models; this is a '" + name +
+                                 "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))
@@ -4745,11 +4746,11 @@ void Engine::run(const int32_t* tokens, int n) {
     // call's tokens together are [0, window) by their number, and a half of a window comes after those, by the
     // window's tokens and which half it is.  Which tokens leave their state is the window's, so its halves' too.
     const size_t wn = (size_t) opt_.window, recs = 3 * wn + (size_t) opt_.batch + 1;   // step()'s rows after
-    const auto up = [&](int il, int m, size_t rec) {
+    const auto up = [&](int il, int m, size_t rec, const float* add) {
         Layer& L = layers_[(size_t) il];
         const size_t head = (size_t) head_key(il, m) * recs + rec;
-        if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head(L, il, m); });
-        else layer_head(L, il, m);
+        if (replay && L.fixed) replayed(L.heads, head, [&] { layer_head_add(L, il, m, add); });
+        else layer_head_add(L, il, m, add);
         if (!L.moe || batched(L, m)) return;
         ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
         if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, m); });
@@ -4799,7 +4800,7 @@ void Engine::run(const int32_t* tokens, int n) {
                 tail(il, m, rec);
             }
             for (int j = il < 0 ? lo_ : il + 1; j < hi_; ++j) {
-                up(j, m, rec);
+                up(j, m, rec, nullptr);
                 if (layers_[(size_t) j].moe) break;
             }
         };
@@ -4884,13 +4885,19 @@ void Engine::run(const int32_t* tokens, int n) {
         for (int il = lo_; il < hi_; ++il) stats_.gpu_experts += layers_[(size_t) il].moe ? n * n_used_ : 0;
         return;
     }
+    // A model whose first norm sums the previous layer's tail (head_adds_tail()) does it in the launch that reads
+    // the row: the same axpy, one launch less a layer, and the last layer of the card keeps its own tail.
+    const bool fold = head_adds_tail() && !opt_.dump;
+    const float* add = nullptr;
     for (int il = lo_; il < hi_; ++il) {
         Layer& L = layers_[(size_t) il];
-        up(il, n, (size_t) n - 1);
+        up(il, n, (size_t) n - 1, add);
+        add = nullptr;
         if (!L.moe) continue;
         if (batched(L, n)) moe_rows(L, il, n);
         else if (!on_card(il, n, (size_t) n - 1) && moe(L, il, n)) moe_add(n);
-        tail(il, n, (size_t) n - 1);
+        if (fold && il + 1 < hi_) add = fo_;
+        else tail(il, n, (size_t) n - 1);
     }
 }
 
@@ -5121,6 +5128,13 @@ void Engine::layer(int il, int n) {
         if (moe(L, il, n)) moe_add(n);
     }
     layer_tail(L, il, n);
+}
+
+// layer_head() with the layer before's tail (fo_) summed into the residual first: what run() asks a head that
+// takes it, for a model whose first norm is that sum.  The default: the axpy() the layer's tail is, then the head.
+void Engine::layer_head_add(Layer& L, int il, int n, const float* add) {
+    if (add) axpy(add, 1.f, r_, (size_t) n * n_embd_, true, st_);
+    layer_head(L, il, n);
 }
 
 // A prompt's tokens in the calls eval() would get, max_rows() at a time.  With experts outside the cache, each

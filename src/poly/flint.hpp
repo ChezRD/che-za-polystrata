@@ -27,6 +27,8 @@ protected:
     int widest() const override { return n_head_ * head_dim_; }
     int streams() const override { return 1; }
     void layer_head(Layer& L, int il, int n) override;
+    void layer_head_add(Layer& L, int il, int n, const float* add) override;
+    bool head_adds_tail() const override { return true; }
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
     void route(int il, const float* logits, int32_t token, int* ids, float* w, float* tmp) const override;
@@ -39,6 +41,9 @@ protected:
     bool batch_heads() const override { return true; }
 
 private:
+    /// Device-to-host and host-to-device, one call each; the formats' rows go through these.
+    void stage_out(const void* src, uint8_t* dst, size_t bytes);
+    void stage_in(uint8_t* dst, const void* src, size_t bytes);
     /// A layer's weights beside the ones every architecture has (Layer), and its caches.
     struct Block {
         bool swa = false;    ///< attends a sliding window; its caches are rings
@@ -50,6 +55,8 @@ private:
         uint16_t* k_scales = nullptr;
         int8_t* v_codes = nullptr;
         uint16_t* v_scales = nullptr;
+        uint8_t* v_q4 = nullptr;        ///< --kv k8v4: the values' Q4_0 nibbles, after the head's Hadamard
+        uint16_t* v_q4_scales = nullptr;
         Dev ffn_gate, ffn_up, ffn_down;   ///< a dense layer's FFN
         std::vector<float> probs_b;       ///< the bias the routed experts' pick adds to the gates (zeros without one)
         Dev probs_b_dev;
@@ -79,6 +86,7 @@ private:
     float* awork_ = nullptr;   ///< a prompt batch's attention (attend_batch)
     float* q8w_ = nullptr;     ///< a --kv q8_0 prompt batch's K and V, dequantized to fp16 (kwork | vwork)
     size_t work_halves_ = 0;   ///< the halves of each of q8w_'s two halves
+    uint16_t* ringw_ = nullptr;   ///< a quantized window layer's ring as fp16 for a prompt batch (K | V, ring_ rows each)
 };
 
 }  // namespace strata::poly

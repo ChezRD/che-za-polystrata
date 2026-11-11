@@ -432,6 +432,13 @@ protected:
     virtual void layer_head(Layer& L, int il, int n) = 0;
     /// The routed experts' sum (fo_) into the layer's output.
     virtual void layer_tail(Layer& L, int il, int n) = 0;
+    /// Whether layer_head_add() sums the previous layer's tail into the residual in the launch that already reads
+    /// the row (its first norm), so run() need not call layer_tail() before it.  The same bits: axpy()'s add.
+    virtual bool head_adds_tail() const { return false; }
+    /// layer_head() with `add` (null: none) summed into the residual first, as axpy() sums it: the work of the
+    /// layer before it.  The default is that axpy() and layer_head(); a head whose first norm takes the sum folds
+    /// them into one launch.
+    virtual void layer_head_add(Layer& L, int il, int n, const float* add);
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
     virtual void output_rows(int first, int rows, float* h) = 0;
     /// A token's experts and their weights from its scores at layer il's router.  `token` is the token the row is

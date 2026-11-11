@@ -313,8 +313,6 @@ int main(int argc, char** argv) {
     std::printf("query heads %d, KV heads %d, group %d\n", kHeads, kKvHeads, kHeads / kKvHeads);
     if (fattn_fits(kDim, 24, kKvHeads, kBatch, kScore) ||
         fdec_fits(kDim, 24, kKvHeads, 1024, kScore) ||
-        fattn_fits(128, kHeads, kKvHeads, kBatch, kScore) ||
-        fdec_fits(128, kHeads, kKvHeads, 1024, kScore) ||
         fattn_fits(kDim, kHeads, 0, kBatch, kScore) ||
         fdec_fits(kDim, kHeads, 0, 1024, kScore) ||
         fattn_fits(kDim, kHeads, kKvHeads, kBatch, 0) ||

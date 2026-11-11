@@ -200,8 +200,8 @@ to 8 GB of free VRAM (`--vram-reserve-mib`), Linux, CUDA 12.8, 22 CPU threads on
 
 At 28.9K of context q8_0 reads the prompt 24-31% slower and writes 38-40% slower; a short chat is 2-4% slower.
 The expert cache held 5,483 experts under q8_0 against 5,401 under fp16. Neither arm runs the tensor-core decode
-kernel (`STRATA_FDEC` prints nothing for Flint), so both decode through `attend()`, and q8_0's readers dequantize
-the rows as they read them. Probably the laptop and the RX 7900 XT above spend most of a step on the experts, so
+kernel in this measurement (it predates Flint's `fdec`), so both decoded through `attend()`, and q8_0's readers
+dequantize the rows as they read them. Probably the laptop and the RX 7900 XT above spend most of a step on the experts, so
 the readers' cost hides there, while on this card the experts are fast and the attention at 28.9K is a larger
 part of a step; the step was not timed part by part. The greedy answers left fp16's at token 27 to 61, and the
 text read fine.

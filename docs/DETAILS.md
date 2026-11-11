@@ -2125,14 +2125,17 @@ also parts from itself between runs.
 ## strata-poly: tensor-core decode attention (on by default from 4,096 tokens of context; `STRATA_FDEC=0` turns it off)
 
 The decode side of the same layers: the few tokens of an answer's step (one, or a window of guesses). Once the cache
-holds 4,096 positions they go through a kernel of this project's own (`fdec_q8()` / `fdec_f16()` in `src/poly/fattn.cu`)
+holds 4,096 positions they go through a kernel of this project's own (`fdec_q8()` / `fdec_k8v4()` / `fdec_f16()` in
+`src/poly/fattn.cu`)
 instead of `attend()`'s score, softmax and value kernels, which write every score to memory and read it back twice.
 One CUDA block takes 1,024 keys of a KV head's group for up to 4 tokens (group 8) or 2 tokens (group 16) as flash
 attention on the tensor cores. The cache is read once for those tokens, and the blocks are merged by their softmax
-max and sum. q8_0 and fp16 caches, heads of 256 values, 8 or 16 heads a group, Ampere or later NVIDIA.
+max and sum, with a head's learned sink weighed in as one more score that has no value. q8_0, k8v4 and fp16 caches,
+heads of 128 or 256 values, 8 or 16 heads a group, Ampere or later NVIDIA.
 A token gets the same bits alone or in a window, as
-with `attend()`. No VRAM is added. The server logs `STRATA_FDEC: decode attention through the tensor-core decode
-kernel from 4,096 tokens of context`; Turing, HIP and other models keep the old path, and so does `STRATA_FDEC=0`.
+with `attend()`. No VRAM is added. The qwen35 server logs `STRATA_FDEC: decode attention through the tensor-core
+decode kernel from 4,096 tokens of context`; Flint does not print that line. Turing, HIP and models that do not call
+`fdec` keep the old path, and so does `STRATA_FDEC=0`.
 Below 4,096 positions the old path stays, since its kernel is the faster one there (below); `STRATA_FDEC=1` uses
 the new one from the first position, as the opt-in did.
 
@@ -2146,6 +2149,22 @@ arithmetic in doubles where `attend()` is within 1e-6. A long-context question s
 repository's source, temperature 0) got the same 11 of 12 checkable answers right with and without it, and its
 answers part from the old path's about as early as two runs of the old path part from each other. The 107K and a
 247K recall test passed.
+
+**Flint-abliterated-Mix-12G** (49 layers, 14 of them full, a head of 128 values) on an RTX 4060 Ti 16 GB
+(Ada, sm_89), `--vram-reserve-mib 2048`, the integrated GPU not used, with
+`--no-draft`, the 256K-character prompt and an 8,192-token answer, one warm run each: decode with a q8_0 cache 46.4
+tokens/s at 131K of context and 30.7 at 256K with the lookup off, 119.1 and 97.6 with it on; with k8v4 48.1 and
+30.2 off, 119.3 and 82.2 on.  The lookup-on answer was a numbered list; those rates are the lookup's, not the
+model's.  Decode is the average over the answer, not the last token.  These numbers use the current binary with the
+IQ1_S kernels (type 19; at 20K the same decode rose from 79.8 to 92.7 tokens/s, see [FLINT.md](FLINT.md)). Prefill
+was q8_0 1,945 and 1,268, k8v4 1,948 and 1,277 at 131K and 256K; the first q8_0 pass read the model cold (1,718 and
+1,112), so the q8_0 ranges are 1,718-1,945 and 1,112-1,268. The window layers now dequantize their ring once into
+fp16 and read it through `attn_flash128`, which is where the gain over the earlier 1,593 and 1,105 comes from. The fp16
+prompt kernel now walks 32 keys a step, two blocks an SM; against `attend()`
+it differs by 2.1e-4 on 4,096 tokens and 1.7e-5 at 8,192 (`bench/micro/attn128_bench.cu`).
+Teacher-forced top-1 against fp16, 8 prompts of 8,192 random tokens and 48 answers: q8_0 90.1% without fdec and
+90.4% with, k8v4 84.1% and 83.3%; at 512-token prompts, where the old path is still used, 91.2% (q8_0) and 91.7%
+(k8v4). Below 4,096 positions the greedy answers are bit-identical to the old path's.
 
 **Both, measured again before they became the default** on an RTX PRO 6000 (sm_120, CUDA 12.8) held to 12 GB with
 `--vram-reserve-mib`, Qwen3.6-35B-A3B UD-Q3_K_M with setup's own flags, fp16 cache, the expert split frozen, a

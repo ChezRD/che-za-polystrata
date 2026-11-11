@@ -2156,19 +2156,20 @@ attn_flash64_kernel(const float* __restrict__ q, const half* __restrict__ kcache
 
 // attend_batch() for heads of 128 values in groups of 8 (Flint's), the way attn_flash64_kernel goes, with a window
 // over a ring of rows and a sink a head: a launch block takes FLASH128_TOKENS tokens of a group, 64 rows of queries
-// with a token's 8 heads side by side, a warp two tokens, and walks the keys 64 at a time.  The walk starts at a
-// multiple of 64, so a token's keys go in the same blocks whatever tokens the call has beside it: a block it attends
-// none of changes none of its sums.  The two buffers of keys and values take 68 KiB, past the 48 a block has without
-// asking: the launch asks for them (attend_batch()).
-constexpr int FLASH128_TOKENS = 8, FLASH128_KEYS = 64, FLASH128_ROW = 128 + 8;
+// with a token's 8 heads side by side, a warp two tokens, and walks the keys a step at a time.  The walk starts at a
+// multiple of the step, so a token's keys go in the same blocks whatever tokens the call has beside it: a block it
+// attends none of changes none of its sums.  A step of 32 keys takes 34 KiB of the two buffers, so two blocks fit an
+// SM; 64 takes 68, past the 48 a block has without asking.
+constexpr int FLASH128_TOKENS = 16, FLASH128_KEYS = 32, FLASH128_ROW = 128 + 8;
 constexpr int FLASH128_SMEM = 2 * 2 * FLASH128_KEYS * FLASH128_ROW * int(sizeof(half));
 
-__global__ void __launch_bounds__(4 * WARP)
+// 32 keys a step keeps the registers for two blocks an SM (the second number of __launch_bounds__).
+__global__ void __launch_bounds__(8 * WARP, 2)
 attn_flash128_kernel(const float* __restrict__ q, const half* __restrict__ kcache, const half* __restrict__ vcache,
                      float* __restrict__ out, int rows, int n_head, int kv_heads, long long pos, float scale_log2,
                      int window, int ring, const float* __restrict__ sinks) {
 #if STRATA_POLY_MMA
-    constexpr int DIM = 128, G = 8, KEYS = FLASH128_KEYS, ROW = FLASH128_ROW;
+    constexpr int DIM = 128, G = 8, KEYS = FLASH128_KEYS, NS = KEYS / 8, KV = KEYS / 16, ROW = FLASH128_ROW;
     extern __shared__ __align__(16) half flash_sm[];
     half(*ks)[KEYS][ROW] = reinterpret_cast<half(*)[KEYS][ROW]>(flash_sm);
     half(*vs)[KEYS][ROW] = reinterpret_cast<half(*)[KEYS][ROW]>(flash_sm + 2 * KEYS * ROW);
@@ -2191,7 +2192,7 @@ attn_flash128_kernel(const float* __restrict__ q, const half* __restrict__ kcach
     const long long hi = pos + min(t0 + FLASH128_TOKENS, rows);
     const long long lo = window > 0 ? max(0LL, pos + t0 - window + 1) : 0;
     const auto fetch = [&](int buf, long long k0) {
-        for (int i = threadIdx.x; i < KEYS * DIM / 8; i += 4 * WARP) {
+        for (int i = threadIdx.x; i < KEYS * DIM / 8; i += blockDim.x) {
             const int r = i / (DIM / 8), c = 8 * (i % (DIM / 8));
             const long long key = k0 + r;
             const bool whole = key >= lo && key < hi;   // the others are zeros, which no weight reads
@@ -2213,10 +2214,10 @@ attn_flash128_kernel(const float* __restrict__ q, const half* __restrict__ kcach
             flash_wait<0>();
         }
         __syncthreads();
-        float s[8][4];
-        for (int n = 0; n < 8; ++n) {
+        float s[NS][4];
+        for (int n = 0; n < NS; ++n) {
             s[n][0] = s[n][1] = s[n][2] = s[n][3] = 0.0f;
-            for (int k = 0; k < 8; k += 2) {
+            for (int k = 0; k < DIM / 16; k += 2) {
                 uint32_t b[4];   // keys 8 n.., values 16 k.. and 16 (k + 1)..
                 ldmatrix_x4(b, &ks[buf][8 * n + lane % 8][16 * k + 8 * (lane / 8)], false);
                 mma16816(s[n], qa[k], b);
@@ -2226,7 +2227,7 @@ attn_flash128_kernel(const float* __restrict__ q, const half* __restrict__ kcach
         for (int i = 0; i < 2; ++i) {
             const long long own = pos + tok[i];   // the row's token attends positions (own - window, own]
             float mx = -INFINITY;
-            for (int n = 0; n < 8; ++n)
+            for (int n = 0; n < NS; ++n)
                 for (int j = 2 * i; j < 2 * i + 2; ++j) {
                     const long long key = k0 + 8 * n + 2 * tig + j % 2;
                     if (key > own || (window > 0 && key <= own - window)) s[n][j] = -INFINITY;
@@ -2242,13 +2243,13 @@ attn_flash128_kernel(const float* __restrict__ q, const half* __restrict__ kcach
                 o[n][2 * i] *= f;
                 o[n][2 * i + 1] *= f;
             }
-            for (int n = 0; n < 8; ++n)
+            for (int n = 0; n < NS; ++n)
                 for (int j = 2 * i; j < 2 * i + 2; ++j) {
                     s[n][j] = exp2f(s[n][j] - base);
                     l[i] += s[n][j];
                 }
         }
-        for (int k = 0; k < 4; ++k) {   // keys 16 k..: the weights as an A fragment
+        for (int k = 0; k < KV; ++k) {   // keys 16 k..: the weights as an A fragment
             const uint32_t pa[4] = {half2_bits(s[2 * k][0], s[2 * k][1]), half2_bits(s[2 * k][2], s[2 * k][3]),
                                     half2_bits(s[2 * k + 1][0], s[2 * k + 1][1]),
                                     half2_bits(s[2 * k + 1][2], s[2 * k + 1][3])};
@@ -3362,6 +3363,18 @@ size_t attend_split_floats(int chunk, int n_head, int max_rows, int dim) {
     return size_t(chunk) * n_head * grid(size_t(max_rows), SPLIT_KEYS) * (dim + 2);
 }
 
+bool attend_batch_flash128(int dim, int per) { return dim == 128 && per == 8 && kernels_ptx() >= 80; }
+
+void dequant_q8_to_f16(const int8_t* codes, const uint16_t* scales, uint16_t* out, int width, int64_t first, int rows,
+                       void* stream) {
+    dequant_q8_kernel<<<dim3(grid(width, 256), rows), 256, 0, cs(stream)>>>(codes, scales, (half*) out, width, first);
+}
+
+void dequant_q4_to_f16(const uint8_t* q4, const uint16_t* scales, uint16_t* out, int width, int64_t first, int rows,
+                       void* stream) {
+    dequant_q4_kernel<<<dim3(grid(width, 256), rows), 256, 0, cs(stream)>>>(q4, scales, (half*) out, width, first);
+}
+
 // ---------------------------------------------- the int8 attention caches' readers (--kv int8 / int8k)
 
 namespace {
@@ -4016,13 +4029,13 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
         return;
     }
     if (dim == 128 && per == 8 && !whole && kq8.codes == nullptr && vq8.codes == nullptr && vq4.q == nullptr &&
-        kernels_ptx() >= 80) {
+        attend_batch_flash128(dim, per)) {
         // the device's own setting: asked on whichever card the call is for
         const cudaError_t e =
             cudaFuncSetAttribute(attn_flash128_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, FLASH128_SMEM);
         if (e != cudaSuccess)
             throw std::runtime_error(std::string("attend_batch: shared memory: ") + cudaGetErrorString(e));
-        attn_flash128_kernel<<<dim3(grid(rows, FLASH128_TOKENS), kv_heads), 4 * WARP, FLASH128_SMEM, cs(stream)>>>(
+        attn_flash128_kernel<<<dim3(grid(rows, FLASH128_TOKENS), kv_heads), 8 * WARP, FLASH128_SMEM, cs(stream)>>>(
             q, (const half*) kcache, (const half*) vcache, out, rows, n_head, kv_heads, (long long) pos,
             scale * 1.44269504f, window, ring, sinks);
         return;

@@ -309,6 +309,17 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
                   float scale, void* stream, int window = 0, int ring = 0, bool whole = false, Kvq8 kq8 = {},
                   Kvq8 vq8 = {}, uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0,
                   const float* sinks = nullptr, Kvq4 vq4 = {});
+/// Whether attend_batch() takes its flash128 kernel here for heads of `dim` values in groups of `per`: heads of 128
+/// values in groups of 8 (Flint's), a window, a ring and sinks included, on a card running ptx 8.0's instructions.
+bool attend_batch_flash128(int dim, int per);
+/// Dequantizes `rows` rows of a Q8_0 cache, from row `first`, into `out` as fp16: `width` values a row, a scale a
+/// block of 32, as store_q8() wrote them.  A window layer's whole ring in one call is what a prompt batch needs to
+/// read it through attend_batch()'s fp16 path.
+void dequant_q8_to_f16(const int8_t* codes, const uint16_t* scales, uint16_t* out, int width, int64_t first, int rows,
+                       void* stream);
+/// The same for a k8v4 value cache: Q4_0's nibbles, 16 bytes and a scale a block of 32.
+void dequant_q4_to_f16(const uint8_t* q4, const uint16_t* scales, uint16_t* out, int width, int64_t first, int rows,
+                       void* stream);
 /// attend() over int8 caches (store_int8): the same attention, the same order of products and sums.  `q8` is scratch
 /// in the same form for this call's queries (rows * n_head * dim / kQ8_0Values blocks of codes, and as many
 /// deltas).  A score is a dp4a of a lane's own run of codes - the query's against the key's, both 4-aligned - and

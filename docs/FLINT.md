@@ -97,6 +97,153 @@ UD-Q4_K_XL reading 29,816 tokens on the RTX 5090, tokens/s, and UD-Q3_K_XL's REA
 | 372f4ece | a prompt batch's attention of heads of 128 values in registers (attn_flash128_kernel), and a few tokens' in blocks of 64 rows a launch block each | 11,864 to 12,025; one token at a time after 29,816 tokens 212 instead of 132 to 135 |
 | 3863358e | the router's product in tiles of 4 tokens by 4 outputs a thread, the same bits | 12,929 to 12,936; the laptop 1,999 to 2,006 |
 
+### The 12G mix on a 16 GB card
+
+`Flint-abliterated-Mix-12G.gguf` (49 layers, 14 of them full and 35 with a window of 513) on an RTX 4060 Ti
+16 GB (Ada, sm_89), `--vram-reserve-mib 2048` from the run config; the system's integrated GPU is not used.
+`--max-context 262144`, `--threads 8`, no draft.  The 256K-character prompt, one warm run each, an 8,192-token
+answer.  Reads are prefill; writes are decode, the average over the answer (`predicted_per_second`), not the last
+token.  "lookup" is the n-gram lookup; the on rows include its accepted guesses.  The table is the current binary,
+with the IQ1_S kernels below; the 20K decode is 92.7 tokens/s with a 1 GiB reserve (85.4 with the 2 GiB reserve
+used here).
+
+| Cache | lookup | 131K reads | 131K writes | 256K reads | 256K writes | Bytes a row |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| q8_0 | off | 1,945 (1,718-1,945) | 46.4 | 1,268 (1,112-1,268) | 30.7 | 1,088 |
+| k8v4 | off | 1,948 | 48.1 | 1,277 | 30.2 | 832 |
+| q8_0 | on | 1,939 | 119.1 | 1,274 | 97.6 | 1,088 |
+| k8v4 | on | 1,961 | 119.3 | 1,279 | 82.2 | 832 |
+
+One warm run each (the first q8_0 pass of each length read the model cold: 1,718 and 1,112), an 8,192-token answer,
+not 512: a 512-token answer measured the first tokens and the lookup's warm-up, not the steady decode.  The
+lookup-on rows use a numbered list; their writes are the lookup's, not the model's.  The lookup-off rows are the
+model alone.  The earlier 512-token table (45.9/44.9 at 131K, 23.6/29.3 at 256K) is superseded.
+
+The flags behind the table: `build-poly-local/strata-poly --model <12G>.gguf --max-context 262144 --threads 8
+--prompt-batch 2048 --no-draft`, `--kv q8_0` or `--kv k8v4`, the 12G profile at
+`packs/flint-mix12/expert-profile.txt`, and `--vram-reserve-mib 2048`.  The lookup-off rows add `--lookup 0` and
+`--expert-swaps 0`; the lookup-on rows leave the n-gram lookup at its default.  The 20K IQ1_S run used the same
+flags with `--vram-reserve-mib 1024`.
+
+The 8,192-token profile at 20K of context (`nsys`, `--no-graphs`), measured before the IQ1_S kernels, puts 12.05 s of
+the 105 s wall in `fdec` and 9.1 s in the expert matvecs; the rest is host and the other kernels.  With the default
+graphs the same 20K decode is about 380 launches a token, not 1,296 (1,296 is the `--no-graphs` mode); the GPU is
+busy 8.95 of 13.4 ms, and 4.4 ms a token is outside kernels.  The routed experts are 1.11 ms of that; `fdec` is
+1.25 ms at 20K and 16.2 ms at 256K.  `ncu` on `fdec` at 20K: 88.4% DRAM throughput, 247 GB/s, 90 us a launch,
+176 registers, 4 blocks an SM, theoretical occupancy 16.7%.  The kernel is bandwidth-bound at that length, so the
+lever at 256K is fewer bytes a key or better access, not a launch flag.
+
+The decode window of that 20K run, 105 s for 8,192 tokens: the GPU was busy 74.4 s, 70.8%, and idle 30.6 s,
+29.2%.  Of the busy time, native Q4_K was 25.5%, `fdec` 16.2%, Q6_K 14.5%, `mmvq_slots` 12.6%, Q5_K 7.7%,
+`gemv` 5.2%.  At 256K the same `fdec` work grows with the keys, so it takes the largest share; the expert matvecs
+stay about the same.
+
+At 250K with an 8,192-token answer and q8_0: 31.8 ms a token, GPU busy 26.1 ms (82%), host and gaps 5.7 ms.
+`fdec` is 18.3 ms (57.7%): 14 full layers read 3.83 GB a token at 209 GB/s.  The expert matvecs are 5.3 ms.
+Six layers (2-7) carry IQ1_S gate/up tensors.  They used to be outside the MMVQ and Slots formats, so those experts
+could never enter the cache: 36 of 282 picks a token (12.8%) always ran on the CPU, about 2-3 ms a token.  Type 19 is
+now in both, with llama.cpp's IQ1_S dot and dequantizer.  At 20K with an 8,192-token answer, q8_0 and a 1 GiB reserve:
+decode 79.8 -> 92.7 tokens/s (+16.1%), residents 9,860 -> 10,186, picks from VRAM 86.4% -> 96.6%, CPU experts 0.6 ->
+0.2 ms a token (the CLI line divides by all tokens, the prompt included).  At 250K the gain is inside the +-10%
+run-to-run spread: `fdec` dominates there, and the clean 256K row is 30.7 against 30.8 before the type.  The GPU
+dot's relative error against
+the dequantized weights is 0.029-0.033, below the CPU path's 0.043-0.049; teacher-forced top-1 against the old binary
+drops from 99.3% to 93.8% at 5K and from 100% to 89.6% at 20K, and every flip is a rank-2 near-tie.  This is a
+12G-only path: the 24G mix, UD-IQ3_XXS and UD-Q3_K_XL contain no IQ1_S tensors, so the new type changes nothing
+for them.
+
+Three things carry the writing: the split-K decode kernel (`STRATA_FDEC`, 128-value heads, with the sink of each
+head counted as a score that has no value), keys as Q8_0 and values as rotated Q4_0 (`--kv k8v4`, 832 bytes a row
+against q8_0's 1,088 and fp16's 2,048), and, for q8_0 and k8v4, a prompt batch's attention of the 14 full layers
+through llama.cpp's flash-attention MMA kernel, which reads a q8 or q4 cache in registers; the 35 window layers'
+rings are dequantized whole into fp16 and read through this project's `attn_flash128` kernel, so they no longer go
+through dequant plus cuBLAS.  An fp16 cache sends all 49 layers through the same `attn_flash128` kernel.  At 256K
+the cache takes 3.05 GB under k8v4, 3.99 under q8_0 and 7.52 under fp16 (2.84, 3.72 and
+7.00 GiB); the lookup-off runs hit 89.2% (q8_0) and 89.3% (k8v4) of their expert picks at 131K, and 78.5% and
+80.7% at 256K.  The model-alone
+decode over 8,192 tokens is 46.4 q8_0 and 48.1 k8v4 at 131K; 30.7 and 30.2 at 256K.
+The fp16 prompt kernel's 32-key step read 131K in 1,527-1,528 tokens/s against 1,387-1,437 for the
+64-key tile, 6-10%.  The bench (`bench/micro/attn128_bench.cu` with the 64-key reference in `attn128_64.cu`)
+measured 32 against 64: max |diff| 1.34e-6 at 8,192, 9.9e-5 on 2,048 tokens and 9.5e-5 on 4,096; 2,048 tokens
+0.953 ms against 1.068 (11%), 4,096 tokens 3.475 against 3.965 (12%).  On 100 random `(pos, n)` over 8,192-row
+caches, fdec differed from `attend` by at most 6.8e-5 (fp16), 1.3e-5 (q8_0) and 7.8e-6 (k8v4), none above 1e-3
+(`bench/micro/attn128_bench.cu`).  Below 4,096
+positions the answers are the old path's, bit for bit; `STRATA_FDEC=0` turns the kernel off.
+
+The k8v4 cache is weaker at long range than q8_0's in teacher-forced top-1 against fp16 (83.3% against 90.4% on 8
+prompts of 8,192 random tokens and 48 answers each; at 512-token prompts, where neither uses the split kernel,
+91.7% against 91.2%).  The plan's gate was q8_0 minus 1 point; the 8K comparison misses it by about 7 points, so
+k8v4 stays opt-in.  On the real `merge_intervals` task all three formats wrote code that passed its doctest and
+6 of 6 hidden tests.  At 131K k8v4 is 48.1 against q8_0 46.4; at 256K q8_0 is 30.7 against k8v4 30.2, a near tie.
+With lookup the numbered-list answer gave 119.1/119.3 at 131K and 97.6/82.2 at 256K; those rates are the lookup's,
+not the model's.  The earlier 512-token and 8-token comparisons are superseded.
+
+A needle test on the clean `flint-UD-IQ3_XXS` (Unsloth, 13 GiB), depth 50%, one run each, thinking budget 2,048
+tokens and answer budget 8,192, lookup off:
+
+| Cache | 32K | 128K |
+| --- | --- | --- |
+| fp16 | exact `cobalt-lantern-417` (98 tokens) | exact `cobalt-lantern-417` (136) |
+| q8_0 | missed, the answer continued the haystack (8,192) | quoted the needle sentence (26) |
+| k8v4 | quoted the needle sentence (8,192) | quoted the needle sentence (19) |
+
+Only fp16 followed "reply with the code word only".  q8_0 and k8v4 either missed or repeated the sentence that
+contains the word, so the code word was retrieved but the instruction was not followed.  This is a stronger
+quality warning than the 8K top-1 difference, and k8v4 stays opt-in.
+
+### The other quants on the same card
+
+131K of context, an 8,192-token answer, lookup off, one warm run each, the same RTX 4060 Ti 16 GB (Ada, sm_89),
+`--vram-reserve-mib 2048` and flags as the 12G table; the integrated GPU is not used.
+"Cache hit" is the share of expert picks found in VRAM, from the server's line at the end of the run.
+
+| Quant | File | q8_0 reads / writes | k8v4 reads / writes | Cache hit q8_0 / k8v4 |
+| --- | ---: | ---: | ---: | ---: |
+| Mix-12G | 11.2 GiB | 1,945 / 46.4 | 1,948 / 48.1 | 89.2% / 89.3% |
+| Mix-24G | 22.3 GiB | 1,942 / 40.3 | 1,955 / 42.0 | 39.5% / 59.2% |
+| UD-IQ3_XXS | 13.5 GiB | 1,901 / 52.4 | 1,914 / 52.0 | 90.6% / 93.9% |
+| UD-Q3_K_XL | 17.2 GiB | 1,991 / 45.1 | 1,991 / 46.6 | 78.2% / 85.9% |
+
+The 24G mix writes 40-42 tokens/s because its 22.3 GiB leaves only 39.5% of the picks in VRAM under q8_0 (59.2%
+under k8v4); the old 8-token numbers (51.3 and 61.6) measured the first tokens, not the steady decode.  UD-IQ3_XXS
+is the fastest of the four at 131K: 13.5 GiB, every expert type in MMVQ/Slots, 90.6% of the picks in VRAM under
+q8_0, 52 tokens/s.  UD-Q3_K_XL reads fastest (1,991) and writes 45-47; at 256K it reads 1,305 and writes 30.4
+(q8_0) and 31.0 (k8v4).  Only the 12G mix contains IQ1_S, so the type-19 kernels change nothing for the other
+three.
+
+At 256K, one run each, k8v4, lookup off, an 8,192-token answer, on the same RTX 4060 Ti 16 GB (Ada, sm_89)
+with `--vram-reserve-mib 2048`; the integrated GPU is not used:
+
+| Quant | prefill | decode | Cache hit |
+| --- | ---: | ---: | ---: |
+| Mix-24G | 1,236 | 30.8 | 77.6% |
+| UD-IQ3_XXS | 1,220 | 34.3 | 89.5% |
+| UD-Q3_K_XL | 1,302 | 31.2 | 73.1% |
+
+A route prior (qwen35moe's `--cache-bias`, adding F to the score of an expert in VRAM) was measured on Flint and
+rejected.  It does speed writing up: at 20K of context the share of picks found in VRAM goes 67.5% -> 84.9% and
+writing 88.2 -> 91.9 tokens/s (median of two 32-token runs, F=1.5-3); at 131K 67.4 -> 70.6 (F=3).  But teacher-forced
+top-1 against the unbiased arm fell to 73.8% (F=1.5) and 76.2% (F=3), while an unbiased control with the expert
+split frozen scored 100.0%: the bias changes the model's most likely token at about one position in four.  The
+option stays qwen35moe's; Flint does not take it.
+
+### Sparse attention with the sinks: measured, not built
+
+A per-head sink looks like the place to put the weight of the keys a sparse reader throws away: it takes weight
+and returns nothing.  The distribution says otherwise.  On the same card and the 251,585-token prompt, with the
+q8_0 cache and the dense decode path (`STRATA_FDEC=0`), 448 (layer, head) pairs of the 14 full layers:
+
+| Context | Weight in the middle, median | Pairs with the middle under 5% | Weight in the sink, median | Weight in the last 513 keys |
+| --- | ---: | ---: | ---: | ---: |
+| 64K | 90.0% | 3.6% | 1.1% | 1.8% |
+| 128K | 95.7% | 2.5% | 0.25% | 0.65% |
+| 256K | 97.2% | 2.5% | 0.22% | 0.35% |
+
+The middle is everything between key 2,048 and the last 513.  At 256K, keeping the 513-token window and the 2,048
+heaviest keys would keep 8-15% of the weight (median over heads of two layers); 8,192 keys, 28-39%; 16,384,
+42-51%.  So a sink+top-k reader would lose most of what the model attends to, and none was built.  The counters
+were a temporary instrumented build; they are not in the shipped engine.
+
 ## Long contexts
 
 Flint's model card gives it a context of 262,144 tokens; setup offers up to 131,072. The test is the one DEEPSEEK.md
