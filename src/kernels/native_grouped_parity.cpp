@@ -10,8 +10,12 @@
 // scattered destinations, stale scratch, grid_groups 0 (= cap), 1, 2, 3, 4 and above cap: the output must be BITWISE
 // equal to v1's, the rows the call must not write included (both start from the same NaN pattern).
 //
+// The IQ4_NL gate/up rows are also checked against a host dot, because v1 runs the same gate/up kernel for them (grid.y
+// and the SwiGLU pass only): a row the launch never computes is a NaN in both runs.
+//
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -272,6 +276,69 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
     g_fail += bad;
 }
 
+// The gate/up rows an IQ4_NL call wrote, against a host dot of the dequantized weight row and the dequantized q8_1
+// activation.  Bitwise equality with v1 covers neither: for IQ4_NL v1 runs the same gate/up kernel over the same rows
+// (grid.y only), so a row the launch does not cover (gu_rows not the kernel's 8) is a NaN in both runs.
+void check_iq4nl_gu(int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
+    Setup S(20, 20, H, FF, 6, 4, 4, rng, s);              // 6 tokens x 4 experts: 4 blobs
+    const int ng = S.plan_sizes({1, 2, 3, 4}, 0, rng);     // every n of the gate/up kernel's GRP_NC = 4
+    const size_t fa = ((size_t) S.cap * S.L.n_ff * sizeof(float) + 255) & ~(size_t) 255;
+    const size_t gu_n = (size_t) S.cap * S.L.n_ff;
+    ck(cudaMemset(S.scr, 0xFF, 2 * fa), "memset");         // the rows the call must write: NaN anywhere else
+    k::native_grouped_set_v1(false);
+    S.call(4, s);
+    ck(cudaStreamSynchronize(s), "sync");
+    std::vector<unsigned long long> ptr(S.n_blobs);
+    std::vector<int32_t> start(S.cap + 1), tok(S.cap);
+    ck(cudaMemcpy(ptr.data(), S.ptr, ptr.size() * 8, cudaMemcpyDeviceToHost), "ptr");
+    ck(cudaMemcpy(start.data(), S.start, (size_t) (ng + 1) * 4, cudaMemcpyDeviceToHost), "start");
+    ck(cudaMemcpy(tok.data(), S.tok, tok.size() * 4, cudaMemcpyDeviceToHost), "tok");
+    std::vector<float> gate(gu_n), up(gu_n);              // the scratch's gate, then its up rows after the padding
+    ck(cudaMemcpy(gate.data(), S.scr, gu_n * 4, cudaMemcpyDeviceToHost), "gate");
+    ck(cudaMemcpy(up.data(), S.scr + fa, gu_n * 4, cudaMemcpyDeviceToHost), "up");
+    std::vector<uint8_t> xq((size_t) S.T * (H / 32) * 36);
+    ck(cudaMemcpy(xq.data(), S.xq, xq.size(), cudaMemcpyDeviceToHost), "xq");
+    std::vector<double> x((size_t) S.T * H);
+    for (size_t b = 0; b < x.size() / 32; ++b) {           // a q8_1 block: fp16 scale, then 32 int8
+        uint16_t dh;
+        std::memcpy(&dh, &xq[b * 36], 2);
+        const double d = k::f32_from_f16(dh);
+        for (int i = 0; i < 32; ++i) x[b * 32 + i] = d * (int8_t) xq[b * 36 + 4 + i];
+    }
+    float* dwf = dalloc<float>((size_t) (2 * FF * H));
+    std::vector<float> wf((size_t) (2 * FF * H));
+    size_t nonfinite = 0;
+    double num = 0, den = 0;
+    for (int g = 0; g < ng; ++g) {
+        // the group's gate rows | up rows, by the GPU dequantizer (iq_parity checks it against gguf-py)
+        k::iq_dequant_f32(20, (const void*) ptr[g], 2 * FF * H, dwf, s);
+        ck(cudaStreamSynchronize(s), "dequant");
+        ck(cudaMemcpy(wf.data(), dwf, wf.size() * 4, cudaMemcpyDeviceToHost), "wf");
+        for (int e = start[g]; e < start[g + 1]; ++e) {
+            const double* xe = x.data() + (size_t) tok[e] * H;
+            for (int r = 0; r < FF; ++r) {
+                double acc[2] = {0, 0}, got[2] = {gate[(size_t) e * FF + r], up[(size_t) e * FF + r]};
+                for (int64_t k = 0; k < H; ++k) {
+                    acc[0] += (double) wf[(size_t) r * H + k] * xe[k];
+                    acc[1] += (double) wf[(size_t) (FF + r) * H + k] * xe[k];
+                }
+                for (int i = 0; i < 2; ++i) {
+                    if (!std::isfinite(got[i])) { ++nonfinite; continue; }
+                    num += std::fabs(got[i] - acc[i]);
+                    den += std::fabs(acc[i]);
+                }
+            }
+        }
+    }
+    cudaFree(dwf);
+    const double rel = num / (den + 1e-30);               // the type 20 dot itself measures 7e-08 (iq_multi_parity)
+    const bool ok = nonfinite == 0 && rel < 1e-2;         // iq_multi_parity's bound for that dot
+    std::printf("%-8s/%-7s %5lld x %4lld  %d groups, %d entries: gate/up %s (host dot rel %.2e)\n", name_of(20), name_of(20),
+                (long long) H, (long long) FF, ng, start[ng],
+                ok ? "agree with the host dot" : nonfinite ? "FAIL: rows not written" : "FAIL", rel);
+    if (!ok) ++g_fail;
+}
+
 // ------------------------------------------------------------------------------------------------ --bench
 // A window's 48 calls, one per layer, each with ITS OWN experts as the layers have: copies of the Setup's blobs in one
 // arena, so the weights stream from DRAM as in the engine.  (48 calls re-reading the same 28 experts - 73 MB, about an
@@ -399,7 +466,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(316);
-    for (int gu : {16, 17, 18, 21, 22, 23, 29, 42, 12, 13,
+    for (int gu : {16, 17, 18, 20, 21, 22, 23, 29, 42, 12, 13,
 #ifdef STRATA_Q6K_EXPERTS
                    14,
 #endif
@@ -407,6 +474,10 @@ int main(int argc, char** argv) {
         for (int dt : {20, 23, 42, 7, 8, 6}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS (6 = Q5_0: UD-IQ4_XS / Q3_K_XL); IQ4_XS: n_ff % 256
     check(42, 42, 2560, 640, s, rng);
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
+    check(20, 20, 2560, 640, s, rng);                                   // IQ4_NL gate/up with an IQ4_NL down
+    check(20, 8, 2560, 640, s, rng);                                    // the same gate/up with a Q8_0 down
+    check_iq4nl_gu(2560, 640, s, rng);                                  // those gate/up rows against a host dot
+    check_iq4nl_gu(512, 256, s, rng);
     // round 0214: every expert type pair of the new Unsloth Qwen3.8-Flash-Next sets at the model's 2560 x 640
     // (IQ1_M/IQ2_XXS/IQ2_XS/IQ2_S/Q2_0/IQ3_XXS/IQ4_XS gate/up; Q2_0/IQ4_NL/Q5_0/Q8_0 down; IQ4_XS is 256-wide so n_ff 640 needs a 32-block down)
     for (int gu : {29, 16, 17, 22, 42, 18, 23})
