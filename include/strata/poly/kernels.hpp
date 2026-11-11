@@ -188,12 +188,24 @@ void idx_select(const float* score, int score_stride, int32_t* sel, int sel_stri
 
 /// out = silu(min(gate, limit)) * clamp(up, -limit, limit).
 void swiglu_clamp(const float* gate, const float* up, float* out, int n, float limit, void* stream);
+/// The global scales of NVFP4 routed experts converted from NVIDIA's checkpoints (the GGUF's ffn_gate_exps.scale
+/// and ffn_up_exps.scale, one an expert), on the card.  Row r of an activation is expert ids[r]'s, or e[r]'s when
+/// ids is null: its gate values are multiplied by gate[that expert] and its up values by up[it] first.
+struct ExpertScales {
+    const float* gate = nullptr;   ///< null: none (1)
+    const float* up = nullptr;     ///< null: none (1)
+    const int32_t* ids = nullptr;
+    int32_t e[32] = {};
+};
 /// swiglu_clamp for rows that each hold n gate values and then n up values; out has n values a row.
-void swiglu_clamp_rows(const float* gate_up, float* out, int n, int rows, float limit, void* stream);
+void swiglu_clamp_rows(const float* gate_up, float* out, int n, int rows, float limit, void* stream,
+                       const ExpertScales* scales = nullptr);
 /// out = gelu(gate) * up, with the tanh form of GELU that ggml's CUDA backend computes.
 void geglu(const float* gate, const float* up, float* out, int n, void* stream);
 /// geglu for rows that each hold n gate values and then n up values; out has n values a row.
-void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream);
+void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream, const ExpertScales* scales = nullptr);
+/// w[r] *= scale[ids[r]] for `rows` weights: the down scales of ExpertScales' experts, on their routing weights.
+void expert_weights(float* w, const float* scale, const int32_t* ids, int rows, void* stream);
 /// The routing of `rows` tokens from their router scores (n_expert a token, times in_scale), as an architecture's
 /// route() does it on the host: probabilities by `gate` (0 softmax, 1 sigmoid, 2 sqrt(softplus), 3 sigmoid with the
 /// pick on the bare scores), the n_used largest of the probabilities plus `bias` (null: none), the lower expert

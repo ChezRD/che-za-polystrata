@@ -11,6 +11,8 @@
 #include <windows.h>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
+#else
+#include <sys/resource.h>
 #endif
 
 namespace {
@@ -103,7 +105,25 @@ int file_tier_prefers_direct_cases() {
 
 int main() {
     int fail_keeps = file_cache_keeps_cases() | file_tier_prefers_direct_cases();
+    if (fail_keeps != 0) {
+        std::printf("platform_memory_test: FAILED\n");
+        return 1;
+    }
     const uint64_t bytes = 256ull << 20;
+#if !defined(_WIN32)
+    // A stock Linux caps a process's locked pages at RLIMIT_MEMLOCK (8 MiB here, 64 KiB on many distributions) and
+    // mlock cannot exceed it without CAP_IPC_LOCK, so the 256 MiB lock below is impossible for this process rather
+    // than broken. Say which limit stopped it and skip: the file-tier logic above still runs and reports, and a host
+    // that allows the lock still fails a real mlock bug.
+    struct rlimit rl {};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && (uint64_t) rl.rlim_cur < bytes) {
+        std::printf("platform_memory_test: SKIPPED: RLIMIT_MEMLOCK is %llu MiB and the test locks %llu MiB "
+                    "(raise `ulimit -l` to %llu or grant CAP_IPC_LOCK)\n",
+                    (unsigned long long) ((uint64_t) rl.rlim_cur >> 20), (unsigned long long) (bytes >> 20),
+                    (unsigned long long) (bytes >> 10));
+        return 77;
+    }
+#endif
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);

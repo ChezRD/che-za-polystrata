@@ -446,13 +446,19 @@ void Qwen35::gdn(Block& B, int n) {
     lin(B.wz, xn_, z_, n, xq_);
     lin(B.alpha, xn_, alpha_, n, xq_);
     lin(B.beta, xn_, beta_, n, xq_);
-    if (rows_of_) {   // step(): each row with its own sequence's convolution and state
-        for (int i = 0; i < n; ++i) {
+    if (rows_of_) {   // step(): each sequence's rows with its own convolution and state
+        for (int i = 0, m; i < n; i += m) {
+            // a token and its guess (step() with guesses) go in one call, a window of two, leaving the state after
+            // the first at its snap for keep_step()
             const int s = rows_of_[i].seq;
+            m = i + 1 < n && rows_of_[i + 1].seq == s ? 2 : 1;
+            float* snap = rows_of_[i].snap;
             const size_t c = (size_t) i * conv_dim_, h = (size_t) i * v_heads_, d = (size_t) i * d_inner_;
-            conv4_silu(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c, conv_dim_, 1, st_);
+            conv4_silu(proj_ + c, seq_state(s, B.past), fp(B.conv), qkv_ + c, conv_dim_, m, st_,
+                       snap ? snap + (B.past - state_) : nullptr, rec_n_, snap ? 1u : 0u);
             gdn_step(qkv_ + c, alpha_ + h, beta_ + h, fp(B.dt), fp(B.a), seq_state(s, B.s), z_ + d, fp(B.o_norm),
-                     gated_ + d, s_dim_, v_heads_, k_heads_, 1, rms_eps_, st_);
+                     gated_ + d, s_dim_, v_heads_, k_heads_, m, rms_eps_, st_, snap ? snap + (B.s - state_) : nullptr,
+                     rec_n_, snap ? 1u : 0u);
         }
     } else {
         conv4_silu(proj_, B.past, fp(B.conv), qkv_, conv_dim_, n, st_,
@@ -652,47 +658,49 @@ void Qwen35::attn_rows(Block& B, int n) {
     const bool q8 = opt_.kv_format == KvFmt::kQ8_0, v4 = opt_.kv_format == KvFmt::kK8V4;
     const bool quant = q8 || v4;
     const size_t kv = (size_t) n_kv_ * head_dim_, hq = (size_t) n_head_ * head_dim_;
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0, m; i < n; i += m) {
         const Row& r = rows_of_[i];
         const long long* ai = at + 2 * i;
-        // a row at a time: the turn takes one position and counts on from it, which suits a window's rows only
+        // a sequence's rows at a time: one, or a token and its guess (step() with guesses), a window of two.  The
+        // turn takes one position and counts on from it, which suits a window's rows only.
+        m = i + 1 < n && rows_of_[i + 1].seq == r.seq ? 2 : 1;
         head_norm_rope(qg_ + 2 * i * hq, 2 * head_dim_, fp(B.q_norm), q_ + i * hq, head_dim_, n_head_, n_rot_,
-                       theta_scale_, 0, 1, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
-        head_norm_rope(kraw_ + i * kv, head_dim_, fp(B.k_norm), k_ + i * kv, head_dim_, n_kv_, n_rot_, theta_scale_, 0, 1,
+                       theta_scale_, 0, m, rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
+        head_norm_rope(kraw_ + i * kv, head_dim_, fp(B.k_norm), k_ + i * kv, head_dim_, n_kv_, n_rot_, theta_scale_, 0, m,
                        rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
         Kvq8 kq{}, vq{};
         Kvq4 vq4{};
         uint16_t *kc = nullptr, *vc = nullptr;
         if (quant) {
             kq = {(int8_t*) seq_buf(r.seq, B.k_codes), (uint16_t*) seq_buf(r.seq, B.k_scales)};
-            store_q8_at(k_ + i * kv, (int8_t*) kq.codes, (uint16_t*) kq.scales, (int) kv, ai, 1, 0, st_);
+            store_q8_at(k_ + i * kv, (int8_t*) kq.codes, (uint16_t*) kq.scales, (int) kv, ai, m, 0, st_);
             if (v4) {
                 vq4 = {(uint8_t*) seq_buf(r.seq, B.v_q4), (uint16_t*) seq_buf(r.seq, B.v_q4_scales)};
-                fwht_rows(v_ + i * kv, v_ + i * kv, n_kv_, head_dim_, st_);
-                store_q4_at(v_ + i * kv, (uint8_t*) vq4.q, (uint16_t*) vq4.scales, (int) kv, ai, 1, 0, st_);
+                fwht_rows(v_ + i * kv, v_ + i * kv, m * n_kv_, head_dim_, st_);
+                store_q4_at(v_ + i * kv, (uint8_t*) vq4.q, (uint16_t*) vq4.scales, (int) kv, ai, m, 0, st_);
             } else {
                 vq = {(int8_t*) seq_buf(r.seq, B.v_codes), (uint16_t*) seq_buf(r.seq, B.v_scales)};
-                store_q8_at(v_ + i * kv, (int8_t*) vq.codes, (uint16_t*) vq.scales, (int) kv, ai, 1, 0, st_);
+                store_q8_at(v_ + i * kv, (int8_t*) vq.codes, (uint16_t*) vq.scales, (int) kv, ai, m, 0, st_);
             }
         } else {
             kc = (uint16_t*) seq_buf(r.seq, B.keys);
             vc = (uint16_t*) seq_buf(r.seq, B.vals);
-            store_f16_at(k_ + i * kv, kc, (int) kv, ai, 1, 0, st_);
-            store_f16_at(v_ + i * kv, vc, (int) kv, ai, 1, 0, st_);
+            store_f16_at(k_ + i * kv, kc, (int) kv, ai, m, 0, st_);
+            store_f16_at(v_ + i * kv, vc, (int) kv, ai, m, 0, st_);
         }
         const int64_t keep = pos_;
         pos_ = r.pos;
-        const int sized = room(1);
+        const int sized = room(m);
         pos_ = keep;
         const size_t sf = (size_t) chunk_ * n_head_ * opt_.max_context;
         if (!(fdec_ && r.pos >= fdec_from_ &&
-              (v4 ? fdec_k8v4(q_ + i * hq, kq, vq4, r.pos, 1, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
+              (v4 ? fdec_k8v4(q_ + i * hq, kq, vq4, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
                               scale, score_, sf, st_)
-                  : q8 ? fdec_q8(q_ + i * hq, kq, vq, r.pos, 1, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
+                  : q8 ? fdec_q8(q_ + i * hq, kq, vq, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
                                  scale, score_, sf, st_)
-                       : fdec_f16(q_ + i * hq, kc, vc, r.pos, 1, ai, sized, att_ + i * hq, head_dim_, n_head_,
+                       : fdec_f16(q_ + i * hq, kc, vc, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_,
                                   n_kv_, scale, score_, sf, st_))))
-            attend(q_ + i * hq, kc, vc, r.pos, 1, score_, chunk_, att_ + i * hq, head_dim_, n_head_, n_kv_, scale, st_,
+            attend(q_ + i * hq, kc, vc, r.pos, m, score_, chunk_, att_ + i * hq, head_dim_, n_head_, n_kv_, scale, st_,
                    0, 0, false, ai, sized, 0, kq, vq, nullptr, /*part_floats*/ 0, vq4);
     }
     if (v4) fwht_rows(att_, att_, n * n_head_, head_dim_, st_);

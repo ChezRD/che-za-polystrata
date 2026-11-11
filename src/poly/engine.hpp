@@ -15,6 +15,7 @@
 #pragma once
 
 #include "cpu_experts.hpp"
+#include "strata/poly/kernels.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -131,6 +132,7 @@ struct Options {
                                   ///< empty, or one device: the current card alone
     int batch = 0;                ///< sequences beside the first, each with a state and caches of its own (bind(),
                                   ///< step()); 0: one sequence
+    bool batch_mtp = false;       ///< step() takes a guess beside each sequence's token (steps_guesses())
 };
 
 /// A thing a model's file may call by other names than the engine does: converters differ.
@@ -144,6 +146,7 @@ struct Dev {
     void* p = nullptr;
     uint32_t type = 0;
     int n_in = 0, n_out = 0;
+    float scale = 1.0f;   ///< on the product: an NVFP4 matrix's global scale (Engine::global_scale())
 };
 
 /// What a layer has in every architecture.  Its attention's weights, and a dense FFN's, are the architecture's.
@@ -170,6 +173,10 @@ struct Layer {
     size_t gu2() const { return gu_bytes + u_bytes; }   ///< an expert's gate and up: where its down starts in a slot
     size_t gu_step = 0;   ///< from a staged expert's gate|up to the next one's: gu2(), and in a mixed layer whole
                           ///< blocks of both types, since MMQ takes the stride in blocks (Mmq::mul)
+    // NVFP4 experts converted from NVIDIA's checkpoints: each expert's global scale of gate, up and down (the
+    // GGUF's ffn_*_exps.scale), on the card and here; none in any other file
+    Dev s_gate, s_up, s_down;
+    std::vector<float> h_s_gate, h_s_up, h_s_down;
     std::vector<uint8_t*> slot;        ///< per expert: gate | up | down in VRAM, or null
     size_t slot_bytes = 0;             ///< from a slot of the layer to the one behind it: whole blocks of both types
     std::vector<int32_t> ahead;        ///< experts a full prompt batch stages before it routes
@@ -382,6 +389,21 @@ public:
     /// with logits would on its own.  logits_of(i) then holds the scores of what follows tokens[i].  The sequences
     /// differ; none of them has pictures past its position.  The bound sequence stays bound.
     void step(const int* seqs, const int32_t* tokens, int n);
+    /// step() with guesses (Options::batch_mtp, after Basalt's and Strata's --batch-mtp): where guesses[i] is a token,
+    /// it goes into sequence seqs[i] after tokens[i], at the next position, as a window's second token.  The rows
+    /// are each sequence's in turn, its token and then its guess, and logits_of(r) holds row r's scores.  Each
+    /// sequence's model output rows are left for its draft block.  The positions stay where they were until
+    /// keep_step().
+    void step(const int* seqs, const int32_t* tokens, int n, const int32_t* guesses);
+    /// After step() with guesses: sequence seqs[i] of that step keeps kept[i] of its rows (1, or 2 with its guess),
+    /// as keep() keeps a window's, and its draft block's rows for them are written.
+    void keep_step(const int* kept);
+    /// draft(tokens[i], 0, &p) for each sequence seqs[i] at its position, in one pass of the draft block: the
+    /// guesses for step() with guesses.
+    void draft_many(const int* seqs, const int32_t* tokens, int n, int32_t* guesses);
+    /// Whether step() takes guesses: Options::batch_mtp, a draft block, one card, and an architecture whose
+    /// step() rows can leave the recurrent state after a row (rows_snaps()).
+    bool steps_guesses() const;
     /// Sequence `to` becomes what sequence `from` is: its position, state, rows and pictures, copied on the card.
     void copy_seq(int from, int to);
 
@@ -480,10 +502,15 @@ protected:
     /// state and attention rows from its own sequence (rows_of_, seq_state(), seq_buf()), its position from at_.
     /// Otherwise step() runs the head a row at a time, with the row's sequence bound.
     virtual bool batch_heads() const { return false; }
-    /// While step() runs a head in one call: each row's sequence and position, row after row; else null.
+    /// The architecture's step() rows leave the recurrent state after a row at Row::snap (step() with guesses).
+    virtual bool rows_snaps() const { return false; }
+    /// While step() runs a head in one call: each row's sequence and position, row after row; else null.  snap: for
+    /// the first of a sequence's two rows, where every recurrent layer leaves the state after it (at its place in
+    /// state_, as a window's snapshots), for keep_step() to go back to; else null.
     struct Row {
         int seq;
         int64_t pos;
+        float* snap = nullptr;
     };
     const Row* rows_of_ = nullptr;
     int n_rows_of_ = 0;
@@ -518,6 +545,9 @@ protected:
     enum Want { kF32, kFloatMat, kAnyMat, kGuessMat };
     Dev upload(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
                float (*fix)(float) = nullptr);
+    Dev upload_as(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
+                  float (*fix)(float));
+    float global_scale(const TensorInfo& t) const;
     const TensorInfo* tensor(int il, const char* name) const;
     const Shards& home(const TensorInfo& t) const;
     const MetaValue* meta_in(const Shards& g, const char* key) const;
@@ -534,6 +564,9 @@ protected:
     const Image* image_at(int64_t row) const;
     bool input(int32_t token, int64_t row, float* dst) const;
     void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
+    void lin_raw(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x);
+    /// The layer's ExpertScales for rows of the experts ids[r] (on the card), or none.
+    ExpertScales expert_scales(const Layer& L, const int32_t* ids = nullptr) const;
     void fill_expert_cache();
     void ensure_stage();
     void start_swaps();
@@ -791,6 +824,13 @@ protected:
     float* snap_at_ = nullptr;   ///< where the call under way leaves the first of its states
     unsigned snap_bits_ = 0;     ///< the tokens of the call under way that leave their state, a bit a token
     bool windowed_ = false;      ///< the call under way is a window's
+    // step() with guesses: a place for every sequence's state after its first row, and what keep_step() settles
+    float* step_snap_ = nullptr;
+    float* step_h_ = nullptr;           ///< draft_many() and keep_step(): the rows' model outputs, gathered
+    Likeliest* h_guesses_ = nullptr;    ///< draft_many()'s guesses, pinned
+    void draft_rows_of(const Row* rows, const int32_t* tokens, int n, Likeliest* out);
+    std::vector<int> step_seqs_, step_rows_;   ///< the sequences of the step, and how many rows each had
+    std::vector<int32_t> step_tok_;            ///< each sequence's token and guess, two places a sequence
     int win_ = 0;                ///< the tokens of the window that keep() has not settled yet
     // A window with experts on the CPU goes through the layers whole, or in two halves one behind the other
     // (run()).  Which takes less time depends on the card, on the CPU and on how many of the experts the cache
@@ -826,6 +866,7 @@ protected:
     void* mqx_ = nullptr;                                   ///< lin()'s tokens quantized for a product
     int32_t *tab_ = nullptr, *h_tab_ = nullptr;   ///< a layer's row tables, in VRAM and pinned
     int32_t* iota_ = nullptr;                     ///< 0, 1, 2, ...
+    int32_t *d_ex_ = nullptr, *h_ex_ = nullptr;   ///< a prompt batch's rows' experts (ExpertScales), in VRAM and pinned
     int32_t* d_ids_ = nullptr;                    ///< a batch's experts and weights when it routes on the card
     float* d_wts_ = nullptr;
     int32_t* h_ids_ = nullptr;                    ///< pinned: the experts, back from the card

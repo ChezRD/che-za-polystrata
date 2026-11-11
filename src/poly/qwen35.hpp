@@ -44,6 +44,7 @@ protected:
     void block_rows(int64_t pos, int n) override;
     int head_key(int il, int n) const override;
     bool batch_heads() const override { return true; }
+    bool rows_snaps() const override { return true; }
     int64_t turn(int64_t row) const override;
     int block_mask() const override { return mask_; }
     void route_block(int il, float* scores, int n) override;

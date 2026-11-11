@@ -6,10 +6,19 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
 namespace strata::poly {
+
+#if STRATA_POLY_NVFP4
+// mmq_nvfp4.cu
+void nvfp4_w4a8(ggml_backend_cuda_context& ctx, const mmq_args& a, cudaStream_t s);
+bool nvfp4_w4a8_fits(int64_t w_rows, int cc, size_t smpbo);
+bool nvfp4_w4a8_stream_k(int64_t w_rows, int cc);
+#endif
+
 namespace {
 
 // The types with kernels in this build: one template instance each in CMakeLists.txt.
@@ -18,6 +27,24 @@ namespace {
     X(IQ1_S) X(IQ2_XXS) X(IQ2_XS) X(IQ2_S) X(IQ3_XXS) X(IQ3_S) X(IQ4_NL) X(IQ4_XS) X(MXFP4)
 
 int64_t pad512(int64_t n) { return (n + 511) / 512 * 512; }
+
+// NVFP4's prompt products: on RTX 50, with STRATA_PREFILL_NVFP4=w4a4, FP4 x FP4 on its FP4 tensor cores (the
+// instance built for 12.0a, as MXFP4's); otherwise, as on every other card, the weights decoded to int8 times Q8_1
+// rows (mmq_nvfp4.cu).
+bool nvfp4_fp4(int cc) {
+    static const bool asked = [] {
+        const char* v = std::getenv("STRATA_PREFILL_NVFP4");
+        return v != nullptr && std::string(v) == "w4a4";
+    }();
+    return asked && cc == GGML_CUDA_CC_BLACKWELL;
+}
+
+// The float each row of NVFP4's FP4 rows carries (quantize_mmq_fp4_cuda's scale) goes behind the blocks and the
+// tiles' tail, in the room q8_bytes() leaves: FP4 blocks take half the bytes of Q8_1's.
+float* fp4_scales(void* xq, int64_t rows, int64_t cols) {
+    return (float*) ((char*) xq + (size_t) rows * (size_t) (pad512(cols) / QK_FP4_MMQ) * sizeof(block_fp4_mmq) +
+                     128 * sizeof(block_q8_1_mmq));
+}
 
 void ck(const char* what) {
     const cudaError_t e = cudaGetLastError();
@@ -39,16 +66,22 @@ Mmq::~Mmq() { delete (ggml_backend_cuda_context*) ctx_; }
 // zero bytes there (kTail in runtime.hpp), as ggml-cuda does behind its tensors.
 bool Mmq::fits(int type, int64_t w_rows, int64_t w_cols) {
     const ggml_type t = (ggml_type) type;
+    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
     switch (t) {
 #define X(T) case GGML_TYPE_##T:
         STRATA_POLY_MMQ_TYPES(X)
 #undef X
         break;
+#if STRATA_POLY_NVFP4
+        case GGML_TYPE_NVFP4:
+            if (w_cols % QK_NVFP4 != 0) return false;
+            if (!nvfp4_fp4(dev.cc)) return nvfp4_w4a8_fits(w_rows, dev.cc, dev.smpbo);
+            break;
+#endif
         default: return false;
     }
     if (w_cols % ggml_blck_size(t) != 0) return false;
     const bool fallback = w_rows % 128 != 0;
-    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
     // MXFP4's instance is built for 12.0a on Blackwell (CMakeLists.txt): another Blackwell has no image of it
     if (t == GGML_TYPE_MXFP4 && dev.cc >= GGML_CUDA_CC_BLACKWELL && dev.cc != GGML_CUDA_CC_BLACKWELL) return false;
     for (int J = 8; J <= 128; J += 8) {
@@ -74,6 +107,9 @@ bool Mmq::split_exact(int type, int64_t w_rows) {
     const ggml_type t = (ggml_type) type;
     const bool fallback = w_rows % 128 != 0;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+#if STRATA_POLY_NVFP4
+    if (t == GGML_TYPE_NVFP4 && !nvfp4_fp4(cc)) return !nvfp4_w4a8_stream_k(w_rows, cc);
+#endif
     for (int J = 8; J <= 128; J += 8) {
         const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config(t, J, fallback, cc);
         if (c.type != GGML_TYPE_COUNT && c.stream_k) return false;
@@ -85,12 +121,14 @@ void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64
                    void* stream) {
     if (rows <= 0) return;
     const ggml_type t = (ggml_type) type;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     // On Blackwell llama.cpp's MXFP4 tiles take the rows as FP4 blocks, half the bytes of Q8_1's (mmq.cu's
-    // use_native_fp4); the rows of another type, or another card, are Q8_1.
-    if (t == GGML_TYPE_MXFP4 && blackwell_mma_available(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+    // use_native_fp4), and so do NVFP4's FP4 ones; the rows of another type, or another card, are Q8_1.
+    const bool nv = t == GGML_TYPE_NVFP4 && nvfp4_fp4(cc);
+    if ((t == GGML_TYPE_MXFP4 && blackwell_mma_available(cc)) || nv) {
         const bool aligned = (uintptr_t) x % 32 == 0 && ((size_t) ld * sizeof(float)) % 32 == 0;
-        quantize_mmq_fp4_cuda(x, ids, xq, nullptr, t, aligned, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
-                              (cudaStream_t) stream);
+        quantize_mmq_fp4_cuda(x, ids, xq, nv ? fp4_scales(xq, rows, cols) : nullptr, t, aligned, cols, ld, rows * ld,
+                              rows * ld, pad512(cols), rows, 1, 1, (cudaStream_t) stream);
     } else {
         quantize_mmq_q8_1_cuda(x, ids, xq, t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                                (cudaStream_t) stream);
@@ -131,6 +169,16 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
 #define X(T) case GGML_TYPE_##T: mul_mat_q_case<GGML_TYPE_##T>(ctx, a, s); break;
         STRATA_POLY_MMQ_TYPES(X)
 #undef X
+#if STRATA_POLY_NVFP4
+        case GGML_TYPE_NVFP4:
+            if (nvfp4_fp4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+                a.y_scale = fp4_scales(const_cast<void*>(xq), total_rows, w_cols);
+                mul_mat_q_case<GGML_TYPE_NVFP4>(ctx, a, s);
+            } else {
+                nvfp4_w4a8(ctx, a, s);
+            }
+            break;
+#endif
         default: throw std::runtime_error("mmq: tensor type " + std::to_string(type) + " is not built");
     }
     ck("mmq product");

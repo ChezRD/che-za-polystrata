@@ -1580,6 +1580,25 @@ void Engine::load_moe(int il, bool shared) {
                                      size_t(8));
         L.gu_step = (L.gu_step + unit - 1) / unit * unit;
     }
+    // NVFP4 experts converted from NVIDIA's checkpoints carry each expert's global scale of gate, up and down
+    // (llama.cpp's ffn_*_exps_s).  Gate's and up's go on their products ahead of the activation (ExpertScales),
+    // down's on the expert's weight in its token's sum.  Only NVFP4's: Gemma 4's ffn_down_exps.scale is its own.
+    const bool nv = L.gu_type == GGML_TYPE_NVFP4 || L.u_type == GGML_TYPE_NVFP4 || L.d_type == GGML_TYPE_NVFP4;
+    if (nv && tensor(il, "ffn_gate_up_exps.scale"))
+        throw std::runtime_error(blk(il, "ffn_gate_up_exps.scale: NVFP4 scales of a joined gate and up are not supported"));
+    // A projection of another type in the same layer has none (Qwen3.6 NVFP4-MTP-HQ: some ups are Q4_K).
+    const auto one = [&](const char* n, uint32_t type, Dev& d, std::vector<float>& h) {
+        const TensorInfo* t = tensor(il, n);
+        h.clear();
+        if (type != GGML_TYPE_NVFP4 || !t) return;
+        if (t->type != kTypeF32) throw std::runtime_error(t->name + " is not F32");
+        d = upload(t, blk(il, n), n_expert_, 1, kF32);
+        h.resize((size_t) n_expert_);
+        std::memcpy(h.data(), home(*t).data(*t), h.size() * sizeof(float));
+    };
+    one("ffn_gate_exps.scale", L.gu_type, L.s_gate, L.h_s_gate);
+    one("ffn_up_exps.scale", L.u_type, L.s_up, L.h_s_up);
+    one("ffn_down_exps.scale", L.d_type, L.s_down, L.h_s_down);
     std::string err;
     if (!cpu_expert_types_ok((int) L.gu_type, (int) L.d_type, n_embd_, n_ff_exp_, err) ||
         !cpu_expert_types_ok((int) L.u_type, (int) L.d_type, n_embd_, n_ff_exp_, err))
@@ -1697,6 +1716,28 @@ const Shards& Engine::home(const TensorInfo& t) const {
 // model's tensors through twice).
 Dev Engine::upload(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
                    float (*fix)(float)) {
+    Dev d = upload_as(t, name, n_in, n_out, want, fix);
+    d.scale = global_scale(*t);
+    return d;
+}
+
+// An NVFP4 matrix converted from NVIDIA's checkpoints has its global scale beside it, "<name>.scale" for
+// "<name>.weight" (llama.cpp's *_s tensors, which multiply the product): about 1e-4, so it cannot go into the
+// blocks' E4M3 scales.  1 for any other matrix.
+float Engine::global_scale(const TensorInfo& t) const {
+    static const std::string w = ".weight";
+    if (t.type != GGML_TYPE_NVFP4 || t.name.size() <= w.size() ||
+        t.name.compare(t.name.size() - w.size(), w.size(), w) != 0)
+        return 1.0f;
+    const TensorInfo* s = home(t).find(t.name.substr(0, t.name.size() - w.size()) + ".scale");
+    if (!s || s->type != kTypeF32 || s->elements() != 1) return 1.0f;
+    float v;
+    std::memcpy(&v, home(*s).data(*s), sizeof v);
+    return v;
+}
+
+Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
+                      float (*fix)(float)) {
     if (!t) throw std::runtime_error("the GGUF has no tensor " + name);
     const uint64_t rest = t->elements() / std::max<uint64_t>(t->shape[0], 1);
     if ((int64_t) t->shape[0] != n_in || (int64_t) rest != n_out)
@@ -3010,7 +3051,15 @@ void Engine::alloc() {
     snap_places_ = snaps_spread() ? std::min(opt_.window - 1, kSnapPlaces) : opt_.window - 1;
     if (snap_places_ > 0)
         snap_ = (float*) dmalloc(size_t(snap_places_) * rec_n_ * sizeof(float), "the recurrent state");
-    const size_t logit_rows = (size_t) std::max(opt_.window, opt_.batch + 1);   // window()'s, step()'s
+    // step() with guesses: every sequence's state after its first row
+    if (opt_.batch_mtp && opt_.batch > 0 && rec_n_ > 0)
+        step_snap_ = (float*) dmalloc(size_t(opt_.batch + 1) * rec_n_ * sizeof(float), "the recurrent state");
+    if (opt_.batch_mtp && opt_.batch > 0 && draft_) {
+        step_h_ = (float*) dmalloc(size_t(opt_.batch + 1) * n_embd_ * sizeof(float), "scratch");
+        h_guesses_ = (Likeliest*) hmalloc(size_t(opt_.batch + 1) * sizeof(Likeliest), "pinned memory");
+    }
+    // window()'s, step()'s (two rows a sequence with guesses)
+    const size_t logit_rows = (size_t) std::max(opt_.window, (opt_.batch_mtp ? 2 : 1) * (opt_.batch + 1));
     wlogits_ = (float*) dmalloc(logit_rows * n_vocab_ * sizeof(float), "scratch");
     h_wlogits_ = (float*) hmalloc(logit_rows * n_vocab_ * sizeof(float), "pinned memory");
     alloc_caches();
@@ -3087,6 +3136,8 @@ void Engine::alloc() {
         tab_ = (int32_t*) dmalloc(tab, "scratch");
         h_tab_ = (int32_t*) hmalloc(tab, "pinned memory");
         iota_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
+        d_ex_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
+        h_ex_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
         std::vector<int32_t> ramp(rr);
         std::iota(ramp.begin(), ramp.end(), 0);
         ck(cudaMemcpy(iota_, ramp.data(), rr * sizeof(int32_t), cudaMemcpyHostToDevice), "scratch");
@@ -3483,6 +3534,20 @@ void Engine::dbg(const char* name, int il, const float* dev, int n) {
 // y = w x for n tokens.  xq is x already in Q8_1, when the caller has it.  rows_per_x below n_out gives each group
 // of rows its own input (see gemv_f32); only the float types take it.
 void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
+    lin_raw(w, x, y, n, xq, rows_per_x);
+    if (w.scale != 1.0f) axpy(y, w.scale, y, n * w.n_out, false, st_);
+}
+
+ExpertScales Engine::expert_scales(const Layer& L, const int32_t* ids) const {
+    ExpertScales s;
+    if (L.h_s_gate.empty() && L.h_s_up.empty()) return s;
+    s.gate = L.h_s_gate.empty() ? nullptr : fp(L.s_gate);
+    s.up = L.h_s_up.empty() ? nullptr : fp(L.s_up);
+    s.ids = ids;
+    return s;
+}
+
+void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
     if (w.type == kTypeF32 || w.type == kTypeBF16) {
         const int per = rows_per_x ? rows_per_x : w.n_out;
         const size_t count = (size_t) w.n_in * w.n_out;
@@ -3975,6 +4040,7 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
             const uint8_t* slot;
             float w;
             int row;
+            int e;
         };
         CpuExpert host[kCpuRows * kMaxUsed];
         Cached cached[kCpuRows * kMaxUsed];
@@ -4007,14 +4073,16 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     ++use_[(size_t) il * n_expert_ + e];
                     if (n_swap_ > 0) recent_[(size_t) il * n_expert_ + e] += 1.f;
                 }
+                // NVFP4's down scale goes on the weight (ExpertScales)
+                const float we = L.h_s_down.empty() ? w[k] : w[k] * L.h_s_down[e];
                 if (const uint8_t* s = L.slot[e]) {
-                    cached[n_cached++] = {s, w[k], at + t};
+                    cached[n_cached++] = {s, we, at + t, (int) e};
                     continue;
                 }
                 host_e[n_host] = (int32_t) e;
                 host_k[n_host] = k;
-                host[n_host++] = {L.exp_gate + e * L.gu_stride, L.exp_up + e * L.u_stride,
-                                  L.exp_down + e * L.d_bytes, w[k], t};
+                host[n_host++] = {L.exp_gate + e * L.gu_stride, L.exp_up + e * L.u_stride, L.exp_down + e * L.d_bytes,
+                                  we, t, L.h_s_gate.empty() ? 1.f : L.h_s_gate[e], L.h_s_up.empty() ? 1.f : L.h_s_up[e]};
             }
         }
         // Strata's STRATA_ROUTE_TAIL_SKIP: an expert outside VRAM that every token here ranks at tail_skip or later
@@ -4084,8 +4152,10 @@ bool Engine::moe(Layer& L, int il, int n, const std::function<void()>* first) {
                     for (int j = 0; j < m && !one_u; ++j)
                         kernels::native_mmvq((int) L.u_type, up.w[j], up.x[j], up.y[j], n_embd_, n_ff_exp_, 1, st_);
                 }
-                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_);
-                else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_);
+                ExpertScales es = expert_scales(L);
+                for (int j = 0; j < m && (es.gate || es.up); ++j) es.e[j] = cached[i0 + j].e;
+                if (gelu_) geglu_rows(g_, h_, n_ff_exp_, m, st_, &es);
+                else swiglu_clamp_rows(g_, h_, n_ff_exp_, m, limit, st_, &es);
                 kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_, m, st_);
                 if (!(m > 1 && kernels::native_mmvq_slots((int) L.d_type, down, m, n_ff_exp_, n_embd_, st_)))
                     for (int j = 0; j < m; ++j)
@@ -4204,8 +4274,10 @@ bool Engine::moe_card(Layer& L, int il, int n) {
         const kernels::MmvqIds up{table, d_ids_, L.gu_bytes, xq_, xq_row, n_used_, g_ + ff, 2 * ff};
         kernels::native_mmvq_ids((int) L.u_type, up, rr, n_embd_, n_ff_exp_, st_);
     }
-    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_);
-    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_);
+    const ExpertScales es = expert_scales(L, d_ids_);
+    if (gelu_) geglu_rows(g_, h_, n_ff_exp_, rr, st_, &es);
+    else swiglu_clamp_rows(g_, h_, n_ff_exp_, rr, clamp_exp_[(size_t) il], st_, &es);
+    if (!L.h_s_down.empty()) expert_weights(d_wts_, fp(L.s_down), d_ids_, rr, st_);
     kernels::native_quantize_q8_1(h_, q8_, n_ff_exp_ * rr, 1, st_);   // the rows back to back, as one vector
     const kernels::MmvqIds down{table, d_ids_, L.gu2(), q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
                                 (size_t) n_embd_};
@@ -4458,20 +4530,24 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     }
     const int rg = at;   // the card's rows
     host_.clear();
+    const ExpertScales es = expert_scales(L, d_ex_);
     for (int i = 0; i < rr; ++i) {
         const size_t e = (size_t) ids_[(size_t) i];
+        if (!L.h_s_down.empty()) w[i] *= L.h_s_down[e];   // NVFP4's down scale goes on the weight (ExpertScales)
         if (on_cpu_[e]) {   // by token, as cpu_experts() takes them, and nothing of it in the card's sum
+            const float gs = es.gate ? L.h_s_gate[e] : 1.f, us = es.up ? L.h_s_up[e] : 1.f;
             if (const uint8_t* p = pool_has(il, (int) e))
-                host_.push_back({p, p + L.gu_bytes, p + L.gu2(), w[i], i / n_used_});
+                host_.push_back({p, p + L.gu_bytes, p + L.gu2(), w[i], i / n_used_, gs, us});
             else
                 host_.push_back({L.exp_gate + e * L.gu_stride, L.exp_up + e * L.u_stride, L.exp_down + e * L.d_bytes,
-                                 w[i], i / n_used_});
+                                 w[i], i / n_used_, gs, us});
             w[i] = 0.f;
             continue;
         }
         const int row = first_[e]++;
         tok[row] = i / n_used_;
         place[row] = i;
+        h_ex_[row] = (int32_t) e;
     }
     for (int r = 0; n_tile == 1 && r < n_round; ++r)
         for (int g = round_[(size_t) r]; g <= round_[(size_t) r + 1]; ++g)
@@ -4492,6 +4568,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
                            sizeof(int32_t),
                        cudaMemcpyHostToDevice, cs(st_)),
        "expert rows");
+    if ((es.gate || es.up) && rg > 0)
+        ck(cudaMemcpyAsync(d_ex_, h_ex_, (size_t) rg * sizeof(int32_t), cudaMemcpyHostToDevice, cs(st_)), "expert rows");
 
     const int rc = bounds[n_cached];   // the rows of the cached experts
     stats_.batch_cached += rc;
@@ -4552,8 +4630,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             up_mul(slot_of(r.j), L.slot_bytes, r.m, d_cb + (size_t) r.c * cb_row + r.j, r.most);
         }
         if (rc > 0) {
-            if (gelu_) geglu_rows(gu_, hx_, n_ff_exp_, rc, st_);
-            else swiglu_clamp_rows(gu_, hx_, n_ff_exp_, rc, limit, st_);
+            if (gelu_) geglu_rows(gu_, hx_, n_ff_exp_, rc, st_, &es);
+            else swiglu_clamp_rows(gu_, hx_, n_ff_exp_, rc, limit, st_, &es);
             if (guard) guard_half_sums(hx_, ff, n_ff_exp_, rc, hf_, st_);
             Mmq::quantize(hx_, nullptr, mq2_, dt, ff, ff, rc, st_);
         }
@@ -4602,8 +4680,10 @@ void Engine::moe_rows(Layer& L, int il, int n) {
                 mmq_->mul(stage_, gt, gu_rows, n_embd_, step, m, mq_, b, iota_, rg, top, gu_, ff2, st_);
                 up_mul(stage_, step, m, b, top);
             });
-            if (gelu_) geglu_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, st_);
-            else swiglu_clamp_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, limit, st_);
+            ExpertScales er = es;
+            if (er.ids) er.ids += r0;
+            if (gelu_) geglu_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, st_, &er);
+            else swiglu_clamp_rows(gu_ + (size_t) r0 * ff2, hx_ + (size_t) r0 * ff, n_ff_exp_, rows, limit, st_, &er);
             if (guard) guard_half_sums(hx_ + (size_t) r0 * ff, ff, n_ff_exp_, rows, hf_ + r0, st_);
             Mmq::quantize(hx_ + (size_t) r0 * ff, nullptr, mq2_, dt, ff, ff, rows, st_);
             each_class([&](int k, int top) {
@@ -4908,57 +4988,78 @@ void Engine::run(const int32_t* tokens, int n) {
 // these tokens missing, which makes its guesses worse and its tokens no different.  On several cards each takes the
 // rows from the one before it, a row a sequence in the same order (pass_ from its start), and the last one gives the
 // logits.
-void Engine::step(const int* seqs, const int32_t* tokens, int n) {
+void Engine::step(const int* seqs, const int32_t* tokens, int n) { step(seqs, tokens, n, nullptr); }
+
+bool Engine::steps_guesses() const {
+    return opt_.batch_mtp && draft_ && step_h_ && !block_guess_ && !next_ && !pass_ && batch_heads() &&
+           (rec_n_ == 0 || (rows_snaps() && step_snap_));
+}
+
+void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* guesses) {
     if (n < 1 || n > std::min(rows_, sequences())) throw std::logic_error("step takes 1 to sequences() tokens");
+    if (guesses && !steps_guesses()) throw std::logic_error("step: guesses need --batch-mtp, a draft block and one card");
+    if (!step_seqs_.empty()) throw std::logic_error("step: the rows of the step before are not kept yet (keep_step())");
     OnCard here(device_, split_);
     end_read();
     const int home = bound_;
     const auto use = [&](int s) { hold(s); };
-    std::vector<int64_t> at((size_t) n);
+    // the rows: each sequence's token, then its guess when it has one
+    std::vector<int> rseq;
+    std::vector<int32_t> rtok;
+    std::vector<int64_t> at;
+    std::vector<float*> rsnap;
     for (int i = 0; i < n; ++i) {
         if (seqs[i] < 0 || seqs[i] >= sequences() || std::count(seqs, seqs + i, seqs[i]))
             throw std::logic_error("step: no such sequence, or one twice");
         use(seqs[i]);
-        if (pos_ + 1 > opt_.max_context)
+        const int m = guesses && guesses[i] >= 0 ? 2 : 1;
+        if (pos_ + m > opt_.max_context)
             throw std::runtime_error("the context is full (" + std::to_string(opt_.max_context) + " tokens)");
-        cover(pos_ + 1);
-        at[(size_t) i] = pos_;
+        cover(pos_ + m);
+        for (int j = 0; j < m; ++j) {
+            rseq.push_back(seqs[i]);
+            rtok.push_back(j ? guesses[i] : tokens[i]);
+            at.push_back(pos_ + j);
+            rsnap.push_back(m == 2 && j == 0 && step_snap_ ? step_snap_ + (size_t) seqs[i] * rec_n_ : nullptr);
+        }
     }
+    const int R = (int) rseq.size();
+    if (R > rows_) throw std::logic_error("step: more rows than a call takes");
 
     ck(cudaStreamSynchronize(cs(st_)), "step");
-    if (n_swap_ > 0) follow(n);
-    tok_ = tokens;
+    if (n_swap_ > 0) follow(R);
+    tok_ = rtok.data();
     windowed_ = false;
     snap_bits_ = 0;
     const size_t e_row = (size_t) n_embd_, r_row = (size_t) streams() * e_row;
     const float scale = embed_scale();
-    if (pass_) std::memcpy(h_r_, pass_, (size_t) n * r_row * sizeof(float));   // a later card
-    for (int i = 0; i < n; ++i) {
-        use(seqs[i]);
+    if (pass_) std::memcpy(h_r_, pass_, (size_t) R * r_row * sizeof(float));   // a later card
+    for (int i = 0; i < R; ++i) {
+        use(rseq[(size_t) i]);
         float* r = h_r_ + (size_t) i * r_row;
         if (!pass_) {
-            if (!input(tokens[i], at[(size_t) i], r) && scale != 1.f)
+            if (!input(rtok[(size_t) i], at[(size_t) i], r) && scale != 1.f)
                 for (size_t k = 0; k < e_row; ++k) r[k] *= scale;
             for (int h = 1; h < streams(); ++h) std::memcpy(r + (size_t) h * e_row, r, e_row * sizeof(float));
         }
         h_at_[2 * i] = at[(size_t) i];
         h_at_[2 * i + 1] = turn(at[(size_t) i]);
     }
-    copy2(h_r_, r_, n * (int) r_row, nullptr, nullptr, 0, st_);
-    copy2(h_at_, at_, n * 2 * (int) (sizeof(long long) / 4), nullptr, nullptr, 0, st_);
+    copy2(h_r_, r_, R * (int) r_row, nullptr, nullptr, 0, st_);
+    copy2(h_at_, at_, R * 2 * (int) (sizeof(long long) / 4), nullptr, nullptr, 0, st_);
 
-    const size_t wn = (size_t) opt_.window, recs = 3 * wn + (size_t) opt_.batch + 1, rec = (size_t) n - 1;
+    const size_t wn = (size_t) opt_.window, recs = 3 * wn + (size_t) opt_.batch + 1, rec = (size_t) R - 1;
     const bool replay = opt_.graphs && !opt_.dump;
     const auto replayed = [&](std::vector<void*>& made, size_t key, auto&& work) {
         if (made.size() <= key) made.resize(key + 1, nullptr);
         if (!made[key]) made[key] = record(work);
         ck(cudaGraphLaunch((cudaGraphExec_t) made[key], cs(st_)), "layer graph");
     };
-    const bool card = n < kStageRows && card_moe(n);
+    const bool card = R < kStageRows && card_moe(R);
     // an architecture that takes the rows in one head: their sequences and positions while it does
     std::vector<Row> rows;
     if (batch_heads())
-        for (int i = 0; i < n; ++i) rows.push_back({seqs[i], at[(size_t) i]});
+        for (int i = 0; i < R; ++i) rows.push_back({rseq[(size_t) i], at[(size_t) i], rsnap[(size_t) i]});
     struct Clear {
         const Row*& p;
         ~Clear() { p = nullptr; }
@@ -4968,26 +5069,27 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
         Layer& L = layers_[(size_t) il];
         if (batch_heads()) {
             const int64_t keep = pos_;
-            key.assign(1, n);
-            for (int i = 0; i < n; ++i) {
+            key.assign(1, R);
+            for (int i = 0; i < R; ++i) {
                 pos_ = at[(size_t) i];
-                key.push_back(seqs[i]);
+                key.push_back(rseq[(size_t) i]);
                 key.push_back(head_key(il, 1));
+                if (guesses) key.push_back(rsnap[(size_t) i] ? 1 : 0);   // a recording that leaves the state
             }
             pos_ = keep;
             rows_of_ = rows.data();
-            n_rows_of_ = n;
+            n_rows_of_ = R;
             if (replay && L.fixed) {
                 void*& made = L.rows_heads[key];
-                if (!made) made = record([&] { layer_head(L, il, n); });
+                if (!made) made = record([&] { layer_head(L, il, R); });
                 ck(cudaGraphLaunch((cudaGraphExec_t) made, cs(st_)), "layer graph");
             } else {
-                layer_head(L, il, n);
+                layer_head(L, il, R);
             }
             rows_of_ = nullptr;
         } else {
-            for (int i = 0; i < n; ++i) {
-                use(seqs[i]);
+            for (int i = 0; i < R; ++i) {
+                use(rseq[(size_t) i]);
                 shift_rows(i);
                 pos_ = at[(size_t) i];
                 const size_t head = (size_t) head_key(il, 1) * recs + 3 * wn + (size_t) i;
@@ -4998,39 +5100,60 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
             }
         }
         if (!L.moe) continue;
-        if (batched(L, n)) {
-            moe_rows(L, il, n);
+        if (batched(L, R)) {
+            moe_rows(L, il, R);
         } else {
             ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-            if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, n); });
-            else moe_shared(L, il, n);
+            if (replay) replayed(L.shared, rec, [&] { moe_shared(L, il, R); });
+            else moe_shared(L, il, R);
             if (card && L.card == 1 && replay) {
-                replayed(L.card_moe, rec, [&] { moe_card(L, il, n); });
-                stats_.gpu_experts += n * n_used_;
-            } else if (card && moe_card(L, il, n)) {
-                stats_.gpu_experts += n * n_used_;
-            } else if (moe(L, il, n)) {
-                moe_add(n);
+                replayed(L.card_moe, rec, [&] { moe_card(L, il, R); });
+                stats_.gpu_experts += R * n_used_;
+            } else if (card && moe_card(L, il, R)) {
+                stats_.gpu_experts += R * n_used_;
+            } else if (moe(L, il, R)) {
+                moe_add(R);
             }
         }
-        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, n); });
-        else layer_tail(L, il, n);
+        if (replay && L.fixed) replayed(L.tail, rec, [&] { layer_tail(L, il, R); });
+        else layer_tail(L, il, R);
     }
 
     if (next_) {
-        float* h = pass_rows(n);
-        ck(cudaMemcpyAsync(h, r_, (size_t) n * r_row * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)), "the next card");
+        float* h = pass_rows(R);
+        ck(cudaMemcpyAsync(h, r_, (size_t) R * r_row * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)), "the next card");
         ck(cudaStreamSynchronize(cs(st_)), "the next card");
         next_->pass_ = h;
         next_->step(seqs, tokens, n);
     } else {
-        output_rows(0, n, xn_);
-        lin(output_, xn_, wlogits_, n);
-        finish_logits(wlogits_, n);
-        ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) n * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
+        output_rows(0, R, xn_);
+        lin(output_, xn_, wlogits_, R);
+        finish_logits(wlogits_, R);
+        ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) R * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                            cs(st_)),
            "logits");
+        // with guesses: each row's output for its sequence's draft block, in its rows after the first, as window()
+        // leaves them (draft_rows())
+        if (guesses)
+            for (int i = 0, j = 0; i < R; ++i, ++j) {
+                if (i > 0 && rseq[(size_t) i] != rseq[(size_t) i - 1]) j = 0;
+                ck(cudaMemcpyAsync(seq_state(rseq[(size_t) i], hn_) + (size_t) (1 + j) * e_row, xn_ + (size_t) i * e_row,
+                                   e_row * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+                   "step");
+            }
         ck(cudaStreamSynchronize(cs(st_)), "step");
+    }
+    if (guesses) {   // keep_step() settles the positions
+        step_seqs_.assign(seqs, seqs + n);
+        step_rows_.assign((size_t) n, 1);
+        step_tok_.assign((size_t) 2 * n, 0);
+        for (int i = 0; i < n; ++i) {
+            step_rows_[(size_t) i] = guesses[i] >= 0 ? 2 : 1;
+            step_tok_[(size_t) 2 * i] = tokens[i];
+            step_tok_[(size_t) 2 * i + 1] = guesses[i];
+        }
+        use(home);
+        return;
     }
     for (int i = 0; i < n; ++i) {
         use(seqs[i]);
@@ -5039,6 +5162,143 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n) {
     }
     use(home);
     stats_.tokens += n;
+}
+
+void Engine::keep_step(const int* kept) {
+    if (step_seqs_.empty()) throw std::logic_error("keep_step: no step with guesses to keep");
+    OnCard here(device_, split_);
+    const int home = bound_;
+    const size_t e = (size_t) n_embd_;
+    // The draft block's rows of the kept tokens, every sequence's in one pass: token j at the sequence's position
+    // + j, with the model's output for the token before it (hn_'s row j).  draft() wrote the first token's already
+    // where it guessed from it.
+    std::vector<Row> rows;
+    std::vector<int32_t> toks;
+    for (size_t i = 0; i < step_seqs_.size(); ++i) {
+        const int k = kept[i], m = step_rows_[i];
+        if (k < 1 || k > m) throw std::logic_error("keep_step keeps 1 to the sequence's rows");
+        if (!draft_) continue;
+        hold(step_seqs_[i]);
+        const int32_t* t = step_tok_.data() + 2 * i;
+        for (int j = ahead_pos_ == pos_ && t[0] == ahead_tok_ ? 1 : 0; j < k; ++j) {
+            ck(cudaMemcpyAsync(step_h_ + rows.size() * e, hn_ + (size_t) j * e, e * sizeof(float),
+                               cudaMemcpyDeviceToDevice, cs(st_)),
+               "keep_step");
+            rows.push_back({step_seqs_[i], pos_ + j});
+            toks.push_back(t[j]);
+        }
+    }
+    if (!rows.empty()) draft_rows_of(rows.data(), toks.data(), (int) rows.size(), nullptr);
+    for (size_t i = 0; i < step_seqs_.size(); ++i) {
+        const int k = kept[i], m = step_rows_[i];
+        hold(step_seqs_[i]);
+        // a guess that was wrong: the state after the sequence's first row, which that row left
+        if (k < m && rec_n_ > 0)
+            ck(cudaMemcpyAsync(state_, step_snap_ + (size_t) step_seqs_[i] * rec_n_, rec_n_ * sizeof(float),
+                               cudaMemcpyDeviceToDevice, cs(st_)),
+               "keep_step");
+        // the output the next token pairs with
+        if (draft_) copy2(hn_ + (size_t) k * e, hn_, n_embd_, nullptr, nullptr, 0, st_);
+        pos_ += k;
+        ahead_pos_ = -1;
+        stats_.tokens += k;
+    }
+    step_seqs_.clear();
+    hold(home);
+}
+
+// The draft block over rows of different sequences, as draft_step() and draft_rows() run it for one: row i takes
+// tokens[i] at rows[i].pos, with step_h_'s row i (the model's output for the token before it), and keeps its rows
+// in its own sequence's caches (the architecture's step() rows, rows_of_).  With `out` the rows go through the
+// rest of the block too and out[i] gets row i's guess.  The card is left working.
+void Engine::draft_rows_of(const Row* rows, const int32_t* tokens, int n, Likeliest* out) {
+    Layer& L = layers_[(size_t) n_layer_];
+    const size_t e = (size_t) n_embd_;
+    for (int i = 0; i < n; ++i) {
+        h_at_[2 * i] = rows[i].pos;
+        h_at_[2 * i + 1] = turn(rows[i].pos);
+    }
+    copy2(h_at_, at_, n * 2 * (int) (sizeof(long long) / 4), nullptr, nullptr, 0, st_);
+    // draft_input()'s, with each row's own sequence for its embedding (a picture's rows are a sequence's)
+    if (!ev_hr_) {
+        cudaEvent_t ev = nullptr;
+        ck(cudaEventCreateWithFlags(&ev, cudaEventDisableTiming), "cudaEventCreate");
+        ev_hr_ = ev;
+    } else {
+        ck(cudaEventSynchronize((cudaEvent_t) ev_hr_), "embed");
+    }
+    for (int i = 0; i < n; ++i) {
+        hold(rows[i].seq);
+        input(tokens[i], rows[i].pos, h_r_ + (size_t) i * e);
+    }
+    copy2(h_r_, cur_, n * n_embd_, nullptr, nullptr, 0, st_);
+    ck(cudaEventRecord((cudaEvent_t) ev_hr_, cs(st_)), "embed");
+    rms_norm(cur_, fp(d_enorm_), r_, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
+    rms_norm(step_h_, fp(d_hnorm_), r_ + e, n_embd_, n, rms_eps_, st_, 2 * n_embd_);
+    float* x = r_ + 2 * (size_t) n * e;
+    lin(d_proj_, r_, x, n);
+    rms_norm(x, fp(L.attn_norm), xn_, n_embd_, n, rms_eps_, st_);
+    kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    struct Clear {
+        const Row*& p;
+        ~Clear() { p = nullptr; }
+    } clear{rows_of_};
+    rows_of_ = rows;
+    n_rows_of_ = n;
+    block_attend(rows[0].pos, n);
+    rows_of_ = nullptr;
+    if (!out) return;
+    axpy(ao_, 1.f, x, n * n_embd_, true, st_);
+    rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
+    kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
+    moe_router(L, n);
+    ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
+    moe_shared(L, n_layer_, n);
+    tok_ = nullptr;   // a guess's row has no token of the sequence
+    if (moe(L, n_layer_, n)) moe_add(n);
+    axpy(fo_, 1.f, x, n * n_embd_, true, st_);
+    rms_norm(x, fp(d_head_), step_h_, n_embd_, n, rms_eps_, st_);
+    Dev head = output_;   // the matrix's first rows are the common tokens'
+    head.n_out = draft_rows();
+    lin(head, step_h_, wlogits_, n);
+    finish_logits(wlogits_, n);
+    for (int r = 0; r < n; ++r) likeliest(wlogits_ + (size_t) r * head.n_out, head.n_out, out + r, st_);
+}
+
+void Engine::draft_many(const int* seqs, const int32_t* tokens, int n, int32_t* guesses) {
+    if (!steps_guesses() || !step_h_ || n < 1 || n > opt_.batch + 1)
+        throw std::logic_error("draft_many: guesses need --batch-mtp and a draft block");
+    if (!step_seqs_.empty()) throw std::logic_error("draft_many: the rows of the step before are not kept yet");
+    OnCard here(device_, split_);
+    end_read();
+    const int home = bound_;
+    const size_t e = (size_t) n_embd_;
+    // a sequence with no room for its token and a guess after it gets no guess
+    std::vector<Row> rows;
+    std::vector<int32_t> toks;
+    std::vector<int> of;
+    for (int i = 0; i < n; ++i) {
+        guesses[i] = -1;
+        hold(seqs[i]);
+        if (pos_ + 2 > opt_.max_context) continue;
+        cover(pos_ + 1);
+        ck(cudaMemcpyAsync(step_h_ + rows.size() * e, hn_, e * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+           "draft");
+        rows.push_back({seqs[i], pos_});
+        toks.push_back(tokens[i]);
+        of.push_back(i);
+    }
+    if (!rows.empty()) {
+        draft_rows_of(rows.data(), toks.data(), (int) rows.size(), h_guesses_);
+        ck(cudaStreamSynchronize(cs(st_)), "draft");
+        for (size_t r = 0; r < rows.size(); ++r) {
+            hold(rows[r].seq);
+            ahead_pos_ = rows[r].pos;
+            ahead_tok_ = toks[r];
+            guesses[of[r]] = h_guesses_[r].token;
+        }
+    }
+    hold(home);
 }
 
 void Engine::shift_rows(ptrdiff_t by) {

@@ -341,7 +341,7 @@ prints:
 routed experts 9.44B 3.61 GB 3.06 bits/w IQ3_XXS 100%
 attention ... Q6_K 89%, Q8_0 11%
 ...
-Strata: not Qwen3.8-Flash-Next (architecture 'deepseek2'): PolyStrata runs only that model
+PolyStrata: not Qwen3.8-Flash-Next (architecture 'deepseek2'): PolyStrata runs only that model
 ```
 
 That message is the *model-family* gate in the inspector, not a type rejection.
@@ -350,7 +350,7 @@ flint}`; `deepseek2` is not in that set (nor in setup's `POLY_GGUF_ARCHS`). The
 engine itself is wired: `src/poly/engine.cpp:1183-1199` maps
 `"deepseek2"`/`"gigachat_audio"` to `GigaChatAudio` and permits `--kv q8_0`.
 The same inspector, on a Qwen file setup already accepts, prints
-`Strata: this is setup's --family qwen --model IQ3_XXS`. In other words:
+`PolyStrata: this is setup's --family qwen --model IQ3_XXS`. In other words:
 
 * the storage/type layer can read and multiply IQ3_XXS/IQ3_S;
 * the `deepseek2`/`gigachat_audio` backend exists on this branch

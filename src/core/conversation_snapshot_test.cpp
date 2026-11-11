@@ -105,12 +105,23 @@ struct Fixture {
             kv_ring_table(st.page_table,st.n_pages,st.n_slots,nullptr);
         }
     }
+    // The snapshot copies run on the engine's private non-blocking stream (conversation_copy.hpp), which the driver
+    // does not order against the legacy stream.  A cudaMemcpy from pageable host memory may return with its DMA to
+    // the device still in flight on the legacy stream, so a fill does not by itself establish what the next save
+    // reads or the restore overwrites: this is the caller-side synchronization conversation_kv_save / _restore and
+    // the snapshot capture require, and the query shows the fill has landed (a missing sync returns
+    // cudaErrorNotReady here and made this test fail about half of its runs).
+    void landed() {
+        cuda_check(cudaDeviceSynchronize());
+        check(cudaStreamQuery(nullptr) == cudaSuccess, "a fixture fill has landed on the device");
+    }
     void fill(uint8_t salt) {
         for (size_t i=0;i<sources.size();++i) {
             std::vector<uint8_t> data(sizes[i]);
             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
             if (!data.empty()) cuda_check(cudaMemcpy(sources[i],data.data(),data.size(),cudaMemcpyDefault));
         }
+        landed();
     }
     void fill_after(uint8_t salt, int64_t first_dirty) {
         for (size_t i=0;i<sources.size();++i) {
@@ -119,6 +130,7 @@ struct Fixture {
             if (sizes[i] > offset)
                 cuda_check(cudaMemset(static_cast<uint8_t*>(sources[i])+offset, salt, sizes[i]-offset));
         }
+        landed();
     }
     ~Fixture() { for (void* p:device) cudaFree(p); for (void* p:host) cudaFreeHost(p); }
 };

@@ -145,9 +145,20 @@ static void activation(const float* gate, const float* up, float* out, int n, in
     element(a,stream);
 }
 void swiglu_clamp(const float* g,const float* u,float* o,int n,float limit,void* s) { activation(g,u,o,n,1,limit,5,s); }
-void swiglu_clamp_rows(const float* gu,float* o,int n,int rows,float limit,void* s) { activation(gu,nullptr,o,n,rows,limit,5,s); }
+// NVFP4 has no Metal kernels, so no layer here has expert scales
+static void no_scales(const ExpertScales* sc) {
+    if (sc && (sc->gate || sc->up)) throw std::runtime_error("Metal: NVFP4 expert scales are not supported");
+}
+void swiglu_clamp_rows(const float* gu,float* o,int n,int rows,float limit,void* s,const ExpertScales* sc) {
+    no_scales(sc); activation(gu,nullptr,o,n,rows,limit,5,s);
+}
 void geglu(const float* g,const float* u,float* o,int n,void* s) { activation(g,u,o,n,1,0,6,s); }
-void geglu_rows(const float* gu,float* o,int n,int rows,void* s) { activation(gu,nullptr,o,n,rows,0,6,s); }
+void geglu_rows(const float* gu,float* o,int n,int rows,void* s,const ExpertScales* sc) {
+    no_scales(sc); activation(gu,nullptr,o,n,rows,0,6,s);
+}
+void expert_weights(float*,const float*,const int32_t*,int,void*) {
+    throw std::runtime_error("Metal: NVFP4 expert scales are not supported");
+}
 void moe_sum(const float* x,const float* w,float* acc,int n,int used,int rows,void* s) {
     BasicArgs a{{x,w,acc}}; a.n=n; a.stride=used; a.count=uint64_t(n)*rows; a.kind=7; element(a,s);
 }

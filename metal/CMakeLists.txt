@@ -12,6 +12,7 @@
 #   ninja -C build-metal
 cmake_minimum_required(VERSION 3.24)
 project(strata_metal LANGUAGES C CXX OBJCXX)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/strata_geometry.cmake)   # -DSTRATA_GEOMETRY=<name> (default flash_next, no flag added)
 
 if(NOT APPLE)
   message(FATAL_ERROR "metal/ builds on macOS only")
@@ -26,6 +27,8 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 set(CMAKE_OBJCXX_FLAGS_RELEASE "-O2")
 
+# The fork's if(BUILD_TESTING) blocks and ctest labels need CTest's BUILD_TESTING option; without include(CTest) they are
+# dead and the tests below are never registered.  (fork metal/CMakeLists.txt:29)
 include(CTest)
 
 get_filename_component(STRATA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
@@ -53,6 +56,7 @@ endforeach()
 # These checks use generated inputs and CPU references; no model download is needed.
 # Keep benchmarks and the model-dependent chain programs out of CTest. Serialize
 # GPU checks even under ctest -j so they do not compete for unified memory.
+# (fork metal/CMakeLists.txt:53-71)
 if(BUILD_TESTING)
   add_test(NAME arena_budget_test COMMAND arena_budget_test)
   set_tests_properties(arena_budget_test PROPERTIES LABELS "metal;cpu")
@@ -86,6 +90,7 @@ target_link_libraries(strata_gpu_metal PUBLIC "-framework Metal" "-framework Fou
 
 # Native strata-poly port, opt-in for the smaller families. This library uses
 # the same stream and graph runtime as strata. Full-model validation is pending.
+# (fork metal/CMakeLists.txt:87-127)
 option(STRATA_METAL_POLY "Build the strata-poly Metal kernel port and checks" OFF)
 if(STRATA_METAL_POLY)
   add_library(strata_poly_metal_kernels STATIC src/poly/basic.cpp src/poly/attention.cpp src/poly/recurrent.cpp src/poly/advanced.cpp)
@@ -136,30 +141,26 @@ if(BUILD_TESTING)
                        RESOURCE_LOCK metal_gpu TIMEOUT 120)
 endif()
 
-# The engine: ggml (the native expert formats' type traits and ggml-cpu) from a llama.cpp checkout at the commit the
-# PC build pins (CMakeLists.txt: 3cf03257).
+# The engine: ggml (the native expert formats' type traits and ggml-cpu) from the tree vendored in third_party/strata-ggml (frozen at the
+# commit the PC build pins, 3cf03257).  -DSTRATA_GGML_DIR=<llama.cpp checkout> builds from that checkout instead (an override kept for two releases).
 option(STRATA_METAL_ENGINE "Build the engine (strata) for Metal" ON)
-set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout at the pinned commit")
+set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from instead of the vendored third_party/strata-ggml (empty: the vendored tree)")
 if(NOT STRATA_METAL_ENGINE)
   return()
 endif()
-if(NOT EXISTS "${STRATA_GGML_DIR}/ggml/CMakeLists.txt")
-  message(FATAL_ERROR "STRATA_GGML_DIR='${STRATA_GGML_DIR}' is not a llama.cpp checkout")
+include(${STRATA_ROOT}/cmake/strata_ggml.cmake)        # -DSTRATA_GGML_DIR, or the vendored third_party/strata-ggml
+include(${STRATA_ROOT}/cmake/backends/metal.cmake)
+strata_ggml_resolve("${STRATA_ROOT}")
+if(NOT EXISTS "${_strata_ggml_root}/ggml/CMakeLists.txt")
+  message(FATAL_ERROR "ggml sources not found in '${_strata_ggml_root}' (third_party/strata-ggml, or the -DSTRATA_GGML_DIR checkout)")
 endif()
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(GGML_STATIC ON CACHE BOOL "" FORCE)
-set(GGML_METAL OFF CACHE BOOL "" FORCE)
-set(GGML_BLAS OFF CACHE BOOL "" FORCE)
-set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
-set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
+strata_metal_ggml()
 # ref_quant's IQ1_S / IQ1_M / Q6_K dequantizers against ggml's own (the Unsloth sets' kernels are checked against ref_quant: dsu_parity)
 add_executable(dsu_ref_vs_ggml tests/dsu_ref_vs_ggml.cpp)
-target_include_directories(dsu_ref_vs_ggml PRIVATE ${STRATA_GGML_DIR}/ggml/include)
+target_include_directories(dsu_ref_vs_ggml PRIVATE ${_strata_ggml_root}/ggml/include)
 target_link_libraries(dsu_ref_vs_ggml PRIVATE mtl_rt ggml-base ggml-cpu)
 
+# NVFP4 decode on Metal against ggml's reference (fork metal/CMakeLists.txt:163-166)
 add_executable(nvfp4_parity tests/nvfp4_parity.cpp)
 target_link_libraries(nvfp4_parity PRIVATE mtl_rt ggml-base)
 add_test(NAME nvfp4_parity COMMAND nvfp4_parity)
@@ -186,8 +187,8 @@ file(GLOB STRATA_METAL_ENGINE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_D
 
 add_library(strata_metal_host STATIC ${STRATA_METAL_HOST_SOURCES})
 target_include_directories(strata_metal_host PUBLIC ${STRATA_ROOT}/include ${S}/core ${STRATA_ROOT}/third_party/ggml
-                           ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src ${STRATA_GGML_DIR}/ggml/src/ggml-cpu)
-target_compile_definitions(strata_metal_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_HAVE_DFLASH2=1 STRATA_VERSION="0.1.58-metal")
+                           ${_strata_ggml_root}/ggml/include ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/src/ggml-cpu)
+target_compile_definitions(strata_metal_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_HAVE_DFLASH2=1 STRATA_VERSION="0.1.59-metal")
 target_compile_options(strata_metal_host PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
 target_link_libraries(strata_metal_host PUBLIC strata_gpu_metal ggml-cpu ggml-base)
 
@@ -201,14 +202,18 @@ target_link_libraries(strata_metal_kernels PUBLIC strata_metal_host mtl_rt)
 
 add_executable(strata ${S}/program/generate.cpp)
 target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+# the decode window on its own (probe/window_probe.cpp): the engine's process state without the engine, for looking at a Metal fault
+add_executable(window_probe probe/window_probe.cpp)
+target_link_libraries(window_probe PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
 
 # The smaller-family engine keeps the shared line protocol, expert cache, CPU
 # experts, batching, conversations and speculative decoding.
+# (fork metal/CMakeLists.txt:205-415; ${STRATA_GGML_DIR} is ${_strata_ggml_root} after the 0.2.13 ggml split)
 if(STRATA_METAL_POLY)
   target_sources(strata_poly_metal_kernels PRIVATE src/poly/quantized.cpp src/poly/unported.cpp)
-  target_include_directories(strata_poly_metal_kernels PRIVATE ${S}/poly ${STRATA_GGML_DIR}/ggml/include)
+  target_include_directories(strata_poly_metal_kernels PRIVATE ${S}/poly ${_strata_ggml_root}/ggml/include)
   target_compile_definitions(strata_poly_metal_kernels PRIVATE
-    STRATA_POLY_GGML_SOURCE="${STRATA_GGML_DIR}/ggml/src"
+    STRATA_POLY_GGML_SOURCE="${_strata_ggml_root}/ggml/src"
     STRATA_POLY_QUANT_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/poly/quantized.metal"
     STRATA_POLY_MM_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/src/poly/mm.metal")
   target_link_libraries(strata_poly_metal_kernels PUBLIC ggml-base)
@@ -216,7 +221,7 @@ if(STRATA_METAL_POLY)
     ${S}/poly/gemma4.cpp ${S}/poly/lfm2moe.cpp ${S}/poly/glm5next.cpp ${S}/poly/deepseek4.cpp ${S}/poly/flint.cpp
     ${S}/poly/kolibri1.cpp ${S}/poly/cpu_experts.cpp ${S}/poly/spill.cpp ${S}/platform/memory.cpp
     ${S}/core/conversation_memory.cpp ${S}/spec/draft_policy.cpp ${S}/spec/suffix_drafter.cpp)
-  target_include_directories(strata-poly PRIVATE ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src)
+  target_include_directories(strata-poly PRIVATE ${_strata_ggml_root}/ggml/include ${_strata_ggml_root}/ggml/src)
   target_link_libraries(strata-poly PRIVATE strata_poly_metal_kernels ggml-cpu ggml-base)
   target_compile_definitions(strata-poly PRIVATE STRATA_VERSION="0.1.45-metal-poly")
   set_source_files_properties(${S}/poly/norm_q8_test.cu PROPERTIES LANGUAGE CXX)
@@ -301,6 +306,13 @@ if(STRATA_METAL_POLY AND BUILD_TESTING)
     --tokens 1,2,3,4,5 --max-new 8 --max-context 128 --prompt-batch 32 --threads 2 --no-draft --batch 2 --check-batch 2 --kv q8_0)
   set_tests_properties(poly_tiny_qwen_q8 PROPERTIES LABELS "metal;gpu;poly;synthetic"
     RESOURCE_LOCK metal_gpu TIMEOUT 120 FIXTURES_REQUIRED tiny_qwen35moe)
+  # each sequence's draft block guesses in the batch, and the answers are still each one's alone
+  # (PolyStrata 0.1.45-poly.9, batch MTP)
+  add_test(NAME poly_tiny_qwen_batch_mtp COMMAND strata-poly --model ${CMAKE_CURRENT_BINARY_DIR}/tiny-qwen35moe.gguf
+    --tokens 1,2,3,4,5 --max-new 8 --max-context 128 --prompt-batch 32 --threads 2 --window 2 --batch 2 --check-batch 2
+    --batch-mtp)
+  set_tests_properties(poly_tiny_qwen_batch_mtp PROPERTIES LABELS "metal;gpu;poly;synthetic"
+    RESOURCE_LOCK metal_gpu TIMEOUT 120 FIXTURES_REQUIRED tiny_qwen35moe)
 endif()
 
 if(STRATA_METAL_POLY AND BUILD_TESTING)
@@ -319,7 +331,7 @@ if(STRATA_METAL_POLY)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/q36_host.py ${S}/qwen35/q36_engine.cu ${Q36_GENERATED}
     DEPENDS ${S}/qwen35/q36_engine.cu tools/q36_host.py VERBATIM)
   add_executable(strata-q36 ${Q36_GENERATED}/q36_host.cpp ${S}/qwen35/q36_main.cpp src/q36/bindings.cpp src/q36/cpu_compat.cpp)
-  target_include_directories(strata-q36 PRIVATE ${Q36_GENERATED} src/q36 ${S}/poly ${STRATA_GGML_DIR}/ggml/include)
+  target_include_directories(strata-q36 PRIVATE ${Q36_GENERATED} src/q36 ${S}/poly ${_strata_ggml_root}/ggml/include)
   target_compile_definitions(strata-q36 PRIVATE STRATA_Q36_CPU_POOL=1 STRATA_Q36_METAL_SOURCE="${Q36_GENERATED}/q36.metal")
   target_link_libraries(strata-q36 PRIVATE strata_metal_host strata_poly_metal_kernels ggml-cpu ggml-base)
 endif()
@@ -376,7 +388,7 @@ if(STRATA_METAL_POLY AND BUILD_TESTING)
   get_target_property(poly_engine_test_sources strata-poly SOURCES)
   list(REMOVE_ITEM poly_engine_test_sources ${S}/poly/main.cpp)
   add_library(poly_engine_test_host STATIC ${poly_engine_test_sources})
-  target_include_directories(poly_engine_test_host PUBLIC ${S}/poly ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src)
+  target_include_directories(poly_engine_test_host PUBLIC ${S}/poly ${_strata_ggml_root}/ggml/include ${_strata_ggml_root}/ggml/src)
   target_link_libraries(poly_engine_test_host PUBLIC strata_poly_metal_kernels ggml-cpu ggml-base)
   add_executable(poly_memory_growth poly_tests/memory_growth.cpp)
   target_compile_definitions(poly_memory_growth PRIVATE STRATA_METAL_TESTING=1)

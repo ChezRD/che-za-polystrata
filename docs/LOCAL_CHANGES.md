@@ -1,8 +1,9 @@
 # Local changes and upstream sync
 
-The engine is taken from upstream Strata through `upstream-engine-<tag>` snapshot commits;
+The engine is taken from the [Strata](https://github.com/Niko1221/Strata) project through `upstream-engine-<tag>` snapshot commits;
 `main` merges them. Local work stays in new files and small hooks. This page lists the
-fork-local change set and the sync checklist.
+fork-local change set and the sync checklist. The 2026-11-11 sync (PolyStrata 0.1.45-poly.9 and
+the Strata project's 0.2.13.1 release) is recorded in [SYNC-2026-11-11.md](SYNC-2026-11-11.md).
 
 ## Flint
 
@@ -47,9 +48,14 @@ fork-local change set and the sync checklist.
 - After a sync: `python tools/polystrata_names.py`, then build, `ctest -R 'local_hooks|iq_|poly_'`,
   `native_grouped_parity`, and the 12G/REAP smoke tests.
 
-## Verification, 2026-11-11
+## Verification, 2026-11-11 sync
 
 - `native_grouped_parity`: 111 cases, 111 bitwise equal, 0 failures.
-- `local_hooks_test`: ok.
-- `ctest -R 'iq_|poly_'`: 12/12 (3 HIP tests skipped).
+- `local_hooks_test`: ok, including the NVFP4 type-40 checks.
+- `ctest -R 'local_hooks|iq_|poly_'`: 13/13 (3 HIP tests skipped).
+- Flint 12G, 20K, 64 tokens: 64/64 ids at a matched expert-cache plan; 100.0 tok/s k8v4.
+- REAP short: 32 tokens, 30.45 tok/s, 2,462 slots, 30.76 GiB resident.
+- Full `ctest` after the follow-up fixes: 307/307 passed, 14 skipped, 0 failed (920 s).
 - `git diff --check`: clean.
+- Full gate table, the ctest triage and the untested list: [SYNC-2026-11-11.md](SYNC-2026-11-11.md).
+- Metal/HIP/SYCL, the synthetic W4A8 pack and the `ncu`/`nsys` split: [PLATFORM_GATES.md](PLATFORM_GATES.md).

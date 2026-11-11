@@ -8,6 +8,10 @@ request it is about.
 
 This list is edited by the maintainers. An item stays until a report answers it.
 
+The gates that need hardware the maintainers do not have after the 2026-11-11 sync (Metal, HIP, SYCL, NVFP4 W4A8 on a
+real pack, Nsight Compute counters), with the exact commands and what counts as a pass, are in
+[PLATFORM_GATES.md](PLATFORM_GATES.md).
+
 | Wanted | Why | Example of an earlier answer |
 |---|---|---|
 | Two NVIDIA cards of different sizes (a large and a small one), in both card orders, with `--layer-split auto` | There is no unequal pair here to check the split planner; the card order and the small card's free memory changed the split | #880, #1238 |

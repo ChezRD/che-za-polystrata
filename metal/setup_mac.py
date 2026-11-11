@@ -103,7 +103,12 @@ def model_catalog() -> dict:
 
 
 def model_shard_names(model: str, family: str | None = None) -> list[str]:
-    """The chosen family's files in order; ready packs use their manifest instead."""
+    """The chosen family's files in order; ready packs use their manifest instead.
+
+    Upstream's 0.2.13 delta added a feed branch here (S.model_file of the family the feed registered). This version
+    already names every family's files through S.model_file/S.model_shards, so a feed family added to S.FAMILIES gets
+    its names without a branch of its own.
+    """
     family = family or MAC_MODELS[model].get("family", "qwen")
     fam = S.FAMILIES[family]
     return [S.model_file(fam, model, i) for i in range(1, S.model_shards(fam, model) + 1)]
@@ -733,7 +738,26 @@ def setup_q36(a, info: dict, data: Path, elsewhere: list) -> int:
 
 
 # ------------------------------------------------------------------------------------------------ main
+def _feed_models(argv, interactive: bool) -> None:
+    """The signed feed's models (setup.py feed_models_setup: the feed, else the last verified list) join MAC_MODELS / FAMILIES / MODELS. Read when a name the built-in
+    tables do not know is given, or when the size menu is going to be shown; nothing happens when the feed has no models.
+
+    Upstream's 0.2.13 delta.  The feed's entry point (S.feed_models_setup) lives in setup.py's app layer, which this
+    engine tree's setup.py does not carry: without it the call would stop the Mac setup with AttributeError, so the
+    block is skipped and a feed family reaches the catalog only when setup.py grows the function back."""
+    if not hasattr(S, "feed_models_setup"):
+        return
+    args = list(argv or sys.argv[1:])
+    peek = lambda flag: next((v.split("=", 1)[1] if v.startswith(flag + "=") else args[i + 1] if i + 1 < len(args) else None   # noqa: E731
+                              for i, v in enumerate(args) if v == flag or v.startswith(flag + "=")), None)
+    family, model = peek("--family"), peek("--model")
+    if (family and family not in ("qwen", "unsloth", "gyro")) or (model and model not in MAC_MODELS) or interactive:
+        S.feed_models_setup(peek("--feed"))
+
+
 def main(argv=None) -> int:
+    given = argv if argv is not None else sys.argv[1:]
+    _feed_models(argv, not any(x in given for x in ("--yes", "--model", "--check", "--family")) and ("--setup" in given or not mac_configs()))   # (a plain start of an installed model reads nothing)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--list-models", action="store_true",
                     help="list all model families and quantizations from the shared installer")
@@ -893,6 +917,9 @@ def main(argv=None) -> int:
         S.download(fam["hf"].format(q=model) + s.name, s)
     S.check_shards(files)
     for s in files:                                    # the Unsloth files: pinned sizes and SHA-256
+        # Upstream's 0.2.13 delta pinned a feed family's files here too (S.fam_pin, fam.get("feed")).  This tree's
+        # setup.py has no feed API (strata_control and S.fam_pin are not in the engine snapshot), so the fork's
+        # unsloth-only pin stays; the feed models cannot be installed until setup.py carries them.
         if shard_sha(s.name):
             S.verify_sha256(s, *shard_sha(s.name))
     S.ok("model files present")

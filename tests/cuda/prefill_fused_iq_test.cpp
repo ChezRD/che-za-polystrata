@@ -5,15 +5,16 @@
 //     (gate/up, SwiGLU, down), and
 //   - the MMQ path in prefill.cpp's sequence (gather_native into 16-expert groups, q8_1 of the slots' activations,
 //     gate/up, SwiGLU, q8_1 of H, down).
-// Both round the activations and H to int8 per 32 values, differently, so this is not a bitwise test: the fused
-// path's error against the reference has to be comparable to MMQ's own (at most 1.5x its RMS and 2x its worst row).
+// Both round the activations and H to int8 per 32 values (the activations with the same .5 tie rule, roundf; H's ties
+// go the other way), so this is not a bitwise test: the fused path's error against the reference has to be comparable
+// to MMQ's own (at most 1.5x its RMS and 2x its worst row).
 // The pairs cover every format the kernels take: gate/up IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_XS, down Q2_0 IQ4_NL.
 // Part 1 (reference), per pair: 256 tokens over 64 experts, skewed routing - experts with 0 rows, with one, with
 // several 64-row tiles - an all-zero token, per-expert blobs at unrelated (2-byte aligned) addresses, three launches of
 // different expert ranges.  Part 2 (timing): one layer at the engine's chunks (2048, 3584, 8192 tokens; 512 experts,
 // top 10) on both paths and on MMQ's products alone (no gathers), for the IQ2_XS, IQ3_XXS and IQ3_S packs' most
 // common layers, with the grouping checked and a sample of rows against the reference.  --no-ref, --no-timing,
-// --only=NAME, --chunks=A,B, --unset-pf-fused (STRATA_PF_FUSED left unset instead of set to 1: the engine's default, for the
+// --only=NAME, --edge, --chunks=A,B, --unset-pf-fused (STRATA_PF_FUSED left unset instead of set to 1: the engine's default, for the
 // STRATA_PF_FUSED_Q2N=1 ctest entry).  Exit 77 without a CUDA device of sm_80 or newer.
 #include "strata/core/emulate.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -40,7 +41,8 @@ namespace {
 namespace mmq = strata::prefill::mmq;
 namespace fused = strata::prefill::fused;
 
-constexpr int N = 2560, FF = 640, K = 10, GROUP = 16;
+// The compiled geometry's widths (Flash-Next: 2560 x 640, 512 experts, top 10): build with -DSTRATA_GEOMETRY=<name> to test another shape.
+constexpr int N = fused::kMoeEmbd, FF = fused::kMoeFF, FF2 = fused::kMoeGuRows, K = (int) strata::core::kCompiledGeometry.n_expert_used, GROUP = 16;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -114,7 +116,7 @@ std::vector<uint8_t> make_blob(const Pair& p, const Geo& g, std::mt19937& rng) {
     return b;
 }
 
-// ggml's dequantized weights: gate [640][2560], up [640][2560], down [2560][640]
+// ggml's dequantized weights: gate [FF][N], up [FF][N], down [N][FF]
 void dequant(const Pair& p, const Geo& g, const std::vector<uint8_t>& b, std::vector<float>& gu, std::vector<float>& dn) {
     const auto* tg = ggml_get_type_traits(p.gu);
     const auto* td = ggml_get_type_traits(p.d);
@@ -178,9 +180,9 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
     MmqBufs(const Pair& p, int64_t rows, int E)
-        : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * 1280 * 4), h((size_t) rows * FF * 4),
+        : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * FF2 * 4), h((size_t) rows * FF * 4),
           hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident((size_t) rows * 4),
-          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, 1280, N) + 4096),
+          bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, FF2, N) + 4096),
           grp_d(GROUP * mmq::matrix_bytes(p.d, N, FF) + 4096) {}
 };
 // `direct`: no gathers - the products read the blobs where they are (they must lie at a fixed stride, every expert
@@ -188,7 +190,7 @@ struct MmqBufs {
 void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const Routing& r, const float* x_dev,
              const int32_t* src_dev, const std::vector<const uint8_t*>& blob, int64_t rows, cudaStream_t s,
              bool direct = false, size_t stride = 0) {
-    const size_t gub = mmq::matrix_bytes(p.gu, 1280, N), db = mmq::matrix_bytes(p.d, N, FF);
+    const size_t gub = mmq::matrix_bytes(p.gu, FF2, N), db = mmq::matrix_bytes(p.d, N, FF);
     const int E = (int) r.cnt.size();
     std::vector<int32_t> order;
     for (int e = 0; e < E; ++e) if (r.cnt[(size_t) e] > 0) order.push_back(e);
@@ -220,12 +222,12 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         }
         const uint8_t* b0 = blob[(size_t) order[j0]];
         mmq::Product gu;
-        gu.w = direct ? (const void*) b0 : b.grp_gu.p; gu.type = (int) p.gu; gu.w_rows = 1280; gu.w_cols = N;
+        gu.w = direct ? (const void*) b0 : b.grp_gu.p; gu.type = (int) p.gu; gu.w_rows = FF2; gu.w_cols = N;
         gu.expert_bytes = direct ? stride : gub;
         gu.n = ngx; gu.xq = b.xq.p; gu.bounds = b.bounds.as<int32_t>() + j0; gu.ids = b.ident.as<int32_t>();
-        gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = 1280;
+        gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = FF2;
         ctx.run(gu, s);
-        mmq::swiglu(b.gu.as<float>() + r0 * 1280, b.h.as<float>() + r0 * FF, nr, FF, false, s);
+        mmq::swiglu(b.gu.as<float>() + r0 * FF2, b.h.as<float>() + r0 * FF, nr, FF, false, s);
         mmq::quantize(b.h.as<float>() + r0 * FF, nullptr, b.hq.p, (int) p.d, FF, FF, nr, s);
         mmq::Product dn;
         dn.w = direct ? (const void*) (b0 + geo.down_off) : b.grp_d.p; dn.type = (int) p.d; dn.w_rows = N; dn.w_cols = FF;
@@ -264,12 +266,15 @@ void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, 
 
 struct Err {
     double rms = 0, worst = 0;   // RMS error / RMS of the reference; the worst row's max |error| / its max |ref|
+    int64_t rows = 0, over = 0;  // rows compared; how many are above the bound compare() was given (the tail)
 };
-// y_a[row_a(i)] against y_b[row_b(i)] for every pair i (rows of N values)
+// y_a[row_a(i)] against y_b[row_b(i)] for every pair i (rows of N values).  `bound` > 0: count the rows whose ratio is
+// above it into Err::over.
 template <typename RA, typename RB>
-Err compare(const std::vector<float>& a, RA row_a, const std::vector<float>& b, RB row_b, size_t pairs) {
+Err compare(const std::vector<float>& a, RA row_a, const std::vector<float>& b, RB row_b, size_t pairs, double bound = 0) {
     double e2 = 0, r2 = 0;
     Err out;
+    out.rows = (int64_t) pairs;
     for (size_t i = 0; i < pairs; ++i) {
         const float* ya = a.data() + (size_t) row_a(i) * N;
         const float* yb = b.data() + (size_t) row_b(i) * N;
@@ -284,18 +289,23 @@ Err compare(const std::vector<float>& a, RA row_a, const std::vector<float>& b, 
         }
         if (mr > 0) out.worst = std::max(out.worst, me / mr);
         else if (me > 0) out.worst = 1e30;   // a zero row must stay exactly zero
+        if (bound > 0 && (mr > 0 ? me / mr : (me > 0 ? 1e30 : 0)) > bound) ++out.over;
     }
     out.rms = r2 > 0 ? std::sqrt(e2 / r2) : 0;
     return out;
 }
 
-// the kernels' int8 rounding per 32 values (quant_act_nat_kernel / the H epilogue), as floats: codes * (amax / 127)
-void quant32(const float* in, float* out, int n) {
+// the kernels' int8 rounding per 32 values (quant_act_nat_kernel / the H epilogue), as floats: codes * (amax / 127).
+// The activation quantizer rounds a .5 tie away from zero (roundf, as MMQ's q8_1 does); the H epilogue rounds to even.
+void quant32(const float* in, float* out, int n, bool act = false) {
     for (int b = 0; b < n; b += 32) {
         float am = 0.0f;
         for (int j = 0; j < 32; ++j) am = std::max(am, std::fabs(in[b + j]));
         const float inv = am > 0.0f ? 127.0f / am : 0.0f, d = am / 127.0f;
-        for (int j = 0; j < 32; ++j) out[b + j] = (float) std::nearbyint(in[b + j] * inv) * d;
+        for (int j = 0; j < 32; ++j) {
+            const float c = in[b + j] * inv;
+            out[b + j] = (act ? std::round(c) : std::nearbyint(c)) * d;
+        }
     }
 }
 
@@ -379,7 +389,7 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
                         for (int f = 0; f < FF; ++f) a += (double) wd[f] * h[(size_t) f];
                         ref[(size_t) i * N + o] = (float) a;
                     }
-                    quant32(xr, xq.data(), N);
+                    quant32(xr, xq.data(), N, true);
                     for (int f = 0; f < FF; ++f) {
                         double gt = 0, up = 0;
                         const float *wg = gu.data() + (size_t) f * N, *wu = gu.data() + (size_t) (FF + f) * N;
@@ -430,7 +440,7 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
 
 // part 2: one layer at a real chunk, timed
 void timing_part(const Pair& p, int T, cudaStream_t s) {
-    static const int E = [] { const char* v = std::getenv("S20_E"); return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : 512; }();   // S20_E=256: the Coder pack
+    static const int E = [] { const char* v = std::getenv("S20_E"); return v != nullptr && std::atoi(v) > 0 ? std::atoi(v) : (int) strata::core::kCompiledGeometry.n_expert; }();   // S20_E=256: the Coder pack
     const Geo geo(p);
     std::mt19937 rng(1360);
     const int64_t rows = (int64_t) T * K;
@@ -535,10 +545,10 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         std::printf("  fused output bits hash %016llx\n", (unsigned long long) hsh);
     }
     const Err efm = mq ? compare(y_f, [&](size_t i) { return (int64_t) slot[i]; }, y_mmq,
-                                 [&](size_t i) { return (int64_t) r.row_of[i]; }, (size_t) rows) : Err{};
+                                 [&](size_t i) { return (int64_t) r.row_of[i]; }, (size_t) rows, 2e-2) : Err{};
     std::printf("%s - timing part: %d tokens x top %d over %d experts, one layer: MMQ path %.3f ms, fused %.3f ms "
-                "(%.2fx); fused vs MMQ rel RMS %.3e worst row %.3e\n",
-                p.name, T, K, E, t_mmq, t_f, t_mmq / t_f, efm.rms, efm.worst);
+                "(%.2fx); fused vs MMQ rel RMS %.3e worst row %.3e, %lld of %lld rows above 2e-2\n",
+                p.name, T, K, E, t_mmq, t_f, t_mmq / t_f, efm.rms, efm.worst, (long long) efm.over, (long long) efm.rows);
     {   // the grouping: every pair in its expert's rows (the near-identical blobs here would hide a wrong expert)
         const std::vector<int32_t> fsrc = download_i(fb.src, (size_t) rows);
         int64_t bad = 0, bad_src = 0;
@@ -640,6 +650,9 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     delete mbp;
     // the two int8 paths at the real shape, every tile of the layer: R9700 rel RMS 1.3-1.9e-4, worst row 2.9e-3-8.3e-3
     // (STRATA_PF_F16=1: F16 products against MMQ's int8, gfx1151 rel RMS 2.5-2.7e-3, worst row 6.4e-3-8.8e-3)
+    // The activation quantizer rounds like MMQ's q8_1 (roundf: a .5 tie away from zero), so the two paths agree to
+    // 1.7e-7 RMS / 2.2e-3 worst row at 8192 tokens on the RTX 4060 Ti (sm_89, Q2_0 / Q2_0); the remaining tail is H's
+    // epilogue, which rounds a tie to even.  The row count printed above is diagnostic, not a gate.
     if (mq && !no_mmq && (efm.rms > (f16_on() ? 5e-3 : 1e-3) || efm.worst > 2e-2))
         throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
 }
@@ -703,10 +716,12 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
         bool timing = true, ref = true;   // --no-timing, --no-ref: skip a part
+        bool edge = false;                // --edge: the tails and tile boundaries (a handful of tokens, one token, 130 / 517 / 640) of the Q5_0 pairs, for every pair
         std::vector<int> chunks = {2048, 3584, 8192};   // --chunks=A,B: the timing part's chunk sizes
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--no-timing") == 0) timing = false;
             if (std::strcmp(argv[i], "--no-ref") == 0) ref = false;
+            if (std::strcmp(argv[i], "--edge") == 0) edge = true;
             if (std::strncmp(argv[i], "--chunks=", 9) == 0) {
                 chunks.clear();
                 for (const char* c = argv[i] + 9; *c;) {
@@ -732,11 +747,12 @@ int main(int argc, char** argv) {
             }
             if (ref) reference_part(p, s);
             // Q5_0 down (round 0217): tails and boundaries - a handful of tokens, one token, a tile's edge (63, 65 rows an expert is not controlled, the counts follow the routing)
-            if (ref && p.d == GGML_TYPE_Q5_0) {
+            if (ref && (p.d == GGML_TYPE_Q5_0 || edge)) {
                 reference_part(p, s, 33, 16, 5);
                 reference_part(p, s, 1, 16, -1);
                 reference_part(p, s, 130, 32, 77);
                 reference_part(p, s, 517, 32, 300);
+                if (edge) reference_part(p, s, 640, 16, 300);   // five 64-row tiles an expert: the paired-tile (128-row) kernels
             }
         }
         if (timing) {

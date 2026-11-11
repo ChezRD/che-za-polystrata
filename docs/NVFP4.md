@@ -208,6 +208,32 @@ engine's own q8_1 kernels, which decode UE4M3/E2M1 in software. The engine was b
 on the RTX 5090 with the host answering as that generation. On those builds `mmq_nvfp4_parity` and
 `nvfp4_expert_gpu_parity` gave results identical to sm_120.
 
+### Ada (RTX 4060 Ti 16 GB)
+
+Measured on the merged tree, 2026-11-11, CUDA 13.4, 2820 MHz: `mmq_expert_bench 12 160 626`, one launch of 16
+experts x R rows, gate/up + down, the median of 25 runs. R=12 is a 600-token chunk, 160 an 8K prompt, 626 a 32K
+prompt.
+
+| R | NVFP4 W4A8 | IQ3_S + IQ4_NL | FP16 (cuBLAS) |
+| ---: | ---: | ---: | ---: |
+| 12 | 0.121 ms, 15.6 TOPS | 0.127 ms, 14.9 TOPS | 0.671 ms, 2.8 TOPS |
+| 160 | 0.628 ms, 40.1 TOPS | 0.567 ms, 44.4 TOPS | 0.873 ms, 28.8 TOPS |
+| 626 | 2.015 ms, 48.9 TOPS | 1.773 ms, 55.5 TOPS | 2.469 ms, 39.9 TOPS |
+
+For prompt speed on Ada, IQ3_S/IQ4_NL are the faster pair: NVFP4 W4A8 is 5% faster only at R=12, then 10% and 12%
+slower at R=160 and R=626, and its expert blob is 19% larger (2.76 against 2.33 MB). Without FP4 tensor cores W4A8
+runs the int8 MMQ path plus FP4 unpacking, so NVFP4 on this card is a size/decode choice, not a prompt-speed one.
+W4A4 is not available here.
+
+FP16 is slower at every size (22% behind W4A8 and 39% behind IQ at R=626; 5.5x behind at R=12, where the 16
+per-expert cuBLAS calls are launch-bound), and its weights cost 3.6x the bytes. It buys accuracy: on 256 tokens
+over 12 experts, gate/up 0.683% for W4A8 against 0.021% with FP16 activations, down 0.894% against 0.021%. The
+0.021% keeps the NVFP4 weights and rounds only the activations, so it is the weight floor, not an FP16-weight
+error; the W4A8 error is almost all Q8_0 activation quantization.
+
+These are kernel/product times only: expert streaming over PCIe, routing and combine are excluded, the weights and
+activations are synthetic, and no end-to-end tokens/s was measured.
+
 HIP: the decode kernels use no CUDA-only intrinsics. The NVFP4 MMQ instance and the W4A8 unit are CUDA-only and
 guarded (`GGML_USE_HIP`). Neither was built for HIP here.
 

@@ -382,8 +382,11 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
     const Df2Seg sg = df2_pick(segs, row_g);
     const int row0 = row_g - sg.row0;
     const int nb = n_in / 32, steps = nb / 16;
-    const int4* wq = reinterpret_cast<const int4*>(sg.q + (size_t) row0 * n_in) + lane + sub * R * 32;
-    const __half* wd = sg.d + (size_t) row0 * nb + (lane >> 1) + sub * R * 16;
+    // row0 is a row of the segment (rows [row0, row0 + 8) of sg, so 0 <= row0 < sg.n_out): zero-extending it into the two
+    // weight pointers keeps row0 one register.  Sign-extended, ptxas parked the int64 pair in the frame for the epilogue
+    // store of gemm_rows_kernel<8, 1, 2> (STACK 8, 2 STL / 2 LDL at 64 registers); narrowed, it stays in registers (62).
+    const int4* wq = reinterpret_cast<const int4*>(sg.q + (size_t) (unsigned) row0 * n_in) + lane + sub * R * 32;
+    const __half* wd = sg.d + (size_t) (unsigned) row0 * nb + (lane >> 1) + sub * R * 16;
     const int4* xv = reinterpret_cast<const int4*>(xq) + lane;
     float acc[R][8];
 #pragma unroll
@@ -499,6 +502,9 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const i
 // The Q4_0 GEMM with R rows a warp (R = 4, 2, 1) instead of 8, as gemm_rows_kernel is to gemm8_kernel: a group of 8 rows is shared by 8 / R warps, each reading only its
 // rows' nibbles and scales; every output keeps the arithmetic of gemm4_kernel (same steps in the same order per lane, the same xsum and shuffle tree), so the result is bitwise
 // the same.  The activations' per-column sum is recomputed by each of the group's warps (4 dp4a a column and step).
+// The epilogue keeps row0 + sub * R in the store, unlike gemm_rows_kernel: the same hoist here clears this kernel's 16 B frame
+// too, but ptxas then picks 120 registers for gemm4_rows_kernel<2, 2, 2> (the default Q4_0 variant, 96 today) and down and fc
+// measure 4.3 % and 4.4 % slower on the RTX 4060 Ti - the frame costs less than the two blocks an SM it would buy.
 template <int WARPS, int R, int UNR>
 __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
     constexpr int SUBS = 8 / R;

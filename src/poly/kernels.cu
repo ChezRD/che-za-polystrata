@@ -1053,14 +1053,28 @@ __global__ void add_scaled_kernel(ScaledRows rows, int count, int n) {
     for (int k = 0; k < count; ++k) rows.acc[k][i] = rows.acc[k][i] + rows.x[k][i] * rows.w[k];
 }
 
+// a row's gate and up scales; 1 (exact) where there is none
+__device__ __forceinline__ float2 row_scales(const ExpertScales& s, int row) {
+    if (!s.gate && !s.up) return make_float2(1.0f, 1.0f);
+    const int e = s.ids ? s.ids[row] : s.e[row];
+    return make_float2(s.gate ? s.gate[e] : 1.0f, s.up ? s.up[e] : 1.0f);
+}
+
 __global__ void swiglu_clamp_rows_kernel(const float* __restrict__ gate_up, float* __restrict__ out, int n,
-                                         float limit) {
+                                         float limit, ExpertScales s) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float* row = gate_up + size_t(blockIdx.y) * 2 * n;
-    const float g = fminf(row[i], limit);
-    const float u = fminf(fmaxf(row[n + i], -limit), limit);
+    const float2 sc = row_scales(s, blockIdx.y);
+    const float g = fminf(row[i] * sc.x, limit);
+    const float u = fminf(fmaxf(row[n + i] * sc.y, -limit), limit);
     out[size_t(blockIdx.y) * n + i] = g / (1.0f + expf(-g)) * u;
+}
+
+__global__ void expert_weights_kernel(float* __restrict__ w, const float* __restrict__ scale,
+                                      const int32_t* __restrict__ ids, int rows) {
+    const int r = blockIdx.x * blockDim.x + threadIdx.x;
+    if (r < rows) w[r] *= scale[ids[r]];
 }
 
 __device__ __forceinline__ float gelu(float x) {
@@ -1073,11 +1087,12 @@ __global__ void geglu_kernel(const float* __restrict__ gate, const float* __rest
     if (i < n) out[i] = gelu(gate[i]) * up[i];
 }
 
-__global__ void geglu_rows_kernel(const float* __restrict__ gate_up, float* __restrict__ out, int n) {
+__global__ void geglu_rows_kernel(const float* __restrict__ gate_up, float* __restrict__ out, int n, ExpertScales s) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float* row = gate_up + size_t(blockIdx.y) * 2 * n;
-    out[size_t(blockIdx.y) * n + i] = gelu(row[i]) * row[n + i];
+    const float2 sc = row_scales(s, blockIdx.y);
+    out[size_t(blockIdx.y) * n + i] = gelu(row[i] * sc.x) * (row[n + i] * sc.y);
 }
 
 // A warp a token, a lane every 32nd expert.  The pick is the host's: the n_used largest of the probabilities plus
@@ -3131,16 +3146,23 @@ void add_scaled(const ScaledRows& rows, int count, int n, void* stream) {
     add_scaled_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(rows, count, n);
 }
 
-void swiglu_clamp_rows(const float* gate_up, float* out, int n, int rows, float limit, void* stream) {
-    swiglu_clamp_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n, limit);
+void swiglu_clamp_rows(const float* gate_up, float* out, int n, int rows, float limit, void* stream,
+                       const ExpertScales* scales) {
+    swiglu_clamp_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n, limit,
+                                                                                scales ? *scales : ExpertScales{});
+}
+
+void expert_weights(float* w, const float* scale, const int32_t* ids, int rows, void* stream) {
+    if (rows > 0) expert_weights_kernel<<<grid(rows, 256), 256, 0, cs(stream)>>>(w, scale, ids, rows);
 }
 
 void geglu(const float* gate, const float* up, float* out, int n, void* stream) {
     geglu_kernel<<<grid(n, 256), 256, 0, cs(stream)>>>(gate, up, out, n);
 }
 
-void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream) {
-    geglu_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n);
+void geglu_rows(const float* gate_up, float* out, int n, int rows, void* stream, const ExpertScales* scales) {
+    geglu_rows_kernel<<<dim3(grid(n, 256), rows), 256, 0, cs(stream)>>>(gate_up, out, n,
+                                                                        scales ? *scales : ExpertScales{});
 }
 
 void route_rows(const float* logits, int n_expert, int n_used, int rows, int gate, float in_scale, const float* bias,

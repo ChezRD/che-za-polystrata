@@ -81,7 +81,7 @@ Notes:
 - The REAP file's expert blobs are larger than Swift's (4.43 MB against 2.33 MB), so the same
   reserve gives 2,522 slots here against 3,132 for Swift. The desktop held about 2.1 GiB of
   VRAM during the run.
-- The engine in the tree is 0.1.58; the Swift config points at 0.1.45.
+- The engine in the tree is 0.1.59.1; the Swift config points at 0.1.45.
 - `--resident-cpu-experts` with `--ram-keep-gib` is not the same mode. It copies the whole
   expert complement, reaches 30.62 tok/s at 2K, and swaps other applications at 256K. Use
   `--resident-budget-gib` instead.

@@ -129,23 +129,43 @@ int main(int argc, char** argv) {
             const bool gpu = kernels::native_mmvq_supported((int) tg.type) && kernels::native_mmvq_supported((int) td.type);
             uint8_t* d_w = nullptr;
             ck(cudaMalloc(&d_w, 2 * gu_bytes + d_bytes + 256));
+            // NVFP4 converted from NVIDIA's checkpoints: each expert's global scales (Engine::load_moe())
+            const TensorInfo* sc[3] = {g.find(b + "ffn_gate_exps.scale"), g.find(b + "ffn_up_exps.scale"),
+                                       g.find(b + "ffn_down_exps.scale")};
+            const uint32_t sc_type[3] = {tg.type, tu.type, td.type};
+            for (int k = 0; k < 3; ++k)
+                if (sc_type[k] != GGML_TYPE_NVFP4) sc[k] = nullptr;
+            const bool scaled = sc[0] || sc[1] || sc[2];
+            float* d_s = nullptr;   // this expert's gate and up scales, ExpertScales' table for it
+            if (scaled) ck(cudaMalloc(&d_s, 2 * sizeof(float)));
 
             for (int e : {0, n_expert / 2, n_expert - 1}) {
                 const uint8_t* gate = g.tensor_data(tg) + (size_t) e * gu_bytes;
                 const uint8_t* up = g.tensor_data(tu) + (size_t) e * gu_bytes;
                 const uint8_t* down = g.tensor_data(td) + (size_t) e * d_bytes;
 
+                float s3[3] = {1.f, 1.f, 1.f};
+                for (int k = 0; k < 3; ++k)
+                    if (sc[k]) s3[k] = ((const float*) g.tensor_data(*sc[k]))[e];
+                poly::ExpertScales es;
+                if (scaled) {
+                    ck(cudaMemcpy(d_s, s3, 2 * sizeof(float), cudaMemcpyHostToDevice));
+                    es.gate = sc[0] ? d_s : nullptr;
+                    es.up = sc[1] ? d_s + 1 : nullptr;
+                }
                 const std::vector<double> gv = matvec(dequant(tg.type, gate, n_embd, n_ff), xd, n_embd, n_ff);
                 const std::vector<double> uv = matvec(dequant(tu.type, up, n_embd, n_ff), xd, n_embd, n_ff);
                 std::vector<double> h((size_t) n_ff);
                 for (int i = 0; i < n_ff; ++i) {
-                    const double gg = std::min(gv[(size_t) i], (double) limit);
-                    h[(size_t) i] = gg / (1.0 + std::exp(-gg)) * std::clamp(uv[(size_t) i], (double) -limit, (double) limit);
+                    const double gg = std::min(gv[(size_t) i] * s3[0], (double) limit);
+                    h[(size_t) i] = gg / (1.0 + std::exp(-gg)) *
+                                    std::clamp(uv[(size_t) i] * s3[1], (double) -limit, (double) limit);
                 }
-                const std::vector<double> want = matvec(dequant(td.type, down, n_ff, n_embd), h, n_ff, n_embd);
+                std::vector<double> want = matvec(dequant(td.type, down, n_ff, n_embd), h, n_ff, n_embd);
+                for (double& v : want) v *= s3[2];
 
                 std::vector<float> cpu((size_t) n_embd), dev((size_t) n_embd);
-                const poly::CpuExpert ce{gate, up, down, 1.f};
+                const poly::CpuExpert ce{gate, up, down, s3[2], 0, s3[0], s3[1]};
                 poly::cpu_experts(workers, &ce, 1, 1, (int) tg.type, (int) tu.type, (int) td.type, n_embd, n_ff, x.data(),
                                   limit, false, cpu.data());
                 const double e_cpu = rel_error(cpu.data(), want);
@@ -155,12 +175,15 @@ int main(int argc, char** argv) {
                     ck(cudaMemcpy(d_w + gu_bytes, up, gu_bytes, cudaMemcpyHostToDevice));
                     ck(cudaMemcpy(d_w + 2 * gu_bytes, down, d_bytes, cudaMemcpyHostToDevice));
                     kernels::native_mmvq((int) tg.type, d_w, d_xq, d_gu, n_embd, 2 * n_ff, 1, st);
-                    poly::swiglu_clamp(d_gu, d_gu + n_ff, d_h, n_ff, limit, st);
+                    if (scaled) poly::swiglu_clamp_rows(d_gu, d_h, n_ff, 1, limit, st, &es);
+                    else poly::swiglu_clamp(d_gu, d_gu + n_ff, d_h, n_ff, limit, st);
                     kernels::native_quantize_q8_1(d_h, d_hq, n_ff, 1, st);
                     kernels::native_mmvq((int) td.type, d_w + 2 * gu_bytes, d_hq, d_out, n_ff, n_embd, 1, st);
                     ck(cudaMemcpyAsync(dev.data(), d_out, (size_t) n_embd * 4, cudaMemcpyDeviceToHost, st));
                     ck(cudaStreamSynchronize(st));
-                    e_gpu = rel_error(dev.data(), want);
+                    std::vector<float> dev_s(dev);   // down's scale goes on the weight, in FP32
+                    for (float& v : dev_s) v *= s3[2];
+                    e_gpu = rel_error(dev_s.data(), want);
                 }
                 // The expert twice in one launch a stage, as the engine takes a token's cached experts: each copy
                 // must come out with the bits the launches above gave.
@@ -178,7 +201,7 @@ int main(int argc, char** argv) {
                     }
                     together = ", two in a launch: no kernel";
                     if (kernels::native_mmvq_slots((int) tg.type, gu, 2, n_embd, 2 * n_ff, st)) {
-                        poly::swiglu_clamp_rows(d_gu, d_h, n_ff, 2, limit, st);
+                        poly::swiglu_clamp_rows(d_gu, d_h, n_ff, 2, limit, st, &es);
                         kernels::native_quantize_q8_1(d_h, d_hq, n_ff, 2, st);
                         if (kernels::native_mmvq_slots((int) td.type, dn, 2, n_ff, n_embd, st)) {
                             std::vector<float> two((size_t) 2 * n_embd);
@@ -198,6 +221,7 @@ int main(int argc, char** argv) {
                             pass ? "" : "  FAIL");
             }
             ck(cudaFree(d_w));
+            if (d_s) ck(cudaFree(d_s));
         }
 
         // Every kind of matrix: a type and a shape, a routed expert's being a matrix each.  The weights sit before

@@ -54,6 +54,7 @@ struct CpuExpert {
     const uint8_t* down;
     float weight;
     int row = 0;
+    float gate_scale = 1.f, up_scale = 1.f;   ///< NVFP4's global scales (ExpertScales), on the products
 };
 
 /// Checks that ggml-cpu has a dot product for both types.  Call once per layer format at load.

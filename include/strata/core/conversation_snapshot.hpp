@@ -11,6 +11,9 @@ namespace strata::core {
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
+// The copies below run on the engine's private non-blocking stream (conversation_copy.hpp), which the driver does not
+// order against the legacy stream: a cudaMemcpy from pageable host memory can return with its DMA to the device still
+// in flight, so a write the caller believes finished may land after the save's read or the restore's write.
 size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index);
 // A nonzero unchanged_tokens is valid only for storage retained from an image
 // actually restored into this session, bounded by every subsequent rewrite.

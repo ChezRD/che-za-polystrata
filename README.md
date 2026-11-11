@@ -53,7 +53,7 @@ The server can change between installed models while it runs ([how](docs/BACKEND
 
 Che'za-PolyStrata is a fork of [PolyStrata](https://github.com/simplexai-labs/PolyStrata), created by [VecSzn](https://github.com/VecSzn).
 PolyStrata is built on [Strata](https://github.com/Niko1221/Strata) by Niko1221.
-Why PolyStrata is a separate repo from Strata, AMD and smaller cards, fine-tunes and other questions: [FAQ](docs/FAQ.md).
+Why PolyStrata is a separate repo from [Strata](https://github.com/Niko1221/Strata), AMD and smaller cards, fine-tunes and other questions: [FAQ](docs/FAQ.md).
 
 ## How fast is it?
 

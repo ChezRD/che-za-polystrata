@@ -1,0 +1,76 @@
+# macOS (Apple Silicon): build the Metal engine and run its CPU-side checks.
+#
+# Status: proposed, manual-only (workflow_dispatch). It has not had a green run yet; enable the push and pull_request
+# triggers below after the first green run on a hosted macOS runner.
+#
+# What this job can prove: the hand-merged Metal sources (metal/, the shared src/ and include/ they compile) build on
+# macOS, the shared host code links, and the tests that need no GPU pass. That is the part of a PolyStrata sync that used to
+# go unchecked off a Mac.
+#
+# What it cannot prove: the kernels. GitHub-hosted macOS runners expose a paravirtual GPU ("Apple Paravirtual device",
+# no Metal 2.0 support), so the 62 GPU tests in `ctest -L gpu` have no usable device. They run in a step that does not
+# fail the job, for the log only. Kernel parity, the engine, and speed need a real Mac: docs/PLATFORM_GATES.md.
+name: macos-metal
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: macos-metal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-26          # Apple Silicon, macOS 26, Xcode 26: macOS 15+ is required (MTLResidencySet)
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sw_vers
+          xcodebuild -version
+          cmake --version | head -1
+          ninja --version
+          python3 --version
+          # Xcode 26 ships the Metal compiler as an optional component; the image pre-installs it for release Xcodes
+          xcrun -sdk macosx metal --version || echo "no Metal toolchain (not needed to build: kernels compile at run time)"
+
+      - name: metal-cpp headers (pinned by SHA-256, the same zip setup_mac.py uses)
+        run: |
+          curl -fsSLo metal-cpp_26.zip https://developer.apple.com/metal/cpp/files/metal-cpp_26.zip
+          echo "4df3c078b9aadcb516212e9cb03004cbc5ce9a3e9c068fa3144d021db585a3a4  metal-cpp_26.zip" | shasum -a 256 -c -
+          unzip -q metal-cpp_26.zip -d third_party
+          test -f third_party/metal-cpp/Metal/Metal.hpp
+
+      - name: Trellis codebook matches ggml-common-tq.h
+        run: python3 metal/tools/gen_tq_lut.py --check
+
+      - name: Configure (engine, strata-poly, tests)
+        run: |
+          cmake -S metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DMETAL_CPP_DIR="$PWD/third_party/metal-cpp" \
+            -DSTRATA_METAL_POLY=ON
+          ctest --test-dir build-metal -N | tail -3
+
+      - name: Build
+        run: cmake --build build-metal -j 4
+
+      - name: Metal device probe (for the log)
+        run: |
+          cat > probe.swift <<'SWIFT'
+          import Metal
+          if let d = MTLCreateSystemDefaultDevice() {
+              print("device: \(d.name), Metal 4: \(d.supportsFamily(.metal4))")
+          } else {
+              print("device: none")
+          }
+          SWIFT
+          xcrun swift probe.swift || true
+
+      - name: Tests that need no GPU (12 of 74)
+        run: ctest --test-dir build-metal --output-on-failure -LE gpu
+
+      - name: GPU tests, for the log only (no usable Metal device on hosted runners)
+        continue-on-error: true
+        run: ctest --test-dir build-metal --output-on-failure -L gpu --timeout 300

@@ -90,6 +90,15 @@ struct Outputs {
     ~Outputs() { cudaFree(mixed); cudaFree(bf); cudaFree(h); }
 };
 
+// The device bytes check() holds at once: the cuBLAS output, the inputs (R dominates) and both results.  At T = 32768
+// this test is the suite's largest single allocator, and ctest runs several GPU tests at a time on one card.
+uint64_t peak_device_bytes(int64_t T) {
+    return (uint64_t) T * D * 4                                             // gated, allocated once by main
+         + (uint64_t) T * LR * 2 + (uint64_t) D * LR * 2 + (uint64_t) T * D * 4
+         + (uint64_t) T * HC * 4 + (uint64_t) D * 4                        // Inputs
+         + 2 * ((uint64_t) T * N * 4 + 2 * (uint64_t) T * N * 2);          // ref + got
+}
+
 // mixed[t][d] in FP64 from the same BF16 inputs (the exact result both GPU paths round)
 double exact_mixed(const Inputs& in, int64_t t, int d) {
     double s = 0.0;
@@ -208,6 +217,7 @@ void bench(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T) 
 }  // namespace
 
 int main(int argc, char** argv) {
+    const int64_t Tmax = 32768;
     {   // the fused read is sm_80+ (cp.async, BF16 mma): an older card has nothing to compare
         int dev = 0, major = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
@@ -222,7 +232,20 @@ int main(int argc, char** argv) {
     strata::prefill::Gemm gm;
     std::string err;
     if (!gm.init(st, 0, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
-    const int64_t Tmax = 32768;
+    {   // The checks hold peak_device_bytes(Tmax) at once, and ctest starts several GPU tests together on the one card.
+        // A card that cannot hold the peak all at once is a stated skip with the numbers, not the cudaMalloc failure
+        // of the last check; a genuine allocation bug on a card that had the room still fails.
+        size_t free_bytes = 0, total_bytes = 0;
+        if (!ck(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo")) return 1;
+        const uint64_t need = peak_device_bytes(Tmax) + (512ull << 20);
+        if ((uint64_t) free_bytes < need) {
+            std::printf("gr_upmix_parity: needs %.2f GiB free at T=%lld, %.2f of %.2f GiB free: skipped "
+                        "(another GPU job holds the rest; run the suite with -j1)\n",
+                        (double) need / 1073741824.0, (long long) Tmax, (double) free_bytes / 1073741824.0,
+                        (double) total_bytes / 1073741824.0);
+            return 77;
+        }
+    }
     float* gated = dalloc<float>((size_t) Tmax * D);
     int fails = 0;
     uint32_t seed = 101;

@@ -242,7 +242,7 @@ Predicted Tiel decode, anchored on measured 77 tok/s @85% hit / 7.2 GiB and the
 **30–40 tok/s**. The good news: this can be done without unloading Tiel, via
 `POST /v1/vram {"reserve_mib": 6000}`, which unmaps the arena and refills on
 grow-back. But `--vram-elastic` and `--kv-grow` are mutually exclusive in the
-Strata engine (`docs/VRAM_ELASTIC.md`); in `strata-poly` a shrink+grow cycle
+[Strata](https://github.com/Niko1221/Strata) engine (`docs/VRAM_ELASTIC.md`); in `strata-poly` a shrink+grow cycle
 costs a full refill (~3.5 s for 5 GiB). Debounce grow-back (e.g. 30 s).
 
 ### Strategy C — time-slice inside one process

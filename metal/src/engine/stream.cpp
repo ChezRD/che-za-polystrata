@@ -1,4 +1,5 @@
 // metal/src/engine/stream.cpp - see stream.h.
+#include "geo.h"
 #include "stream.h"
 
 #include "ref_quant.h"
@@ -23,7 +24,7 @@
 namespace strata::metal_engine {
 
 namespace {
-constexpr int NL = 48;
+constexpr int NL = strata_metal::geo::NL;   // layers of the compiled shape (engine/geo.h); the per-layer maps use the model's ne_
 constexpr uint64_t PAGE = 16384;
 double now_ms() { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 int env_int(const char* n, int d) {
@@ -841,7 +842,7 @@ void ExpertStream::report(FILE* f) const {
     if (p_chunks_)
         std::fprintf(f, "expert stream prompts    %llu chunks: %llu distinct lookups (%.1f per layer), in the arena %.4f, streamed "
                         "ahead %.4f, missed %.4f; %llu streamed in; host %.1f ms per chunk, of it waiting %.1f ms\n",
-                     (unsigned long long) p_chunks_, (unsigned long long) p_lookups_, p_lookups_ / 48.0 / p_chunks_,
+                     (unsigned long long) p_chunks_, (unsigned long long) p_lookups_, p_lookups_ / (double) NL / p_chunks_,
                      p_hits_ / std::max(1.0, (double) p_lookups_), p_pre_ / std::max(1.0, (double) p_lookups_),
                      p_misses_ / std::max(1.0, (double) p_lookups_), (unsigned long long) p_streamed_, p_host_ms_ / p_chunks_,
                      p_wait_ms_ / p_chunks_);

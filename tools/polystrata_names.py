@@ -9,8 +9,8 @@ Strata. Run this after taking changes from it:
 
 It replaces the word Strata in the files a user reads or runs (documents, setup, the server, the web app, the
 tools and their tests) and nothing else; a second run changes nothing. It leaves alone the engines' sources and
-build files, the benchmark records, the paper, docs/FAQ.md (it is about both projects), and the places where
-Strata means the project this one is built on (KEEP). To name that project in new text, link it,
+build files, the benchmark records, the paper, docs/FAQ.md and docs/SYNC-*.md (they are about both projects),
+and the places where Strata means the project this one is built on (KEEP). To name that project in new text, link it,
 [Strata](https://github.com/Niko1221/Strata), or write "the Strata project".
 """
 import re
@@ -20,7 +20,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SKIP = ("src/", "include/", "tests/", "cmake/", "third_party/", "bench/", "sycl/src/", "sycl/tools/", "tools/vision/",
-        "docs/paper/", "docs/COMMUNITY_BENCHMARKS.md", "docs/FAQ.md", "tools/polystrata_names.py")
+        "docs/paper/", "docs/COMMUNITY_BENCHMARKS.md", "docs/FAQ.md", "docs/SYNC-",
+        "tools/polystrata_names.py")
 KINDS = (".md", ".py", ".html", ".js", ".css", ".bat", ".sh", ".yml", ".yaml")
 NAMES = ("Dockerfile",)
 KEEP = "|".join((

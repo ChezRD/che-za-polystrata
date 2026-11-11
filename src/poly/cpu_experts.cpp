@@ -214,6 +214,8 @@ void cpu_experts(Workers& workers, const CpuExpert* experts, int n, int rows, in
                 float g = 0.f, u = 0.f;
                 tg->vec_dot(n_embd, &g, 0, gate, 0, a, 0, 1);
                 tu->vec_dot(n_embd, &u, 0, up, 0, au, 0, 1);
+                g *= e.gate_scale;
+                u *= e.up_scale;
                 if (gelu) {
                     hp[(size_t) j * n_ff + r] =
                         0.5f * g * (1.f + std::tanh(0.7978845608f * g * (1.f + 0.044715f * g * g))) * u;
