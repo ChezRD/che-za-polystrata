@@ -252,6 +252,34 @@ __device__ __forceinline__ float vec_dot_iq3_s_q8_1(const void* __restrict__ vbq
     return d * sumi;
 }
 
+// IQ1_S: 256 values as 8 sub-blocks of 32, each with one 16-bit scale+sign word.  The only local quant that uses
+// type 19 is Flint-abliterated-Mix-12G (11.2 GiB): layers 2-5 keep both gate and up in it, 6-7 only up; the 24G
+// mix, UD-IQ3_XXS and UD-Q3_K_XL contain no type 19.  llama.cpp's vec_dot_iq1_s_q8_1 (vecdotq.cuh): the same
+// iq1s_grid_gpu codes, and the delta term from the q8_1 block's stored sum (ds.y), which is the integer bsums of
+// ggml-cpu's q8_K path.
+__device__ __forceinline__ float vec_dot_iq1_s_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                    const int& kbx, const int& iqs) {
+    const block_iq1_s* bq1 = (const block_iq1_s*) vbq + kbx;
+    const int qs_packed = get_int_b2(bq1->qs, iqs);
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq1->qh[iqs];
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int grid = iq1s_grid_gpu[qs[l0 / 2] | (((qh >> 3 * (l0 / 2)) & 0x07) << 8)];
+        const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+        const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+        const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+        const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+    }
+    const float d1q = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+    const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
+    const float2 ds = __half22float2(bq8_1[iqs].ds);
+    return d1q * (ds.x * sumi + ds.y * delta);
+}
+
 __device__ __forceinline__ float vec_dot_iq1_m_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
                                                     const int& kbx, const int& iqs) {
     const block_iq1_m* bq1 = (const block_iq1_m*) vbq + kbx;
@@ -802,6 +830,8 @@ template<> struct Fmt<17> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_xs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<18> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_xxs_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<19> { static constexpr int qk = 256, ipb = 8, step = 1;   // IQ1_S: Flint Mix-12G only
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq1_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<20> { static constexpr int qk = 32, ipb = 2, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<21> { static constexpr int qk = 256, ipb = 8, step = 2;
@@ -858,7 +888,9 @@ STRATA_TQP_FMT(149)
 #else
 #define STRATA_D_FMTS(X) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8) X(13) X(40) X(144) X(146) X(147) X(148) X(149)
 #endif
-#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
+// 19 is IQ1_S, for Flint-abliterated-Mix-12G only.  It is not in GU_FMTS or D_FMTS: that file's down tensors are
+// IQ2, and its gate/up calls go through the generic MMVQ path below.
+#define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(19) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40) X(144) X(145) X(146) X(147) X(148) X(149)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
 
@@ -3036,6 +3068,23 @@ __device__ void dq_iq1_m(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     grid32[0] &= 0x0f0f0f0f;
     for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
 }
+// IQ1_S: llama.cpp's dequantize_row_iq1_s; the same nibble grid as IQ1_M, its own 16-bit scale+sign word per
+// 32-value sub-block (d = d * (2 * 3-bit scale + 1), delta by bit 15)
+template<typename dst_t>
+__device__ void dq_iq1_s(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_iq1_s* x = (const block_iq1_s*) vx;
+    const int64_t il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 8 * il;
+    const int qh = x[ibs].qh[ib];
+    const float d = (float) x[ibs].d * (2 * ((qh >> 12) & 7) + 1);
+    const float delta = qh & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    uint32_t grid32[2];
+    const int8_t* q = (const int8_t*) grid32;
+    grid32[0] = iq1s_grid_gpu[x[ibs].qs[4 * ib + il] | (((qh >> 3 * il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+    for (int j = 0; j < 8; ++j) y[j] = cvt<dst_t>(d * (q[j] + delta));
+}
 template<typename dst_t>
 __device__ void dq_iq4_nl(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     const block_iq4_nl* x = (const block_iq4_nl*) vx + ibs * (QK_K / QK4_NL);
@@ -3319,6 +3368,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
         case 18: dq_iq3_xxs(vx, ibs, y, tid); break;
+        case 19: dq_iq1_s(vx, ibs, y, tid); break;
         case 20: dq_iq4_nl(vx, ibs, y, tid); break;
         case 21: dq_iq3_s(vx, ibs, y, tid); break;
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
@@ -3381,7 +3431,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+    return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40 || t == 144 || t == 145 || t == 146 || t == 147 || t == 148 || t == 149;
 #else
@@ -5333,6 +5383,7 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 16: return (size_t) (n / 256) * sizeof(block_iq2_xxs);
         case 17: return (size_t) (n / 256) * sizeof(block_iq2_xs);
         case 18: return (size_t) (n / 256) * sizeof(block_iq3_xxs);
+        case 19: return (size_t) (n / 256) * sizeof(block_iq1_s);   // IQ1_S: Flint Mix-12G only
         case 20: return (size_t) (n / 32) * sizeof(block_iq4_nl);
         case 21: return (size_t) (n / 256) * sizeof(block_iq3_s);
         case 22: return (size_t) (n / 256) * sizeof(block_iq2_s);

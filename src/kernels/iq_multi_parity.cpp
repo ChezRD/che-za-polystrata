@@ -56,6 +56,7 @@ const char* name_of(int t) {
         case 16: return "IQ2_XXS";
         case 17: return "IQ2_XS";
         case 18: return "IQ3_XXS";
+        case 19: return "IQ1_S";
         case 20: return "IQ4_NL";
         case 21: return "IQ3_S";
         case 22: return "IQ2_S";
@@ -431,7 +432,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 12, 13, 7, 8}) {
+    for (int t : {16, 17, 18, 19, 20, 21, 22, 23, 29, 42, 12, 13, 7, 8}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
