@@ -17,11 +17,11 @@ engine runs it through a native pack; `strata-poly` does not.
   `gu_rows` now follows `launch_gu`'s 80-dot condition through `gu_ipb`, otherwise the up half
   is never written.
 - PLE (`per_layer_token_embd.weight`) stays in the GGUF and is read with `--ple-io direct`,
-  the default. The table is 28.8 GB; `--ple-io ram` does not fit this machine.
+  the default. The table is 28.8 GB; `--ple-io ram` does not fit a 62 GB machine.
 
-## 256K, this box
+## 256K on the RTX 4060 Ti
 
-RTX 4060 Ti 16 GB, Ryzen 5 8600G, 62 GB RAM, NVMe. Config: `strata-reap320.json`.
+RTX 4060 Ti 16 GB, 62 GB RAM, NVMe. Config: `strata-reap320.json`.
 One run, unique 262,144-token prompt built from this repository's docs, 8,192-token answer:
 
 | metric | value |
@@ -96,8 +96,8 @@ probe. Treat it as a coding and agent model, not as a general-knowledge replacem
 
 ## Artifacts
 
-- Pack: `/home/chez/.cache/huggingface/polystrata-data/packs/reap320`
-- Embedding: `packs/reap320/embd-iq4xs.gguf`
-- Profile: `packs/reap320/expert-profile.bin` (trace-built, 320 wide)
-- MTP: `/home/chez/.cache/huggingface/polystrata-data/mtp/rt`
+- Pack: `${HF_HOME:-$HOME/.cache/huggingface}/hub/models--zerodigest--Qwen3.8-Flash-Next-REAP-320-YMQ-GGUF/packs/reap320`
+- Embedding: `embd-iq4xs.gguf` in the pack above
+- Profile: `expert-profile.bin` in the pack above (trace-built, 320 wide)
+- MTP: `${HF_HOME:-$HOME/.cache/huggingface}/polystrata-data/mtp/rt`
 - Config: `strata-reap320.json` (local, untracked; the flags above are the record)

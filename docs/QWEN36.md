@@ -7,6 +7,19 @@ setup (`--family qwen36-strata`); `--family qwen36` runs the same model on strat
 ([BACKENDS.md](BACKENDS.md#qwen36-on-two-engines)). Besides text it
 reads **pictures** and serves **several requests at once**, the same two options the Flash-Next models have.
 
+### On an RTX 4060 Ti: use `--family qwen36` (strata-poly)
+
+Measured on an RTX 4060 Ti 16 GB (sm_89, CUDA 13.4) with the Unsloth UD-Q3_K_M file:
+
+- `qwen36-strata` refuses it at load: `blk.40.experts are Q3_K/Q4_K, which the native expert kernels do not take`.
+  `blk.40` is the in-file MTP block; the 40 main layers pass, and the block is loaded even with `--mtp 0`.
+- `qwen36` (strata-poly) runs the same file: prefill 316 against 137 tok/s at 4K, 343 against 134 at 16K;
+  decode 78.2 against 60.5 tok/s; on a 4,137-token prompt 1,705 against 1,532 tok/s. The two paths give
+  identical tokens (32/32 at 4K, 32/32 at 16K, 128/128 on a longer run).
+- `strata-poly` also has the quantized KV formats, KV streaming, prompt/conversation checkpoints and the
+  Q2_K/Q3_K expert types this file needs. Porting the q36 prefill into it is not justified by these
+  numbers; the q36 path stays as the upstream reference.
+
 Measured by the Strata project on an AMD Radeon AI PRO R9700 32 GB (HIP, Linux, UD-Q4_K_XL, every expert in VRAM) and on an RTX 3060 12 GB (CUDA, 20 threads,
 UD-Q4_K_XL in the hybrid mode: 22-37 of 256 experts per layer in VRAM, the rest on the CPU), llama.cpp 972b5fc on the same files.
 
