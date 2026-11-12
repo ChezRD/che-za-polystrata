@@ -187,6 +187,21 @@ int main(int argc, char** argv) {
         }
     }
     uint16_t* dhf = upload(hf);
+    // a SEPARATE value cache for each arm.  An earlier version passed the KEY cache as the value cache
+    // (`fdec_q8(q, kq, kq, ...)`), so the q8_0 arm read half the bytes and half of them twice - the same pages,
+    // already in L2 - and reported 451 GB/s on a 288 GB/s card.  Each arm now has its own buffer.
+    std::vector<int8_t> vc((size_t) rows_max * width);
+    std::vector<uint16_t> vsc((size_t) rows_max * nb);
+    for (size_t i = 0; i < vc.size(); ++i) vc[i] = (int8_t) ((int) (rng() % 255u) - 127);
+    for (auto& x : vsc) x = (uint16_t) (0x2000 + (rng() % 0x100u));
+    std::vector<uint16_t> hfv((size_t) rows_max * width);
+    for (auto& x : hfv) x = __half_as_ushort(__float2half(2.f * nd(rng)));
+    int8_t* dvc = upload(vc);
+    uint16_t* dvsc = upload(vsc);
+    uint16_t* dhfv = upload(hfv);
+    vc.clear(); vc.shrink_to_fit();
+    vsc.clear(); vsc.shrink_to_fit();
+    hfv.clear(); hfv.shrink_to_fit();
     hf.clear();
     hf.shrink_to_fit();
     int8_t* dkc = upload(kc);
@@ -243,11 +258,12 @@ int main(int argc, char** argv) {
                 fdec_k8v4(q, kq, v4, pos, 1, nullptr, r, out, dim, n_head, kv_heads, scale, score, score_n, nullptr);
             });
             const double mq = time_ms([&] {
-                fdec_q8(q, kq, kq, pos, 1, nullptr, r, out2, dim, n_head, kv_heads, scale, score, score_n, nullptr);
+                fdec_q8(q, kq, Kvq8{dvc, dvsc}, pos, 1, nullptr, r, out2, dim, n_head, kv_heads, scale, score, score_n,
+                        nullptr);
             });
             // fp16: the same values as halves, read where they lie
             const double mh = time_ms([&] {
-                fdec_f16(q, dhf, dhf, pos, 1, nullptr, r, out2, dim, n_head, kv_heads, scale, score, score_n, nullptr);
+                fdec_f16(q, dhf, dhfv, pos, 1, nullptr, r, out2, dim, n_head, kv_heads, scale, score, score_n, nullptr);
             });
             (void) mh;
             k8[ci] = m4;
