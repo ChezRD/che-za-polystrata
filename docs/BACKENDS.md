@@ -15,6 +15,7 @@ a second machine, a Windows laptop whose card has 8 GB.
 | Qwen3.8-Flash-Next and fine-tunes | `qwen4exp` | `strata` | the packs setup builds | separate MTP model |
 | GLM 5.3 Flash | `glm5-next` | `strata-poly` | GSQ-RCO 3.0bit, REAP50-Q3_K_M, UD-IQ2_XXS | draft block |
 | Qwen3.6-35B-A3B | `qwen35moe` | `strata-poly` | Unsloth UD-Q3_K_M, UD-Q2_K_XL and UD-Q4_K_M, 12.6 to 22.7 GB | draft block in the file |
+| Qwen3.8-27B | `qwen35` | `strata-poly` | Unsloth UD-IQ3_XXS, 10.9 GB (dense: [QWEN38.md](QWEN38.md)) | draft block in the file |
 | Ornith 1.5 35B-A3B | `qwen35moe` | `strata-poly` | APEX-MTP-I-Compact, I-Mini and I-Quality, 14.4 to 23.7 GB | draft block in the file |
 | Ornith 1.5 122B | `qwen35moe` | `strata-poly` | Unsloth UD-Q3_K_XL, UD-Q2_K_XL, UD-IQ3_XXS, UD-Q4_K_XL and Q8_0, 44.5 to 132.6 GB | draft block in the file |
 | Gemma 4 26B-A4B | `gemma4` | `strata-poly` | Unsloth UD-Q3_K_M, UD-Q2_K_XL and UD-Q4_K_M, 10.5 to 16.9 GB | its draft model, a file of 0.46 GB |
@@ -228,6 +229,7 @@ key, so a model the engine cannot run is listed as unavailable with the reason i
 | --- | --- |
 | `glm5-next`, `glm5next` | `Glm5Next` |
 | `qwen35moe` | `Qwen35` |
+| `qwen35` | `Qwen35` (dense FFN; see [QWEN38.md](QWEN38.md)) |
 | `gemma4` | `Gemma4` |
 | `deepseek4` | `DeepSeek4` |
 | `lfm2moe` | `Lfm2Moe` |
