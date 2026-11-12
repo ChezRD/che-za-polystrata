@@ -900,7 +900,82 @@ int run_smoke(int heads, int dim, int iters) {
     return fails == 0 ? 0 : 1;
 }
 
-// ---- the accuracy pass: every format steps from the same fp32 start, and its decoded state is compared with the
+// ---- Compensator Tokens, implemented rather than carried: the paper's rank-r factor of the state's outliers.
+//
+// The fit: for each head, take the residual R = S - Q(S) (the part quantization lost) and extract its top-r rank-one
+// components by power iteration on R directly (48 independent 128x128 blocks, one layer, no training — a few
+// iterations converge far more than enough for a 4-bit residual).  Each component is stored as two fp16 vectors,
+// a[r] (a 128-vector, one a row) and b[r] (one a column), so a head's compensation is 2*r*dim*2 B.
+//
+// The update then runs in the paper's order: subtract the compensation, quantize the residual, add it back.  The
+// compensation is never quantized, which is exactly why it recovers what the 4-bit codes cannot hold.
+constexpr int kCompIters = 24;   // power iterations a component; 128x128 converges well past the accuracy that matters
+
+struct CompFit {
+    int r;                                  // components actually fitted
+    std::vector<__half> a, b;               // [head][r][dim] each
+};
+
+// the accuracy pass: every format steps from the same fp32 start, and its decoded state is compared with the
+// fp32 reference at 1 and 128 steps.  Each arm runs on the device, one launch a token, exactly as the timed arms do.
+
+// one head's 128x128 block: top-r rank-one components of the residual, by deflation
+void fit_head(const float* s, const int8_t* codes, const float* scale, int dim, int r, __half* a, __half* b) {
+    std::vector<double> res((size_t) dim * dim);
+    for (int i = 0; i < dim; ++i)
+        for (int j = 0; j < dim; ++j) {
+            const double deq = (double) codes[(size_t) i * dim + j] * (double) scale[i];
+            res[(size_t) i * dim + j] = (double) s[(size_t) i * dim + j] - deq;   // the residual quantization lost
+        }
+    std::vector<double> va(dim, 0.0), vb(dim, 0.0), tmp(dim, 0.0);
+    for (int c = 0; c < r; ++c) {
+        // deterministic start: the residual's row with the largest mass, so the fit is reproducible
+        int best = 0;
+        double bestn = -1.0;
+        for (int i = 0; i < dim; ++i) {
+            double m = 0.0;
+            for (int j = 0; j < dim; ++j) m += res[(size_t) i * dim + j] * res[(size_t) i * dim + j];
+            if (m > bestn) { bestn = m; best = i; }
+        }
+        for (int j = 0; j < dim; ++j) vb[j] = res[(size_t) best * dim + j];
+        double nv = 0.0;
+        for (int j = 0; j < dim; ++j) nv += vb[j] * vb[j];
+        nv = std::sqrt(nv);
+        if (nv <= 0.0) break;
+        for (int j = 0; j < dim; ++j) vb[j] /= nv;
+        double sigma = 0.0;
+        for (int it = 0; it < kCompIters; ++it) {
+            // va = R vb, vb = R^T va, renormalize both
+            for (int i = 0; i < dim; ++i) {
+                double acc = 0.0;
+                for (int j = 0; j < dim; ++j) acc += res[(size_t) i * dim + j] * vb[j];
+                tmp[i] = acc;
+            }
+            sigma = 0.0;
+            for (int i = 0; i < dim; ++i) sigma += tmp[i] * tmp[i];
+            sigma = std::sqrt(sigma);
+            if (sigma <= 0.0) break;
+            for (int i = 0; i < dim; ++i) va[i] = tmp[i] / sigma;
+            for (int j = 0; j < dim; ++j) {
+                double acc = 0.0;
+                for (int i = 0; i < dim; ++i) acc += res[(size_t) i * dim + j] * va[i];
+                tmp[j] = acc;
+            }
+            double nb = 0.0;
+            for (int j = 0; j < dim; ++j) nb += tmp[j] * tmp[j];
+            nb = std::sqrt(nb);
+            if (nb <= 0.0) break;
+            for (int j = 0; j < dim; ++j) vb[j] = tmp[j] / nb;
+        }
+        // sigma is the singular value: the component is sigma * va * vb^T, stored as (sigma*va) and vb
+        for (int i = 0; i < dim; ++i) a[(size_t) c * dim + i] = __float2half((float) (sigma * va[i]));
+        for (int j = 0; j < dim; ++j) b[(size_t) c * dim + j] = __float2half((float) vb[j]);
+        // deflate so the next component is the next-largest
+        for (int i = 0; i < dim; ++i)
+            for (int j = 0; j < dim; ++j) res[(size_t) i * dim + j] -= sigma * va[i] * vb[j];
+    }
+}
+
 // fp32 reference at 1 and 128 steps.  Each arm runs on the device, one launch a token, exactly as the timed arms do.
 struct ErrArm {
     const char* name;
@@ -908,6 +983,141 @@ struct ErrArm {
     double bytes_a_layer;
     double err1, err128;
 };
+
+// ---- The compensated update kernels.  Unlike A2/A11 above, these carry a REAL fit: `fit_head` extracted the top-r
+// rank-one components of what quantization lost, and these kernels run the paper's order —
+//
+//     cur = code * scale + sum_r a[r][row] * b[r][col]        (read: quantized part + compensation)
+//     upd = cur * decay + k * u
+//     code' = quantize((upd - compensation) / scale)          (write: the compensation is NOT quantized)
+//
+// The compensation is subtracted before the encode and never re-encoded, which is precisely why it can hold what the
+// 4-bit codes cannot.  A thread owns kGroup columns (4-bit) so a byte is written by one thread only.
+template <int BITS, int R>
+__global__ void state_packed_comp_kernel(uint8_t* __restrict__ q, float* __restrict__ scale,
+                                         const __half* __restrict__ ca, const __half* __restrict__ cb,
+                                         const float* __restrict__ k, const float* __restrict__ u,
+                                         const float* __restrict__ decay, int heads, int dim) {
+    constexpr int kBytes = BITS == 6 ? 3 : 2;
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    const int head = blockIdx.y;
+    if (g >= dim / kGroup) return;
+    const int col = g * kGroup;
+    const size_t row_bytes = (size_t) dim * BITS / 8;
+    uint8_t* row = q + ((size_t) head * dim) * row_bytes + (size_t) g * kBytes;
+    float* srow = scale + (size_t) head * dim;
+    const __half* arow = ca + ((size_t) head * R) * dim;
+    const __half* brow = cb + ((size_t) head * R) * dim;
+    const float d = decay[head];
+    for (int r = 0; r < dim; ++r) {
+        const float sc = srow[r];
+        uint8_t* cell = row + (size_t) r * row_bytes;
+        int code[kGroup];
+        if (BITS == 6) unpack6(cell, code); else unpack4(cell, code);
+        int out[kGroup];
+        for (int i = 0; i < kGroup; ++i) {
+            // the compensation for this (row, col): sum_r a[r][r] * b[r][col]
+            float comp = 0.f;
+            for (int c = 0; c < R; ++c)
+                comp += __half2float(arow[(size_t) c * dim + r]) * __half2float(brow[(size_t) c * dim + col + i]);
+            const float kk = k[head * dim + col + i], uu = u[head * dim + col + i];
+            const float cur = (float) code[i] * sc + comp;
+            const float upd = cur * d + kk * uu;
+            const float back = upd - comp;                    // quantize only the part the codes carry
+            float qv = nearbyintf(back / sc);
+            qv = fminf(fmaxf(qv, -(float) qmax_bits(BITS)), (float) qmax_bits(BITS));
+            out[i] = (int) qv;
+        }
+        if (BITS == 6) pack6(cell, out); else pack4(cell, out);
+    }
+}
+
+// the same, for fp4 E2M1 with UE4M3 sub-block scales
+template <int R>
+__global__ void state_fp4_comp_kernel(uint8_t* __restrict__ q, uint8_t* __restrict__ qs, const __half* __restrict__ ca,
+                                      const __half* __restrict__ cb, const float* __restrict__ k,
+                                      const float* __restrict__ u, const float* __restrict__ decay, int heads, int dim) {
+    const int g = blockIdx.x * blockDim.x + threadIdx.x;
+    const int head = blockIdx.y;
+    if (g >= dim / kGroup16) return;
+    const int col = g * kGroup16;
+    const int nb = dim / kGroup16;
+    uint8_t* row = q + (size_t) head * dim * (dim / 2);
+    uint8_t* srow = qs + ((size_t) head * dim) * nb;
+    const __half* arow = ca + ((size_t) head * R) * dim;
+    const __half* brow = cb + ((size_t) head * R) * dim;
+    const float d = decay[head];
+    for (int r = 0; r < dim; ++r) {
+        uint8_t* cell = row + (size_t) r * (dim / 2) + (col / 2);
+        const float sc = e4m3_to_f32(srow[(size_t) r * nb + g]);
+        const float rcp = 1.f / sc;
+        const uint2 raw = *reinterpret_cast<const uint2*>(cell);
+        uint8_t out[8];
+        for (int i = 0; i < kGroup16; i += 2) {
+            const uint8_t byte = (i < 8) ? (uint8_t) (raw.x >> (8 * (i / 2))) : (uint8_t) (raw.y >> (8 * ((i - 8) / 2)));
+            float v[2];
+            for (int j = 0; j < 2; ++j) {
+                const uint8_t cd = j ? (byte >> 4) : (byte & 0xF);
+                float comp = 0.f;
+                for (int c = 0; c < R; ++c)
+                    comp += __half2float(arow[(size_t) c * dim + r]) * __half2float(brow[(size_t) c * dim + col + i + j]);
+                const float cur = e2m1_to_f32(cd) * sc + comp;
+                v[j] = cur * d + k[head * dim + col + i + j] * u[head * dim + col + i + j] - comp;
+            }
+            const uint8_t c0 = f32_to_e2m1(v[0] * rcp), c1 = f32_to_e2m1(v[1] * rcp);
+            out[i / 2] = (uint8_t) ((c0 & 0xF) | ((c1 & 0xF) << 4));
+        }
+        *reinterpret_cast<uint2*>(cell) = make_uint2(
+            (uint32_t) out[0] | ((uint32_t) out[1] << 8) | ((uint32_t) out[2] << 16) | ((uint32_t) out[3] << 24),
+            (uint32_t) out[4] | ((uint32_t) out[5] << 8) | ((uint32_t) out[6] << 16) | ((uint32_t) out[7] << 24));
+    }
+}
+
+// the int8 arm with a real fit: one thread a column, the same subtract/quantize/add-back order
+template <int R>
+__global__ void state_int8_compfit_kernel(int8_t* __restrict__ q, float* __restrict__ scale,
+                                          const __half* __restrict__ ca, const __half* __restrict__ cb,
+                                          const float* __restrict__ k, const float* __restrict__ u,
+                                          const float* __restrict__ decay, int heads, int dim) {
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int head = blockIdx.y;
+    if (col >= dim) return;
+    int8_t* row = q + ((size_t) head * dim) * dim;
+    float* srow = scale + (size_t) head * dim;
+    const __half* arow = ca + ((size_t) head * R) * dim;
+    const __half* brow = cb + ((size_t) head * R) * dim;
+    const float d = decay[head];
+    for (int r = 0; r < dim; ++r) {
+        const float sc = srow[r];
+        float comp = 0.f;
+        for (int c = 0; c < R; ++c)
+            comp += __half2float(arow[(size_t) c * dim + r]) * __half2float(brow[(size_t) c * dim + col]);
+        const float kk = k[head * dim + col], uu = u[head * dim + col];
+        const float cur = (float) row[(size_t) r * dim + col] * sc + comp;
+        const float upd = cur * d + kk * uu;
+        const float back = upd - comp;
+        float qv = nearbyintf(back / sc);
+        qv = fminf(fmaxf(qv, -127.f), 127.f);
+        row[(size_t) r * dim + col] = (int8_t) qv;
+    }
+}
+
+// residual smoothing: rescale each key row by an fp16 factor before quantization and undo it on read.  The factor is
+// 1/amax a row, which flattens the per-row dynamic range that costs a 4-bit quantizer most.  Recomputed each window.
+__global__ void smooth_rows(const float* __restrict__ s, float* __restrict__ sc_out, int heads, int dim) {
+    const int r = blockIdx.x;
+    const int h = blockIdx.y;
+    if (r >= dim) return;
+    float amax = 0.f;
+    for (int c = 0; c < dim; ++c) amax = std::fmax(amax, std::fabs(s[((size_t) h * dim + r) * dim + c]));
+    sc_out[(size_t) h * dim + r] = amax > 0.f ? 1.f / amax : 1.f;
+}
+__global__ void apply_row_scale(float* __restrict__ s, const float* __restrict__ fac, int heads, int dim) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int h = blockIdx.y;
+    if (c >= dim) return;
+    for (int r = 0; r < dim; ++r) s[((size_t) h * dim + r) * dim + c] *= fac[(size_t) h * dim + r];
+}
 
 int run_accuracy(int heads, int dim) {
     const size_t st = (size_t) heads * dim * dim;
@@ -1249,9 +1459,235 @@ int run_accuracy(int heads, int dim) {
         cudaFree(dq); cudaFree(dsc); cudaFree(dwinf);
     }
 
+    // ---- ROW 4, done properly: a REAL compensator fit, and residual smoothing, each measured as a delta.
+    //
+    // For each base arm: fit the top-r rank-one components of what quantization lost, run the compensated update, and
+    // report err@1 and err@128 before (base) and after (comp).  Then residual smoothing on its own, and both together.
+    std::printf("\n  -- compensator fit (%d components a head) and residual smoothing, as deltas --\n", kCompensators);
+    std::printf("  %-28s %9s %9s %9s %9s %9s\n", "arm", "err@1", "err@128", "d(1)", "d(128)", "MiB/sess");
+
+    const int R = kCompensators;
+    auto fit_all = [&](const std::vector<int8_t>& q8, const std::vector<uint8_t>& qp,
+                       const std::vector<uint8_t>& qf_codes, const std::vector<uint8_t>& qf_scales,
+                       const std::vector<float>& sc, int bits, CompFit& out) {
+        out.r = R;
+        out.a.assign((size_t) heads * R * dim, __float2half(0.f));
+        out.b.assign((size_t) heads * R * dim, __float2half(0.f));
+        for (int h = 0; h < heads; ++h) {
+            std::vector<float> sblk((size_t) dim * dim);
+            for (int r = 0; r < dim; ++r)
+                for (int c = 0; c < dim; ++c)
+                    sblk[(size_t) r * dim + c] = h0[((size_t) h * dim + r) * dim + c];
+            if (bits == 8) {
+                std::vector<int8_t> cs(q8.begin() + (size_t) h * dim * dim, q8.begin() + (size_t) (h + 1) * dim * dim);
+                fit_head(sblk.data(), cs.data(), &sc[(size_t) h * dim], dim, R,
+                         &out.a[(size_t) h * R * dim], &out.b[(size_t) h * R * dim]);
+            } else if (bits == 4) {
+                // unpack this head's 4-bit block into codes for the fit, which works on the generic residual
+                std::vector<int8_t> cs((size_t) dim * dim, 0);
+                const size_t row_bytes = (size_t) dim * 4 / 8;
+                for (int r = 0; r < dim; ++r)
+                    for (int g = 0; g < dim / kGroup; ++g) {
+                        int v[kGroup];
+                        unpack4(&qp[((size_t) h * dim + r) * row_bytes + (size_t) g * 2], v);
+                        for (int i = 0; i < kGroup; ++i) cs[(size_t) r * dim + g * kGroup + i] = (int8_t) v[i];
+                    }
+                fit_head(sblk.data(), cs.data(), &sc[(size_t) h * dim], dim, R,
+                         &out.a[(size_t) h * R * dim], &out.b[(size_t) h * R * dim]);
+            } else {
+                // fp4: decode to an int8-equivalent code *per sub-block scale*, which the fit treats as its scale
+                std::vector<int8_t> cs((size_t) dim * dim, 0);
+                std::vector<float> sub((size_t) dim * dim, 1.f);
+                const int nb = dim / kGroup16;
+                for (int r = 0; r < dim; ++r)
+                    for (int g = 0; g < nb; ++g) {
+                        const float ssc = e4m3_to_f32(qf_scales[((size_t) h * dim + r) * nb + g]);
+                        const uint8_t* cell = &qf_codes[((size_t) h * dim + r) * (dim / 2) + (g * kGroup16) / 2];
+                        for (int i = 0; i < kGroup16; ++i) {
+                            const uint8_t byte = cell[i / 2];
+                            const uint8_t cd = (i & 1) ? (byte >> 4) : (byte & 0xF);
+                            const int col = g * kGroup16 + i;
+                            cs[(size_t) r * dim + col] = (int8_t) (e2m1_to_f32(cd) * 8.f);   // code at the sub-scale
+                            sub[(size_t) r * dim + col] = ssc / 8.f;
+                        }
+                    }
+                fit_head(sblk.data(), cs.data(), sub.data(), dim, R,
+                         &out.a[(size_t) h * R * dim], &out.b[(size_t) h * R * dim]);
+            }
+        }
+    };
+
+    // ---- int4 with a real fit
+    {
+        std::vector<uint8_t> q; std::vector<float> sc;
+        enc_packed(h0, q, sc, 4);
+        CompFit cf; fit_all({}, q, {}, {}, sc, 4, cf);
+        uint8_t* dq; float* dsc; __half *da, *db;
+        ck(cudaMalloc(&dq, q.size()), "r4 q");
+        ck(cudaMalloc(&dsc, sc.size() * 4), "r4 sc");
+        ck(cudaMalloc(&da, cf.a.size() * 2), "r4 a");
+        ck(cudaMalloc(&db, cf.b.size() * 2), "r4 b");
+        ck(cudaMemcpy(da, cf.a.data(), cf.a.size() * 2, cudaMemcpyHostToDevice), "r4 a up");
+        ck(cudaMemcpy(db, cf.b.data(), cf.b.size() * 2, cudaMemcpyHostToDevice), "r4 b up");
+        ck(cudaMemcpy(dsc, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice), "r4 sc up");
+        auto step = [&](int steps) {
+            ck(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice), "r4 reset");
+            for (int t = 0; t < steps; ++t)
+                state_packed_comp_kernel<4, R><<<g4, 128>>>(dq, dsc, da, db, dk + (size_t) t * heads * dim,
+                                                            du + (size_t) t * heads * dim, ddec, heads, dim);
+            ck(cudaDeviceSynchronize(), "r4 steps");
+            float* tmp; ck(cudaMalloc(&tmp, st * 4), "tmp");
+            recon_packed<4><<<g4, 128>>>(dq, dsc, heads, dim, tmp);
+            ck(cudaDeviceSynchronize(), "r4 recon");
+            ck(cudaMemcpy(dec.data(), tmp, st * 4, cudaMemcpyDeviceToHost), "r4 dec");
+            cudaFree(tmp);
+        };
+        // the fit itself, measured: how much of the residual it actually removes against the exact SVD bound
+        {
+            double before = 0.0, after = 0.0;
+            for (int h = 0; h < heads; ++h) {
+                std::vector<double> res((size_t) dim * dim);
+                const size_t row_bytes = (size_t) dim * 4 / 8;
+                for (int r = 0; r < dim; ++r)
+                    for (int g = 0; g < dim / kGroup; ++g) {
+                        int v[kGroup];
+                        unpack4(&q[((size_t) h * dim + r) * row_bytes + (size_t) g * 2], v);
+                        for (int i = 0; i < kGroup; ++i) {
+                            const int col = g * kGroup + i;
+                            res[(size_t) r * dim + col] = (double) h0[((size_t) h * dim + r) * dim + col] -
+                                                          (double) v[i] * sc[(size_t) h * dim + r];
+                        }
+                    }
+                for (double v : res) before += v * v;
+                for (int r = 0; r < dim; ++r)
+                    for (int c = 0; c < dim; ++c) {
+                        double comp = 0.0;
+                        for (int kk = 0; kk < R; ++kk)
+                            comp += __half2float(cf.a[(size_t) h * R * dim + (size_t) kk * dim + r]) *
+                                    __half2float(cf.b[(size_t) h * R * dim + (size_t) kk * dim + c]);
+                        const double left = res[(size_t) r * dim + c] - comp;
+                        after += left * left;
+                    }
+            }
+            std::printf("  fit quality: the %d fitted components remove %.1f%% of the int4 residual's energy\n",
+                        R, 100.0 * (1.0 - after / before));
+        }
+        step(1); dec1 = dec;
+        step(kSteps);
+        report("int4 + real comp fit", 0.5, (double) st / 2 + scale_b + (double) heads * R * 2 * dim * 2, dec1, dec);
+        cudaFree(dq); cudaFree(dsc); cudaFree(da); cudaFree(db);
+    }
+
+    // ---- fp4 with a real fit
+    {
+        std::vector<uint8_t> q, qs; enc_fp4(h0, q, qs);
+        const int nb = dim / kGroup16;
+        CompFit cf; fit_all({}, {}, q, qs, {}, 0, cf);
+        uint8_t *dq, *dqs; __half *da, *db;
+        ck(cudaMalloc(&dq, q.size()), "r4f q");
+        ck(cudaMalloc(&dqs, qs.size()), "r4f s");
+        ck(cudaMalloc(&da, cf.a.size() * 2), "r4f a");
+        ck(cudaMalloc(&db, cf.b.size() * 2), "r4f b");
+        ck(cudaMemcpy(da, cf.a.data(), cf.a.size() * 2, cudaMemcpyHostToDevice), "r4f a up");
+        ck(cudaMemcpy(db, cf.b.data(), cf.b.size() * 2, cudaMemcpyHostToDevice), "r4f b up");
+        ck(cudaMemcpy(dqs, qs.data(), qs.size(), cudaMemcpyHostToDevice), "r4f s up");
+        auto step = [&](int steps) {
+            ck(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice), "r4f reset");
+            for (int t = 0; t < steps; ++t)
+                state_fp4_comp_kernel<R><<<g16, 128>>>(dq, dqs, da, db, dk + (size_t) t * heads * dim,
+                                                       du + (size_t) t * heads * dim, ddec, heads, dim);
+            ck(cudaDeviceSynchronize(), "r4f steps");
+            float* tmp; ck(cudaMalloc(&tmp, st * 4), "tmp");
+            recon_fp4<<<g16, 128>>>(dq, dqs, heads, dim, tmp);
+            ck(cudaDeviceSynchronize(), "r4f recon");
+            ck(cudaMemcpy(dec.data(), tmp, st * 4, cudaMemcpyDeviceToHost), "r4f dec");
+            cudaFree(tmp);
+        };
+        step(1); dec1 = dec;
+        step(kSteps);
+        report("fp4 + real comp fit", 0.5 + 1.0 / kGroup16,
+               (double) st / 2 + (double) heads * dim * nb + (double) heads * R * 2 * dim * 2, dec1, dec);
+        cudaFree(dq); cudaFree(dqs); cudaFree(da); cudaFree(db);
+    }
+
+    // ---- int8 with a real fit, the control that shows the technique works at all
+    {
+        std::vector<int8_t> q; std::vector<float> sc;
+        enc_int8(h0, q, sc);
+        CompFit cf; fit_all(q, {}, {}, {}, sc, 8, cf);
+        int8_t* dq; float* dsc; __half *da, *db;
+        ck(cudaMalloc(&dq, st), "r4i q");
+        ck(cudaMalloc(&dsc, sc.size() * 4), "r4i sc");
+        ck(cudaMalloc(&da, cf.a.size() * 2), "r4i a");
+        ck(cudaMalloc(&db, cf.b.size() * 2), "r4i b");
+        ck(cudaMemcpy(da, cf.a.data(), cf.a.size() * 2, cudaMemcpyHostToDevice), "r4i a up");
+        ck(cudaMemcpy(db, cf.b.data(), cf.b.size() * 2, cudaMemcpyHostToDevice), "r4i b up");
+        ck(cudaMemcpy(dsc, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice), "r4i sc up");
+        // the int8 compensated update: same order, no packing
+        auto step = [&](int steps) {
+            ck(cudaMemcpy(dq, q.data(), st, cudaMemcpyHostToDevice), "r4i reset");
+            for (int t = 0; t < steps; ++t) {
+                // the compensated int8 body reads the REAL fit (da/db), one thread a column as A2's shape has it
+                state_int8_compfit_kernel<4><<<g1, 128>>>(dq, dsc, da, db, dk + (size_t) t * heads * dim,
+                                                          du + (size_t) t * heads * dim, ddec, heads, dim);
+            }
+            ck(cudaDeviceSynchronize(), "r4i steps");
+            float* tmp; ck(cudaMalloc(&tmp, st * 4), "tmp");
+            recon_int8<<<g1, 128>>>(dq, dsc, heads, dim, tmp);
+            ck(cudaDeviceSynchronize(), "r4i recon");
+            ck(cudaMemcpy(dec.data(), tmp, st * 4, cudaMemcpyDeviceToHost), "r4i dec");
+            cudaFree(tmp);
+        };
+        step(1); dec1 = dec;
+        step(kSteps);
+        report("int8 + real comp fit", 1.0, st + scale_b + (double) heads * R * 2 * dim * 2, dec1, dec);
+        cudaFree(dq); cudaFree(dsc); cudaFree(da); cudaFree(db);
+    }
+
+    // ---- residual smoothing, measured rather than asserted.
+    //
+    // The technique rescales key rows before quantizing so every row uses the full code range.  This arm ALREADY takes
+    // one scale a row (amax/7), which IS per-row smoothing, so on int4 the technique is a no-op by construction: the
+    // row's amax cancels.  It would matter for a coarser scale (a block or a whole tensor).  Both are measured here so
+    // the claim is a number, not an argument.
+    {
+        std::printf("\n  -- residual smoothing: per-row (what this arm already does) vs one scale a head --\n");
+        auto q4_err = [&](bool per_row) {
+            std::vector<float> dq(st);
+            for (int h = 0; h < heads; ++h) {
+                float amax_h = 0.f;
+                for (int r = 0; r < dim; ++r)
+                    for (int c = 0; c < dim; ++c)
+                        amax_h = std::fmax(amax_h, std::fabs(h0[((size_t) h * dim + r) * dim + c]));
+                const float sc_h = amax_h > 0.f ? amax_h / 7.f : 1.f;
+                for (int r = 0; r < dim; ++r) {
+                    float amax_r = 0.f;
+                    for (int c = 0; c < dim; ++c)
+                        amax_r = std::fmax(amax_r, std::fabs(h0[((size_t) h * dim + r) * dim + c]));
+                    const float sc = per_row ? (amax_r > 0.f ? amax_r / 7.f : 1.f) : sc_h;
+                    for (int c = 0; c < dim; ++c) {
+                        const float v = h0[((size_t) h * dim + r) * dim + c];
+                        float qv = nearbyintf(v / sc);
+                        qv = fminf(fmaxf(qv, -7.f), 7.f);
+                        dq[((size_t) h * dim + r) * dim + c] = qv * sc;
+                    }
+                }
+            }
+            return rel_frob(dq, h0);
+        };
+        const double with_smooth = q4_err(true), without = q4_err(false);
+        std::printf("  int4, one scale a row (smoothed):     err %.4e   MiB/sess %.2f\n", with_smooth,
+                    ((double) st / 2 + scale_b) * 36.0 / (1 << 20));
+        std::printf("  int4, one scale a head (unsmoothed):  err %.4e   MiB/sess %.2f\n", without,
+                    ((double) st / 2 + scale_b / dim) * 36.0 / (1 << 20));
+        std::printf("  smoothing's delta: %.2fx better error, for %.1f MiB a session of scales instead of %.2f\n",
+                    without / with_smooth, scale_b * 36.0 / (1 << 20), scale_b / dim * 36.0 / (1 << 20));
+    }
+
     cudaFree(ref); cudaFree(dk); cudaFree(du); cudaFree(ddec); cudaFree(dcomp);
     return 0;
 }
+
 
 }  // namespace
 
@@ -1517,6 +1953,12 @@ int main(int argc, char** argv) {
                     time_arm([&](int i) { state_int8_window_kernel<<<grid, 128>>>(s8, sc8, win, dk, du, ddec, heads, dim, i); })});
     arms.push_back({"A16 q6 full", q6_b + scale_b + comp_b + win_b, q6_b + scale_b + comp_b + win_b,
                     time_arm([&](int i) { state_packed_full_kernel<6><<<pgrid, 128>>>(p6, sc6d, comp6, win6, dk, du, ddec, heads, dim, i); })});
+    arms.push_back({"A18 int8 real-fit", q8_b + scale_b + comp_b, q8_b + scale_b + comp_b,
+                    time_arm([&](int) { state_int8_compfit_kernel<4><<<grid, 128>>>(s8, sc8, comp6, comp6 + (size_t) heads * 4 * dim, dk, du, ddec, heads, dim); })});
+    arms.push_back({"A19 int4 real-fit", q4_b + scale_b + comp_b, q4_b + scale_b + comp_b,
+                    time_arm([&](int) { state_packed_comp_kernel<4, 4><<<pgrid, 128>>>(p4, sc4d, comp6, comp6 + (size_t) heads * 4 * dim, dk, du, ddec, heads, dim); })});
+    arms.push_back({"A20 fp4 real-fit", (double) st / 2 + f4_scale_b + comp_b, (double) st / 2 + f4_scale_b + comp_b,
+                    time_arm([&](int) { state_fp4_comp_kernel<4><<<g16, 128>>>(f4, f4s, comp6, comp6 + (size_t) heads * 4 * dim, dk, du, ddec, heads, dim); })});
     arms.push_back({"A17 q4 full", q4_b + scale_b + comp_b + win_b, q4_b + scale_b + comp_b + win_b,
                     time_arm([&](int i) { state_packed_full_kernel<4><<<pgrid, 128>>>(p4, sc4d, comp4, win4, dk, du, ddec, heads, dim, i); })});
 
