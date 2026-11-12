@@ -19,6 +19,8 @@
 //        poly_fattn_test dec   fdec_q8() and fdec_f16() (the decode kernel) against attend() and the doubles, up
 //                              to 170,000 rows; a token alone and with others, and from a position on the card,
 //                              to the bit; and the GB/s of cache read at 4K/32K/128K/256K
+//        poly_fattn_test deep [pos]  fdec_k8v4 against attend() over ALL heads at one context (128K/256K), split
+//                              per context so a run stays bounded; the always-run test compares 4K/32K only
 //        poly_fattn_test parity the k8v4 payload checks: per-cell isolation, the KV-head map, the prefix bound,
 //                              determinism, and a round trip - see the block above parity_main
 //        poly_fattn_test sweep  one token's decode cost against the context, with nothing else in the process
@@ -992,6 +994,98 @@ int parity_main() {
     return bad ? 1 : 0;
 }
 
+// deep_main: fdec_k8v4 against attend() over ALL query heads at ONE context, so 128K and 256K are checked properly
+// without putting a minutes-long reference inside the always-run test.  Split by context on purpose: attend() takes
+// min(4, kScore / (n_head * (pos+1))) tokens a launch, so at 256K it walks 4097 blocks for one token.  Each call is
+// bounded by the caller (the ctest entry uses timeout 180 per context), and this mode prints its inflight progress.
+//
+//   poly_fattn_test deep 131072
+//   poly_fattn_test deep 262144
+int deep_main(long long pos) {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    constexpr int kRows = 262145;
+    if (pos < 0 || pos + 1 > kRows) {
+        std::printf("deep: pos must be in [0, %d]\n", kRows - 1);
+        return 2;
+    }
+    std::mt19937 rng(97);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> q((size_t) kHeads * kDim);
+    for (float& x : q) x = 2.f * nd(rng);
+
+    // the K and V caches up to this context only: a 256K V4Host is 208 MB of nibbles, a 128K one 104 MB
+    const int rows_used = (int) pos + 1;
+    Cache K = make(rng, rows_used);
+    V4Host V;
+    V.q.resize((size_t) rows_used * (kWidth / 32) * 16);
+    V.sc.resize((size_t) rows_used * (kWidth / 32));
+    std::vector<float> row(kWidth);
+    for (int r = 0; r < rows_used; ++r) {
+        for (float& x : row) x = draw(rng);
+        q4_host_row(row.data(), V.q.data() + (size_t) r * (kWidth / 32) * 16, V.sc.data() + (size_t) r * (kWidth / 32));
+    }
+    int8_t* kc = upload(K.codes);
+    uint16_t* ks = upload(K.scales);
+    uint8_t* vq = upload(V.q);
+    uint16_t* vs = upload(V.sc);
+    float* dq = upload(q);
+    float* score;
+    float* out;
+    cudaMalloc(&score, kScore * sizeof(float));
+    cudaMalloc(&out, size_t(kHeads) * kDim * sizeof(float));
+    const float scale = 1.f / 16.f;
+    const size_t cells = size_t(kHeads) * kDim;
+
+    std::printf("deep: pos %lld, all %d query heads, %d KV heads; %d rows\n", pos, kHeads, kKvHeads, rows_used);
+    std::printf("  fdec_k8v4 first...\n");
+    std::fflush(stdout);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    // a warm call first: the first touch of a 208 MB cache is page faults, not the kernel (measured 73.9 ms cold
+    // against 1.4 ms warm at 256K).  The timing below is informational; the correctness is the point of this mode.
+    fdec_k8v4(dq, Kvq8{kc, ks}, Kvq4{vq, vs}, pos, 1, nullptr, rows_used, out, kDim, kHeads, kKvHeads, scale, score,
+              kScore, nullptr);
+    cudaDeviceSynchronize();
+    cudaEventRecord(e0);
+    const bool ran = fdec_k8v4(dq, Kvq8{kc, ks}, Kvq4{vq, vs}, pos, 1, nullptr, rows_used, out, kDim, kHeads, kKvHeads,
+                               scale, score, kScore, nullptr);
+    cudaEventRecord(e1);
+    cudaDeviceSynchronize();
+    float msd = 0.f;
+    cudaEventElapsedTime(&msd, e0, e1);
+    if (!ran) {
+        std::printf("FAIL deep: fdec_k8v4 refused\n");
+        return 1;
+    }
+    const std::vector<float> fd = download(out, cells);
+    std::printf("  fdec_k8v4 %.3f ms; now attend() (the slow generic reference)...\n", msd);
+    std::fflush(stdout);
+
+    cudaEventRecord(e0);
+    const int chunk = std::min<size_t>(4, kScore / (size_t(kHeads) * (pos + 1)));
+    attend(dq, nullptr, nullptr, pos, 1, score, chunk, out, kDim, kHeads, kKvHeads, scale, nullptr, 0, 0, false,
+           nullptr, 0, 0, Kvq8{kc, ks}, Kvq8{}, nullptr, 0, Kvq4{vq, vs});
+    cudaEventRecord(e1);
+    cudaEventSynchronize(e1);
+    float msa = 0.f;
+    cudaEventElapsedTime(&msa, e0, e1);
+    const std::vector<float> ref = download(out, cells);
+
+    float most = 0.f, big = 0.f;
+    int worst_h = -1, worst_d = -1;
+    for (size_t i = 0; i < cells; ++i) {
+        const float d = std::fabs(fd[i] - ref[i]);
+        if (d > most) { most = d; worst_h = (int) (i / kDim); worst_d = (int) (i % kDim); }
+        big = std::max(big, std::fabs(ref[i]));
+    }
+    const bool ok = most <= 1e-2f;
+    std::printf("%s deep pos %lld: fdec_k8v4 vs attend() over all %d heads: worst |err| %.3e of results up to %.2f "
+                "(head %d, dim %d); attend %.3f ms against fdec %.3f ms\n",
+                ok ? "ok  " : "FAIL", pos, kHeads, most, big, worst_h, worst_d, msa, msd);
+    return ok ? 0 : 1;
+}
+
 int sweep_main() {
     const int rows_max = 262145;
     std::mt19937 rng(31);
@@ -1189,17 +1283,23 @@ int main(int argc, char** argv) {
             return 77;
         }
     }
-    bool decode = false, k8v4 = false, sweep = false, parity = false;
+    bool decode = false, k8v4 = false, sweep = false, parity = false, deep = false;
+    long long deep_pos = 262144;
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "dec") decode = true;
         else if (arg == "k8v4") k8v4 = true;
         else if (arg == "sweep") sweep = true;
         else if (arg == "parity") parity = true;
+        else if (arg == "deep") {
+            deep = true;
+            // the optional position follows it; consume it so the loop does not see a bare number
+            if (i + 1 < argc && argv[i + 1][0] >= '0' && argv[i + 1][0] <= '9') deep_pos = std::atoll(argv[++i]);
+        }
         else if (arg == "gqa16") kHeads = 32;
         else if (arg == "--heads" && i + 1 < argc) kHeadsArg = std::atoi(argv[++i]);
         else {
-            std::fprintf(stderr, "usage: poly_fattn_test [dec|k8v4] [gqa16]\n");
+            std::fprintf(stderr, "usage: poly_fattn_test [dec|k8v4|sweep|parity|deep [pos]] [gqa16] [--heads N]\n");
             return 2;
         }
     }
@@ -1218,6 +1318,14 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (parity) return parity_main();
+    if (deep) {
+        const long long pos = deep_pos;
+        if (!fdec_fits(kDim, kHeads, kKvHeads, (int) pos + 1, kScore)) {
+            std::printf("no decode kernel for this card\n");
+            return 77;
+        }
+        return deep_main(pos);
+    }
     if (sweep) {
         if (!fdec_fits(kDim, kHeads, kKvHeads, 262145, kScore)) {
             std::printf("no decode kernel for this card\n");

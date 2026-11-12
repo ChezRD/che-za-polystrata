@@ -265,6 +265,12 @@ macro(strata_poly_targets)
         add_test(NAME poly_fattn_test_k8v4_g${_g} COMMAND poly_fattn_test k8v4 --heads ${_g})
         set_tests_properties(poly_fattn_test_k8v4_g${_g} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
       endforeach()
+      # fdec_k8v4 against attend() over ALL heads at one long context, one test a context so each stays bounded
+      # (a single run that compares both was 27 minutes and had to be killed; see MB-ROW-1-5.md §29)
+      foreach(_pos 131072 262144)
+        add_test(NAME poly_fattn_test_deep_${_pos} COMMAND poly_fattn_test deep ${_pos})
+        set_tests_properties(poly_fattn_test_deep_${_pos} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+      endforeach()
     endif()
     # STRATA_POLY_STAGED_TILES: the staged experts in size classes, each a launch of its own tile width, against one
     # launch, bit for bit; needs a card
