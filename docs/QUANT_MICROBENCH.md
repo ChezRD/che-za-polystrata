@@ -48,7 +48,7 @@ what the plan's tables use.
 | 1 | k8v4 KV **store**: q8_0 keys + Hadamard-rotated Q4_0 values, 832 B a cell | GB/s of traffic (source read + KV write), and ns a cell | **35.2 ns a cell**; **23.6 GB/s** of KV bytes written; **140.0 GB/s** of traffic | **8.2%** of pure KV bytes; **48.6% (50.0%)** of traffic | **PASS on its own criterion, not on bandwidth**: the byte saving reaches memory as **28.4% less time** a cell than q8_0. The plan's 173 GB/s bar is unreachable (§2.0); 48.6% of traffic is what a 4:1 read-amplifying quantizer gives | the store is 23.5% smaller and 28.4% faster than q8_0's (the *read* is a different answer, row 2) |
 | 2 | KV **read**: decode attention over the k8v4 cache | GB/s of cache read at 256K | **141.5 GB/s** (5.88 ns a cell) | **49.1% (50.5%)** | **FAIL** the 60% bar by 11 points; the row's finding stands | 5.88 ns a cell at 256K, which sizes LSA's wider-list penalty |
 | 3 | GDN recurrent state, 8 formats from int8 to fp4 | µs a layer at T=1, MiB a session, and relative state error at 1 and 128 steps | **see §2.1**: **fp16 is the winner** — 0.88× fp32's time for half the bytes | — (bandwidth is not the limit; §2.1) | **PASS for fp16 (footprint at near-zero time cost); NOT RUN for nothing else** | **the answer is fp16, not int8** — see §2.1 |
-| 4 | the paper's full form: compensators + window buffer | µs a layer, MiB a session | **measured for int8 and 4-bit** (A2/A3/A16/A17) | — | **carrying them costs 8–33%, and their accuracy benefit is NOT measured** (§2.1) | nothing further until a compensator fit exists |
+| 4 | the paper's full form: a **real** rank-4 compensator fit + residual smoothing | error at 1 and 128 steps, µs a layer, MiB a session | **fit removes 12.0% of the residual (= the SVD bound); int4 1.744 → 1.71 at 128 steps, for +39% time and +24% bytes** | — | **FAIL**: 78× worse than fp16, and closing it needs r ≈ 64 (more bytes than fp16) | **no 4-bit format reaches fp16's accuracy; the footprint winner stays fp16 at 16 slots** — §2.1a |
 | 5 | Q8_1 activation quantization, 2,560-value rows | GB/s of activations in + int8 out | **64.5 GB/s at 8 tokens; 8.1 GB/s at 1** | **22.4% (23.0%) at 8; 2.8% at 1** | **FAIL** at every width the engine runs; the stop rule fires | confirms it must be **fused**, not optimized |
 | 6 | IQ3_S / IQ4_NL expert dequant + dot, the reference | int8-equivalent TOPS at R=626 | **55.5 TOPS** (1.773 ms), documented 55.5 | 63% of the 88 TOPS int8 peak | **PASS** (0.0% off) | the truth serum for the phase: the box reproduces its own numbers |
 | 7 | NVFP4 E2M1/UE4M3 decode, software path | GB/s of weights | **252.3 GB/s**, hash `054f38e43e6cdb4e` | **87.6% (90.1%)** | **CONFIRMED** (cited, not re-derived) | the calibration for how a software-decoded 4-bit format behaves here |
@@ -163,17 +163,77 @@ Registers did **not** fall as expected: the int8-fp16 arm uses **39** where plai
 register for two values, but the pack/unpack around it costs more than the arithmetic it saves — which is the same
 reason fp16 only reaches 0.88× on a 2× cheaper multiply.
 
-**What is NOT measured, and must not be read into the table.** The compensator arms carry **zero** compensators
-(`cudaMemset(comp, 0, …)`), so their error column is *identical* to their base arm — the fold is a no-op. They measure
-**what carrying the compensators costs** (8–33% more time, 0.75 MiB a layer at 4 bits), **not what they buy**. The
-paper's premise — that compensators recover the error — is untested here and needs a rank-r fit on the residual, which
-this bench does not implement. **int4's 174% error is therefore not the last word on 4-bit**; it is the last word on
-4-bit *without* a compensator fit.
+**The compensator arms in the table above carry zero compensators** (`cudaMemset(comp, 0, …)`), so their error column
+is *identical* to their base arm and they measure only the cost of carrying them. §2.1a implements the fit for real and
+answers the question; the arms above are left as they are because they are what the cost of the full form is measured
+from.
 
 **Verdict: the LeapQuant line is narrowed to "not worth it for speed, and beaten by plain fp16 on every axis", not
 closed on accuracy.** Row 3's answer is that the state should be **fp16** — half the footprint, 12% more time, and
 25× int8's accuracy — and the heavy 4-bit machinery is not justified by anything measured here. Row 4's compensator
 half remains open for the reason above.
+
+### 2.1a Row 4: the compensator fit works, and cannot help this state
+
+The arms in §2.1 that say "+ comp" carry **zero** compensators. They measure what the full form costs, not what it
+buys — so the paper's central claim was untested. It is tested now: the fit is implemented, not carried.
+
+**What the fit does.** For each head, take the residual **R = S − Q(S)** — the part quantization lost — and extract its
+top-r rank-one components by power iteration (24 iterations a component, deflation between them, deterministic start
+from the row with the largest mass, 48 independent 128×128 blocks, one layer, no training). Each component is stored as
+two **fp16** vectors, `a[r]` a row and `b[r]` a column. The update then runs in the paper's order: read
+`code·scale + Σ a·b`, apply the decay and the rank-1 update, then quantize **`upd − Σ a·b`** — the compensation is
+never re-encoded, which is exactly why it can hold what a 4-bit code cannot.
+
+| int4 + 4 components | err @1 | err @128 | vs no fit |
+| --- | ---: | ---: | --- |
+| no compensators | 1.268e-01 | **1.744** | — |
+| **real fit, r = 4** | **9.6e-02** | **1.71** | −24% at one step, **−2% at 128** |
+
+**The fit is correct and it does not help, and the reason is measurable.** Its quality was checked against the exact
+SVD bound on the same residual: **the 4 fitted components remove 12.0% of the residual's energy**, and a full SVD
+truncated to rank 4 removes 12.2% of the same energy. So the kernel achieves what a perfect rank-4 fit could — the
+ceiling is the technique, not the implementation.
+
+**And that ceiling is low because this residual is full rank.** The singular values of a 128×128 int4 residual on this
+state are almost flat (0.138, 0.137, 0.135, 0.131, 0.128, 0.125, 0.124, 0.122 …), so rank-4 holds **12%** of the
+energy, rank-8 23%, rank-16 31%. A rank one quantizer residual is *noise* — there is no low-rank outlier structure to
+capture, which is the one thing the technique assumes. Recovering int4 by compensators would need r ≈ 64, at which
+point the two fp16 vectors (128·r·2 B a head) cost more than the state they are compressing.
+
+**The same holds for fp4:** 1.090e-01 → 9.6e-02 at one step, 1.561 → 1.54 at 128.
+
+**Residual smoothing is real, and this quantizer already does it.** Measured with one scale a row against one scale a
+head:
+
+| int4 | err @1 | MiB a session |
+| --- | ---: | ---: |
+| one scale a **head** (unsmoothed) | 1.7243e-01 | 13.51 |
+| one scale a **row** (what this arm does) | **1.1700e-01** | 14.34 |
+
+**1.47× better error for 0.83 MiB a session of scales.** So smoothing is worth having — and it is *already in* every
+arm in the table, because a per-row `amax/7` scale **is** per-key-row rescaling. It would only be a change for a
+coarser (per-block or per-tensor) scale. That is why the technique's delta is invisible in the tables: it is not
+missing, it is the scale rule.
+
+**Cost of each technique** (5 interleaved runs, clock pinned):
+
+| arm | µs a layer | × fp32 | MiB a session | slots |
+| --- | ---: | ---: | ---: | ---: |
+| int4, no compensators | 31.8 | 0.49× | 14.3 | 60.3 |
+| int8, no compensators | 20.8 | 0.75× | 27.8 | 31.0 |
+| int8 + 4 compensators | 22.8 | 0.69× | 31.2 | 27.7 |
+| **int4 + real 4-component fit** | **44.2** | **0.35×** | **17.7** | **48.8** |
+| fp4 + real 4-component fit | 126.4 | 0.12× | 18.6 | 46.6 |
+
+The compensators cost **+39% time and +24% bytes** on int4 (31.8 → 44.2 µs, 14.3 → 17.7 MiB) and buy a 2% error
+reduction at 128 steps.
+
+**The question this row asked — does a 4-bit state with the paper's full technique reach fp16's accuracy? — is
+answered: no, not remotely.** fp16 is at **2.2e-02** after 128 steps with **no** compensators; int4 with a real rank-4
+fit is at **1.71**, i.e. **78× worse**, and int4 would need r ≈ 64 to close that, which costs more bytes than fp16
+uses. The footprint winner stays **fp16 at 16 slots**, and 4-bit's 60 slots are not reachable at usable accuracy by
+this technique on this state.
 
 ### 2.2 Row 8 is bounded by the scores it writes
 
@@ -199,6 +259,79 @@ row 7 confirms a recorded 87.6% of DRAM with an unchanged output hash, so the bo
 table to mean something. Row 2 misses its 60% bar by 11 points at 256K and that miss is the row's result: 5.88 ns a cell
 at long context is the real per-cell attention cost the feature plan needed. Row 8 misses its 11 TFLOP/s bar for a
 reason given in §2.2 and still delivers what it was for. Row 4 is not run.
+
+## 2.4 The integration decision for the state format
+
+The measurement says **fp16**. This section says what that costs to implement, what it risks, and what it does not
+decide.
+
+### 2.4.1 The decision, per axis
+
+| axis | winner | number | runner-up |
+| --- | --- | --- | --- |
+| decode time | fp32 (1.00×) | 15.7 µs a layer | **fp16, 0.89× (17.7 µs)** |
+| state footprint | int4 (60.3 slots) | 14.3 MiB a session | fp16, 16.0 slots, 54.0 MiB |
+| accuracy (128 steps) | **fp16 (2.2e-02)** | — | bf16 1.5e-02 at 0.61× |
+| **both time and footprint** | **fp16** | **16 slots for +12% time a layer** | nothing else is close |
+
+`bf16` actually has the *lowest* error at 128 steps (1.5e-02 against fp16's 2.2e-02) — a real second place on accuracy —
+but it is **47% slower** than fp16 (25.9 against 17.7 µs) for the same 2 bytes a value, because it converts per value
+instead of using `HFMA2` on pairs (§4). fp16 wins the combination.
+
+**Why not int4's 60 slots:** §2.1a. Its error is 1.74 at 128 steps, a real rank-4 compensator fit moves that to 1.71,
+and reaching fp16's 2.2e-02 needs r ≈ 64 — more bytes than fp16 costs.
+
+### 2.4.2 What it costs to implement
+
+The fp16 state is the cheapest change in the table: **same shape, half the bytes, no new format code.**
+
+| site | what it is now | the change |
+| --- | --- | --- |
+| `src/core/layer.cpp:240` | `parts[]` reserves `ssm_state_size * ssm_v_heads * ssm_state_size * 4` B for the state | **`* 2`**, and the allocator's 16-byte alignment already holds |
+| `src/core/layer.cpp:245` | `b.state = (float*) ptr[14]` | `(uint16_t*) ptr[14]`, or a `half*` alias |
+| `src/core/layer.cpp:246` | `gdn_buffers_zero_state` memsets `… * sizeof(float)` | `sizeof(uint16_t)` |
+| `src/core/layer.cpp:351-352` | `native_gdn_step` / `gdn_step` take `b.state` | a `half*` overload; the kernels below are the work |
+| `src/prefill/kernels.cu:805` | `gdn_rec_kh_kernel(float* state, …)` — the fused path's state | `__half*`, `__half2` load/store, `__hfma2` for `cur*d + k*u` |
+| `src/prefill/kernels.cu:492,538,599,642` | the other four `gdn_rec_*` variants, all `float* state` | the same change each; they are the fallbacks and parity reference |
+| `src/prefill/gdn_tc.cuh`, `src/split/src/gdn_tc_prompt.cuh` | the TC prompt path's state reads | read `half2` and convert once, or keep fp32 tiles and convert at the tile edge |
+
+The arithmetic change per kernel is one line — `s = __hfma2(s, d2, __hmul2(k2, u2))` — plus the load and store width.
+**No new packing, no scale, no quantize.** That is why it is the cheapest option: it deletes work rather than adding it.
+
+### 2.4.3 The risks, and the tolerance each needs
+
+**1. The three parity tests are fp32 today and they will not tolerate an fp16 state at their current thresholds.**
+
+| test | file | what it compares | what fp16 needs |
+| --- | --- | --- | --- |
+| `gdn_rec_parity` | `src/prefill/gdn_rec_parity.cu` | the recovery kernels against a CPU reference | a **half-precision reference**, or a tolerance derived from fp16's 11-bit significand: a 128-deep accumulation of `k·u` terms carries ~2^-11 relative each step, so expect **~1e-2 relative** after 128 steps — exactly what §2.1 measures (2.2e-02) |
+| `gdn_chunk_parity` | `src/kernels/gdn_chunk_parity.cpp` | the prompt/chunk path against the recovery path | both sides on the same type, so the tolerance is unchanged **if both move to fp16**; a mixed fp32/fp16 pair needs ~1e-3 |
+| `gdn_mma_state_test` | `src/poly/gdn_mma_state_test.cpp` | the tensor-core state path | the mma path wants fp32 accumulators; an fp16 **store** with fp32 **accumulate** is the mixed form measured here as **A15, 0.85×** — 4% slower than plain fp16 and the safe choice for that test |
+
+**The honest number to hold onto:** §2.1's fp16 arm is *one* layer, 128 steps, with decay 0.99 and synthetic inputs. The
+engine's real state sees different activation statistics, and the error at a real 128K context is unmeasured. **2.2e-02
+relative is a ceiling from a synthetic run, not a guarantee.**
+
+**2. The mixed form is available if the parity tests object.** A15 (fp16 store, fp32 accumulate) measures **0.85×**
+against fp16's 0.89× — 4% slower, and it removes the accumulation-order risk entirely. If `gdn_mma_state_test` or
+`gdn_rec_parity` cannot be moved to fp16 tolerances, A15 is the fallback and costs almost nothing.
+
+**3. The state is 54 MiB a session at fp16, and the engine's budget assumes 108.** Halving it is the win, but the
+allocator's `parts[]` arithmetic and anything that sums those parts must change with it, or the buffer layout breaks.
+`src/core/layer.cpp:230-245` is one contiguous arena; a size change at `:240` shifts every part after it. That is the
+one place a mistake is silent corruption rather than a slow kernel.
+
+### 2.4.4 What is NOT decided here
+
+**Whether the engine switches its default.** The repo's rule is that **a default changes only where measured faster**,
+and fp16 is **slower** — 12% on the state step. What it buys is slots, which is a product trade, not a perf win. So:
+
+- **measured:** fp16 is 0.89× fp32 on the state step, 16 slots against 8, and 2.2e-02 error at 128 steps.
+- **not measured:** whether 16 slots at 128K context actually fits the card under real KV pressure; whether the state
+  step's 12% shows up in an end-to-end token time at all (0.07 ms of a ~34 ms token is 0.21%, which is inside the
+  noise of most runs); and whether the parity tests pass at fp16 tolerances.
+- **therefore:** this page recommends fp16 as an **option behind a flag**, not a default change. The end-to-end run that
+  would justify the default is the next step, and it needs the 128K session measurement, not another microbenchmark.
 
 ## 3. The card's documented peaks
 
