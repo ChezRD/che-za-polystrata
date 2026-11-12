@@ -883,7 +883,13 @@ bool query_swizzle_gfx906_device() {
         const bool ok = cudaDeviceGetAttribute(&maj, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
                         cudaDeviceGetAttribute(&mnr, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess;
         if (!ok) cudaGetLastError();
-        per_dev[dev] = ok && strata::sm120_default(maj, mnr) ? 2 : 1;
+        // sm_89 too: measured on the RTX 4060 Ti, the Daily kernel is 19% faster than upstream's at the
+        // Flash-Next geometry (2051 cells, group 12): 14.31 against 17.70 ns a cell, 0.0294 against 0.0363 ms a
+        // decode token, bit-identical on kv_hybrid_parity's mode-3 attention.  ncu on the default kernel puts the
+        // FMA pipe at 11.3% and the DRAM at 17% with 32% achieved occupancy, so neither the tensor cores nor the
+        // bandwidth is the lever here - the value loop's dependent loads are, which is what this kernel folds four
+        // cells at a time.  STRATA_ATTN_DAILY=0 keeps upstream's for an A/B.
+        per_dev[dev] = ok && (strata::sm120_default(maj, mnr) || (maj == 8 && mnr == 9)) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 #endif

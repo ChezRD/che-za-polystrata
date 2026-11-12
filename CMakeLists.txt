@@ -491,6 +491,31 @@ if(STRATA_NATIVE_EXPERTS)
         set_tests_properties(iq_nibble_parity_synthetic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
       endif()
     endif()
+    # Phase 0 row 2 on the path the Qwen3.8-Flash packs run: strata's QSA decode attention over a k8v4 pool
+    # (src/kernels/qsa_decode_attn.cu), at the compiled geometry, as ns a cell and GB/s
+    add_executable(qsa_k8v4_bench src/kernels/qsa_k8v4_bench.cpp)
+    target_include_directories(qsa_k8v4_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(qsa_k8v4_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # Phase 0 row 3 (OPTIMIZATION-STACK.md §0.3): one GDN layer's delta-rule state step at T=1 in four arms -
+    # fp32, int8, int8 + LeapQuant's compensators, int8 + the window buffer - as us a layer and GB/s touched
+    add_executable(gdn_state_bench src/kernels/gdn_state_bench.cu)
+    target_include_directories(gdn_state_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(gdn_state_bench PRIVATE ${_strata_gpu_runtime_target})
+    # Phase 0 row 8 (OPTIMIZATION-STACK.md §0.3): the LSA centroid scan, Q_chunk . C^T with d=64, mma.sync fp16 and
+    # cp.async, at the 256K geometry, as TFLOP/s against the documented fp16 dense peak
+    add_executable(lsa_scan_bench src/kernels/lsa_scan_bench.cu)
+    target_include_directories(lsa_scan_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(lsa_scan_bench PRIVATE ${_strata_gpu_runtime_target})
+    # Phase 0 gate W1 (LSA-PLAN.md §3.3): Ward clustering of one 512-key LSA cluster block, one CTA a block,
+    # every merge round in shared memory; us a block, us a layer, ms of prefill, and the clustering quality
+    add_executable(lsa_ward_bench src/kernels/lsa_ward_bench.cu)
+    target_include_directories(lsa_ward_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(lsa_ward_bench PRIVATE ${_strata_gpu_runtime_target})
+    # Phase 0 row 5 (docs/../OPTIMIZATION-STACK.md §0.3): the Q8_1 activation quantizers at the MoE path's shapes,
+    # as GB/s of activations in plus int8 out (a benchmark, no test)
+    add_executable(q8_1_quant_bench src/kernels/q8_1_quant_bench.cpp)
+    target_include_directories(q8_1_quant_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(q8_1_quant_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     # MODEL-UPDATE: the dense Q8_0 GEMVs at the engine's shapes against the memory bandwidth (a benchmark, no test)
     add_executable(q8_gemv_bench src/kernels/q8_gemv_bench.cpp)
     target_include_directories(q8_gemv_bench PRIVATE ${_strata_gpu_include_directories})

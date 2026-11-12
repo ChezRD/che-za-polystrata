@@ -7,11 +7,16 @@
 //   3. store_q8_at with a ring: two rows written from a device `at` land at (*at + r) % ring and equal what plain
 //      store_q8 writes from the same position.
 // Exit 0 prints "poly_kv_q8_test: PASS"; any failed assertion prints the offending index and values and exits 1.
+//
+// --bench: store_q8 timed as the q8_0 KV store, the comparison arm of MB-ROW-1-5.md's Row 1 (1,088 B a cell for
+// 2 KV heads x 256 values, K and V).  The k8v4 arm is poly_kv_q4_test --bench; this one exists so the bytes and
+// the time come from the same two binaries the plan names.
 #include "strata/poly/kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -216,9 +221,101 @@ void ring_test(std::mt19937& rng, int& fails, long& values) {
     }
 }
 
+// --bench: the q8_0 store (store_q8 for the keys and again for the values), the comparison arm of Row 1.
+// Same shapes, same two invocation forms as poly_kv_q4_test --bench: bulk (the whole cache in calls of kChunk rows)
+// and decode (one row a call).
+namespace bench {
+
+constexpr int kHeadDim = 256, kKvHeads = 2;
+constexpr int kWidth = kKvHeads * kHeadDim;   // 512 values a side
+constexpr int kCellBytes = 544 + 544;         // 512 int8 codes + 16 fp16 scales, twice
+constexpr int kChunk = 4096;
+
+double median_ns(std::vector<double>& v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+}  // namespace bench
+
+void bench_main() {
+    using namespace bench;
+    const int contexts[] = {4096, 32768, 131072, 262144};
+    int dev = 0, bus = 0, clk = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&bus, cudaDevAttrGlobalMemoryBusWidth, dev);
+    cudaDeviceGetAttribute(&clk, cudaDevAttrMemoryClockRate, dev);   // kHz, the card's max memory clock
+    const double peak = 2.0 * (double) clk * 1e3 * (bus / 8) / 1e9;
+    std::printf("q8_0 store: head_dim %d, %d KV heads, %d values a side; %d B a cell\n", kHeadDim, kKvHeads, kWidth,
+                kCellBytes);
+    std::printf("peak %.1f GB/s (2 x %.0f MHz x %d bit / 8, clocks.max.memory)\n", peak, clk / 1e3, bus);
+    const int maxc = contexts[3];
+    // The source is one chunk, cycled for every row: store_q8 reads 4 B a value to quantize it, and in the engine
+    // that source is the projection's fresh output, hot in this card's 32 MB L2 - not a DRAM pool.  See
+    // poly_kv_q4_test --bench for the same choice and why the criterion is about the write.
+    constexpr int kChunkRows = 4096;
+    std::mt19937 rng(99);
+    float* dx;
+    int8_t *kc, *vc;
+    uint16_t *ks, *vs;
+    ck(cudaMalloc(&dx, (size_t) kChunkRows * kWidth * sizeof(float)), "bench x");
+    ck(cudaMalloc(&kc, (size_t) maxc * kWidth), "bench k codes");
+    ck(cudaMalloc(&ks, (size_t) maxc * (kWidth / 32) * sizeof(uint16_t)), "bench k scales");
+    ck(cudaMalloc(&vc, (size_t) maxc * kWidth), "bench v codes");
+    ck(cudaMalloc(&vs, (size_t) maxc * (kWidth / 32) * sizeof(uint16_t)), "bench v scales");
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+    auto store_pair = [&](int64_t first, int rows) {
+        strata::poly::store_q8(dx, kc, ks, kWidth, first, rows, nullptr);
+        strata::poly::store_q8(dx, vc, vs, kWidth, first, rows, nullptr);
+    };
+    // the whole cache in chunks, each chunk read from the same L2-resident source
+    auto store_all = [&](int cells) {
+        for (int row = 0; row < cells; row += kChunkRows)
+            store_pair(row, std::min(kChunkRows, cells - row));
+    };
+    std::printf("\nbulk: the whole cache written, %d rows a call\n", kChunk);
+    std::printf("  cells   ns/cell   GB/s   %% of %.0f (max clk)   %% of 280.0 (loaded)\n", peak);
+    for (int c : contexts) {
+        std::vector<double> v;
+        const int reps = c > 100000 ? 5 : 9;
+        for (int r = 0; r < reps; ++r) {
+            cudaEventRecord(e0);
+            store_all(c);
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "bulk q8");
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (r) v.push_back((double) ms * 1e6 / c);
+        }
+        const double ns = median_ns(v);
+        const double gbs = (double) kCellBytes / ns;
+        std::printf("  %6d  %9.2f  %6.1f  %14.1f%%  %16.1f%%\n", c, ns, gbs, 100.0 * gbs / peak,
+                    100.0 * gbs / 280.0);
+    }
+    const int steps = 65536;
+    std::printf("\ndecode: one row a call, %d calls a rep, the cache's own rows cycled\n", steps);
+    std::printf("  arm     ns/cell   GB/s   %% of %.0f (max clk)   %% of 280.0 (loaded)\n", peak);
+    std::vector<double> v;
+    for (int r = 0; r < 5; ++r) {
+        cudaEventRecord(e0);
+        for (int i = 0; i < steps; ++i)
+            store_pair(((int64_t) r * 104729 + i) % maxc, 1);
+        cudaEventRecord(e1);
+        ck(cudaEventSynchronize(e1), "decode rows");
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        v.push_back((double) ms * 1e6 / steps);
+    }
+    const double ns = median_ns(v);
+    const double gbs = (double) kCellBytes / ns;
+    std::printf("  q8_0  %9.2f  %6.1f  %14.1f%%  %16.1f%%\n", ns, gbs, 100.0 * gbs / peak, 100.0 * gbs / 280.0);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     ck(cudaSetDevice(0), "cudaSetDevice");
 
     std::mt19937 rng(0x51u);
@@ -243,5 +340,8 @@ int main() {
         return 1;
     }
     std::printf("poly_kv_q8_test: PASS (%ld values checked)\n", values);
+    // the timing leg is separate from the pass: `--bench` runs it after the checks have passed
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--bench") == 0) bench_main();
     return 0;
 }

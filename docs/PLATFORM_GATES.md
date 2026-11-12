@@ -16,6 +16,9 @@ no ROCm or oneAPI toolchain and no Intel GPU. Nothing below was run on hardware 
 | NVFP4 W4A8 prompt numerics | **checked** | - | `mmq_nvfp4_parity`, 0.516-0.546% against FP64 |
 | `ncu` counters | normal user blocked by the driver setting; root works | `sudo -n`, or a reboot with one module parameter | `sudo -n ncu --set basic` reports occupancy and DRAM |
 
+The quantized-operation microbenchmarks are a separate set of gates with their own table, their own pass criteria and
+the card's documented peaks: see [QUANT_MICROBENCH.md](QUANT_MICROBENCH.md).
+
 ## 1. Metal
 
 **What is open.** The merged tree carries hand-merged Metal sources (`metal/kernels/moe.metal`, the `strata-poly` port,

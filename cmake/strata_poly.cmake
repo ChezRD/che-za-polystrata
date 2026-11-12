@@ -245,11 +245,33 @@ macro(strata_poly_targets)
     add_test(NAME poly_hip_prefill_fp32_test COMMAND poly_hip_prefill_fp32_test)
     set_tests_properties(poly_hip_prefill_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     # fattn_q8() and fattn_f16() (llama.cpp's flash-attention kernel) against attend_batch(), and with `dec` fdec_q8()
-    # against attend(); needs a card, run by hand
+    # against attend(); needs a card (a machine without one returns 77 and the test is SKIPped, not failed)
     add_executable(poly_fattn_test ${_strata_poly_root}/src/poly/fattn_test.cu ${_strata_poly_root}/src/poly/kernels.cu)
     target_include_directories(poly_fattn_test PRIVATE ${_strata_poly_root}/include ${_strata_poly_root}/src/poly
                                                       ${_strata_gpu_include_directories})
     target_link_libraries(poly_fattn_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+    if(STRATA_BUILD_TESTS)
+      # the batch path (fattn_q8 / fattn_f16 against attend_batch, and the fitters' refusals)
+      add_test(NAME poly_fattn_test COMMAND poly_fattn_test)
+      set_tests_properties(poly_fattn_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      # the decode path (fdec_q8 / fdec_f16 against attend and the doubles, up to 170,000 rows, bit for bit)
+      add_test(NAME poly_fattn_test_dec COMMAND poly_fattn_test dec)
+      set_tests_properties(poly_fattn_test_dec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      # k8v4: fdec_k8v4 against attend and the doubles at 4K/32K/128K/256K, the <=32-cell bit identity against
+      # fdec_q8, and one run per supported group (6 = Qwen3.8-27B, 8 = Qwen3.6/Flint, 12 = Qwen3.8-Flash)
+      add_test(NAME poly_fattn_test_k8v4 COMMAND poly_fattn_test k8v4)
+      set_tests_properties(poly_fattn_test_k8v4 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      foreach(_g 12 24)
+        add_test(NAME poly_fattn_test_k8v4_g${_g} COMMAND poly_fattn_test k8v4 --heads ${_g})
+        set_tests_properties(poly_fattn_test_k8v4_g${_g} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      endforeach()
+      # fdec_k8v4 against attend() over ALL heads at one long context, one test a context so each stays bounded
+      # (a single run that compares both was 27 minutes and had to be killed; see MB-ROW-1-5.md §29)
+      foreach(_pos 131072 262144)
+        add_test(NAME poly_fattn_test_deep_${_pos} COMMAND poly_fattn_test deep ${_pos})
+        set_tests_properties(poly_fattn_test_deep_${_pos} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
+      endforeach()
+    endif()
     # STRATA_POLY_STAGED_TILES: the staged experts in size classes, each a launch of its own tile width, against one
     # launch, bit for bit; needs a card
     add_executable(poly_mmq_tiles_test ${_strata_poly_root}/src/poly/mmq_tiles_test.cu)
@@ -304,6 +326,17 @@ macro(strata_poly_targets)
       target_link_libraries(poly_kv_q4_test PRIVATE ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
                                                     Threads::Threads)
       add_test(NAME poly_kv_q4_test COMMAND poly_kv_q4_test)
+    endif()
+    if(STRATA_BUILD_TESTS)
+      # Phase 0 row 2 (OPTIMIZATION-STACK.md §0.3): every poly KV read path for a geometry, as ns a cell and GB/s,
+      # so a model family the engine serves can be measured without editing the bench (a benchmark, no test)
+      add_executable(poly_kv_read_bench ${_strata_poly_root}/src/poly/kv_read_bench.cpp
+                                         ${_strata_poly_root}/src/poly/kernels.cu)
+      target_include_directories(poly_kv_read_bench PRIVATE ${_strata_poly_root}/include ${_strata_poly_root}/src/poly
+                                                           ${_strata_gpu_include_directories})
+      # strata_poly_mmq already holds fattn.cu (the decode and flash-attention kernels), so it is linked, not rebuilt
+      target_link_libraries(poly_kv_read_bench PRIVATE strata_poly_mmq ${_strata_gpu_blas_target}
+                                                      ${_strata_gpu_runtime_target} Threads::Threads)
     endif()
     # --kv int8/int8k's kernels (store_int8 / attend_int8) against ggml's own quantizer and against attend() over the
     # same numbers in fp16.  The reference is ggml-cpu's quantize_row_q8_0_ref, hence the ggml links; under HIP the
