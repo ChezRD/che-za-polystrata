@@ -25,6 +25,12 @@ corrected bar:
 The measurements themselves were sound; the denominators were not. The gate table shows both the original bar and the
 corrected one, so a reader can see what was actually decided.
 
+**Row 3 then turned out to be the wrong question, and that is a bigger correction than a bar.** Its brief named
+"int8 (LeapQuant's floor)", so the first pass measured one of the format's three bit-widths and treated int8 as the
+interesting end. It is not: the state step has no matrix multiply in it, so the format is simply "cheapest encoding per
+element that keeps accuracy", and **plain fp16 beats int8 on time, accuracy and the slots-per-byte trade** (§2.1). The
+row is now measured across eight formats and reports the one that wins.
+
 **Four figures in this page's first version were also wrong** — row 2's read was the best of five runs rather than the
 median, row 1's was one of the store's two kernels, and both of row 8's numbers (its roofline fraction and the −8.5%
 attributed to it) were misread. All are corrected below and the corrections are recorded in section 9, because a page
@@ -41,8 +47,8 @@ what the plan's tables use.
 | ---: | --- | --- | ---: | ---: | --- | --- |
 | 1 | k8v4 KV **store**: q8_0 keys + Hadamard-rotated Q4_0 values, 832 B a cell | GB/s of traffic (source read + KV write), and ns a cell | **35.2 ns a cell**; **23.6 GB/s** of KV bytes written; **140.0 GB/s** of traffic | **8.2%** of pure KV bytes; **48.6% (50.0%)** of traffic | **PASS on its own criterion, not on bandwidth**: the byte saving reaches memory as **28.4% less time** a cell than q8_0. The plan's 173 GB/s bar is unreachable (§2.0); 48.6% of traffic is what a 4:1 read-amplifying quantizer gives | the store is 23.5% smaller and 28.4% faster than q8_0's (the *read* is a different answer, row 2) |
 | 2 | KV **read**: decode attention over the k8v4 cache | GB/s of cache read at 256K | **141.5 GB/s** (5.88 ns a cell) | **49.1% (50.5%)** | **FAIL** the 60% bar by 11 points; the row's finding stands | 5.88 ns a cell at 256K, which sizes LSA's wider-list penalty |
-| 3 | int8 GDN recurrent state (LeapQuant's floor) | µs a layer at T=1, int8 against fp32 | **20.2 µs int8 vs 15.1–16.8 µs fp32 = 0.70–0.83×** | — (the state is L2-resident; see §2.1) | **FAIL**: below the 1.3× stop rule | **closes the LeapQuant line** on this card |
-| 4 | int8 state + compensator tokens + window buffer | — | **not run** | — | **NOT RUN — gated by row 3's FAIL** | nothing; the plan runs it only if row 3 passes |
+| 3 | GDN recurrent state, 8 formats from int8 to fp4 | µs a layer at T=1, MiB a session, and relative state error at 1 and 128 steps | **see §2.1**: **fp16 is the winner** — 0.88× fp32's time for half the bytes | — (bandwidth is not the limit; §2.1) | **PASS for fp16 (footprint at near-zero time cost); NOT RUN for nothing else** | **the answer is fp16, not int8** — see §2.1 |
+| 4 | the paper's full form: compensators + window buffer | µs a layer, MiB a session | **measured for int8 and 4-bit** (A2/A3/A16/A17) | — | **carrying them costs 8–33%, and their accuracy benefit is NOT measured** (§2.1) | nothing further until a compensator fit exists |
 | 5 | Q8_1 activation quantization, 2,560-value rows | GB/s of activations in + int8 out | **64.5 GB/s at 8 tokens; 8.1 GB/s at 1** | **22.4% (23.0%) at 8; 2.8% at 1** | **FAIL** at every width the engine runs; the stop rule fires | confirms it must be **fused**, not optimized |
 | 6 | IQ3_S / IQ4_NL expert dequant + dot, the reference | int8-equivalent TOPS at R=626 | **55.5 TOPS** (1.773 ms), documented 55.5 | 63% of the 88 TOPS int8 peak | **PASS** (0.0% off) | the truth serum for the phase: the box reproduces its own numbers |
 | 7 | NVFP4 E2M1/UE4M3 decode, software path | GB/s of weights | **252.3 GB/s**, hash `054f38e43e6cdb4e` | **87.6% (90.1%)** | **CONFIRMED** (cited, not re-derived) | the calibration for how a software-decoded 4-bit format behaves here |
@@ -90,13 +96,84 @@ this ("below 15% → it is launch-bound and should be fused, not measured again"
 satisfied when **fusing costs no more than the unfused launch**; the fused SwiGLU+quantize measures **1,655 ns against
 1,659 ns**, so it is free.
 
-### 2.1 Row 3 closed a line on physics, not on a percentage
+### 2.1 Row 3: fp16 is the answer, and the format question was never about int8
 
-The GDN state is 48 heads × 128 × 128 × 4 B = **3.0 MiB**, which fits in the card's 32 MiB L2. The fp32 arm moves it
-at **374–416 GB/s — above the card's 288 GB/s DRAM peak**, which can only happen if it is being served from L2. A
-format that is 4× smaller cannot make a step faster when the step is not paying for its bytes; it only adds a
-dequantize and a requantize a value. That is why int8 measured **0.70–0.83× of fp32** and why the stop rule, not the
-pass bar, is the row's real result.
+The brief for this row named "int8 (LeapQuant's floor)", which measured **one** of the paper's three bit-widths and
+assumed int8 was the interesting end of the range. **It is not, and the framing was the error.** Nothing forces the
+state through int8 at all: the step is an elementwise rank-1 update with no tensor cores, so the only question is
+*cheapest encoding per element that keeps accuracy*. An fp16 store needs **no scale, no quantize and no dequantize** —
+one `cvt` in and one out — where int8 needs a per-row scale multiply in and a divide out. So the row was measured
+across **eight formats**, including the float ones that the int8 framing had excluded.
+
+Sixteen arms, five interleaved runs each, SM clock pinned at 2,820 MHz (dmon shows 2,820/8,751 in every sample), and
+the run-to-run spread was **1.00–1.02×**. Accuracy is the relative Frobenius error of the decoded state against an
+fp32 reference after 1 and 128 update steps.
+
+| format | B/value | µs a layer | × fp32 | MiB a session | slots in 864 MiB | err @1 | err @128 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **fp32** (reference) | 4.00 | **15.0** | 1.00× | **108.0** | **8.0** | — | — |
+| **fp16** | 2.00 | **17.0** | **0.88×** | **54.0** | **16.0** | **3.8e-04** | **2.2e-02** |
+| fp16, fp32 accumulate | 2.00 | 17.6 | 0.85× | 54.0 | 16.0 | — | — |
+| bf16 | 2.00 | 25.0 | 0.60× | 54.0 | 16.0 | 2.3e-03 | 1.5e-02 |
+| fp8 E4M3 | 1.00 | 28.3 | 0.53× | 27.0 | 32.0 | 3.5e-02 | 6.5e-01 |
+| int8 | 1.00 | 20.0 | 0.75× | 27.8 | 31.0 | 9.5e-03 | 1.1e-01 |
+| int8, fp16 arithmetic | 1.00 | 22.4 | 0.67× | 27.8 | 31.0 | — | — |
+| int8, fp16 + fp32 accumulate | 1.00 | 25.5 | 0.59× | 27.8 | 31.0 | — | — |
+| int8 + 4 compensators | 1.00 | 21.8 | 0.69× | 31.2 | 27.7 | 9.5e-03 | 1.1e-01 |
+| int8, fp16 arithmetic + compensators | 1.00 | 32.4 | 0.46× | 31.2 | 27.7 | — | — |
+| int8 + window buffer | 1.00 | 20.0 | 0.75× | 54.8 | 15.8 | — | — |
+| 6-bit int | 0.75 | 31.2 | 0.48× | 21.1 | 41.0 | — | — |
+| **fp4 E2M1 + UE4M3/16** | 0.56 | 125.3 | 0.12× | 15.2 | 56.9 | 1.1e-01 | **1.56** |
+| int4 | 0.50 | 30.4 | 0.49× | **14.3** | **60.3** | 1.3e-01 | **1.74** |
+| 6-bit full form | 0.75 | 42.4 | 0.35× | 51.5 | 16.8 | — | — |
+| 4-bit full form | 0.50 | 41.9 | 0.36× | 44.7 | 19.3 | 1.3e-01 | 1.74 |
+
+**The winner on both axes is fp16.** It halves the state (108 → 54 MiB a session, 8 → 16 slots) for **12% more time a
+layer** — 2 µs at T=1, or **0.07 ms a token over 36 layers**, against a decode token of about 34 ms. That is **+0.2% of
+decode for double the slots.** Nothing else in the table comes close to that trade: every 1-byte format is 25–53%
+slower *and* less accurate, and every 4-bit format is both slower and, at 128 steps, has **more error than signal**
+(1.56–1.74 × the reference norm).
+
+**int8 is beaten by fp16 on every axis that matters.** Same-ish time class (0.75× vs 0.88× — fp16 is *faster*), worse
+accuracy (9.5e-03 vs 3.8e-04 at one step, 25× worse), no footprint advantage worth the trade (31 vs 16 slots at
++25% time). The int8 family needs compensator tokens to be plausible and still does not reach fp16's error.
+
+**fp8 E4M3 is the interesting failure.** At exactly int8's byte cost it is **3.6× less accurate at one step and 5.8×
+at 128** — because E4M3's 4-bit exponent gives it only 3 mantissa bits, and the state's per-row outliers eat them. A
+float format buys dynamic *range* but not dynamic *precision*, and this state needs the latter. It also has no block
+scale here; a scaled fp8 (E4M3 with a per-row scale, i.e. exactly what int8 does) would be the fair comparison for
+fp8 and is not in this table.
+
+**bf16 is worse than fp16 on both counts** (0.60× vs 0.88×, and 6× the error at one step) — it has fp16's byte cost
+with 8 fewer mantissa bits. It exists in the table only to show that "2 bytes, no decode" is not automatically good:
+the decode is not the cost, the mantissa is.
+
+**fp4's 125 µs is a real format cost, not a benchmark defect.** Its kernel compiles to **984 SASS instructions against
+int4's 288**: E2M1's magnitudes are non-uniformly spaced (0, .5, 1, 1.5, 2, 3, 4, 6), so each encode needs seven
+compares where a 4-bit integer needs one shift. That is the price of the float exponent at 4 bits, and it is why fp4
+is 4× slower than int4 at the same byte count.
+
+**The fp16 path does what the brief predicted, and the compiler needed help.** `cuobjdump --dump-sass` on the fp16
+store shows **12 `HFMA2`, 8 `HMUL2`, 0 `FFMA`** where the fp32 arm has 39 `FFMA`. The int8-with-fp16-arithmetic arm
+needed a fix to get there: `__h2div` has **no fp16 instruction** and lowered to `MUFU.RCP` plus a Newton step per
+value, so the row now hoists one reciprocal per row and multiplies. After that it shows **6 `HFMA2`, 6 `HADD2`,
+18 `HMUL2`** and `FFMA` fell 39 → 11. Every kernel in the table is **0 bytes stack, 0 spill** (`ptxas -v`).
+
+Registers did **not** fall as expected: the int8-fp16 arm uses **39** where plain int8 uses **29**. A `half2` is one
+register for two values, but the pack/unpack around it costs more than the arithmetic it saves — which is the same
+reason fp16 only reaches 0.88× on a 2× cheaper multiply.
+
+**What is NOT measured, and must not be read into the table.** The compensator arms carry **zero** compensators
+(`cudaMemset(comp, 0, …)`), so their error column is *identical* to their base arm — the fold is a no-op. They measure
+**what carrying the compensators costs** (8–33% more time, 0.75 MiB a layer at 4 bits), **not what they buy**. The
+paper's premise — that compensators recover the error — is untested here and needs a rank-r fit on the residual, which
+this bench does not implement. **int4's 174% error is therefore not the last word on 4-bit**; it is the last word on
+4-bit *without* a compensator fit.
+
+**Verdict: the LeapQuant line is narrowed to "not worth it for speed, and beaten by plain fp16 on every axis", not
+closed on accuracy.** Row 3's answer is that the state should be **fp16** — half the footprint, 12% more time, and
+25× int8's accuracy — and the heavy 4-bit machinery is not justified by anything measured here. Row 4's compensator
+half remains open for the reason above.
 
 ### 2.2 Row 8 is bounded by the scores it writes
 
@@ -166,8 +243,19 @@ mnemonics in [cicuvc/nvidia-sass-document](https://github.com/cicuvc/nvidia-sass
 | TMA (`cp.async.bulk`) | **no** | `nvcc -arch=sm_89` reports it requires sm_90 |
 | thread-block clusters / DSMEM | **no** | `__cluster_dims__` is rejected for sm_89 |
 
+**Per-format instruction basis**, which is what row 3's table turns on. Each was compiled and counted, not assumed:
+
+| format | instruction | evidence |
+| --- | --- | --- |
+| fp16 arithmetic | `HFMA2`, `HADD2`, `HMUL2` | 2× the per-lane FP32 rate on Ada. **Measured** in row 3's SASS: 12 `HFMA2` + 8 `HMUL2` in the fp16 store, 0 `FFMA`; and 6/6/18 with 11 `FFMA` in the int8-with-fp16-arithmetic arm |
+| bf16 arithmetic | `HFMA2` (bf16 pairs) | native on sm_89; the row-3 arm compiled to 16 `FFMA` **because it converts per value**, so bf16 does not automatically mean vector ops |
+| fp8 E4M3 conversion | `cvt.rn.satfinite.e4m3x2.f32` | sm_89 (PTX ISA). `F2FP.F16.F32.PACK_AB` appears 14× in the fp16 arm; the fp8 arm converts per byte because the state is stored one value a byte |
+| fp4 E2M1 with UE4M3 scales | **software decode, no hardware** | the tree's `Fmt<40>` (`src/kernels/cuda/iq_kernels.cu`) and row 3's arm both decode in software. Below sm_100 there is no FP4 tensor core (Table 36), so a 4-bit state costs 7 compares a value — **984 SASS instructions against int4's 288** |
+| int8 arithmetic | `IMMA` (tensor core) or `IDP.4A` (dp4a) | none of row 3's arms uses either: the step is elementwise, so int8 means `I2F`/`F2I` pairs around an `FFMA` |
+
 The consequence for the work: every kernel of this kind has to be written in `mma.sync` + `cp.async` + `dp4a` terms,
-because the papers' WGMMA, TMA and cluster versions do not port to this card.
+because the papers' WGMMA, TMA and cluster versions do not port to this card. And for an elementwise step like row 3's,
+the instruction that matters is not a tensor-core one at all — it is `HFMA2`.
 
 ## 5. Measurement protocol
 
@@ -230,8 +318,8 @@ binaries around them are in `ctest` and run with the rest of the suite — `poly
 | ---: | --- | --- | --- |
 | 1 | `poly_kv_q4_test` | `poly_kv_q4_test --bench` (and `poly_kv_q8_test --bench` for the q8_0 arm) | the correctness checks are; `--bench` is not |
 | 2 | `poly_kv_read_bench` | `poly_kv_read_bench 256 16 2 --only-fdec --cells 4096,32768,131072,262144 --rows-max 262145` | no; the correctness guard is `poly_fattn_test k8v4` / `deep <pos>`, which is |
-| 3 | `gdn_state_bench` | `gdn_state_bench` | no |
-| 4 | - | not run (see the table) | - |
+| 3 | `gdn_state_bench` | `gdn_state_bench` (timing, 16 arms); `gdn_state_bench --accuracy` (error at 1 and 128 steps); `gdn_state_bench --smoke` (partial-tile correctness) | no |
+| 4 | `gdn_state_bench` | same binary: the compensator arms are A2/A3/A11/A16/A17 | no |
 | 5 | `q8_1_quant_bench` | `q8_1_quant_bench` | no |
 | 6 | `mmq_expert_bench` | `mmq_expert_bench 12 160 626` | no |
 | 6 | `native_expert_bench` | `native_expert_bench <shard>.gguf 0,1,2,3 64 1 -1 -1 200` | no |
