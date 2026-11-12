@@ -1500,20 +1500,34 @@ void Engine::load_shape() {
     const TensorInfo* te = gg_->find("token_embd.weight");
     n_vocab_ = vocab ? (int) vocab->u : te && te->shape.size() == 2 ? (int) te->shape[1] : 0;
     rms_eps_ = shape_f("attention.layer_norm_rms_epsilon");
-    n_expert_ = shape_i("expert_count");
-    n_used_ = shape_i("expert_used_count");
-    n_ff_exp_ = shape_i("expert_feed_forward_length");
-    const MetaValue* shexp = meta_in(*gg_, "expert_shared_feed_forward_length");
-    n_ff_shexp_ = shexp ? (int) shexp->u : n_ff_exp_;
+    // A dense model (qwen35) has no routed experts: its file carries no expert_count, and its FFN is one dense
+    // SwiGLU of `feed_forward_length` rows.  n_ff_ is that width here, exactly as Flint's and LFM2.5's dense layers
+    // use it; the three expert widths stay 0 so the MoE paths are all inert.  n_ff_ must be set before any scratch
+    // is sized (shared_scratch() and q_max both take the max over these four) or the SwiGLU overruns a zero buffer.
+    const MetaValue* arch_key = gg_->get("general.architecture");
+    const bool dense = arch_key && arch_key->s == "qwen35";
+    if (dense) {
+        n_ff_ = shape_i("feed_forward_length");
+        n_expert_ = n_used_ = n_ff_exp_ = n_ff_shexp_ = 0;
+    } else {
+        n_expert_ = shape_i("expert_count");
+        n_used_ = shape_i("expert_used_count");
+        n_ff_exp_ = shape_i("expert_feed_forward_length");
+        const MetaValue* shexp = meta_in(*gg_, "expert_shared_feed_forward_length");
+        n_ff_shexp_ = shexp ? (int) shexp->u : n_ff_exp_;
+    }
 
     auto need = [](bool ok, const char* what) {
         if (!ok) throw std::runtime_error(std::string("unsupported model: ") + what);
     };
     need(n_layer_ > 0 && n_embd_ > 0 && n_embd_ % 32 == 0 && n_vocab_ > 0, "bad block_count or embedding_length");
-    need(n_used_ >= 1 && n_used_ <= kMaxUsed && n_used_ <= n_expert_, "bad expert_used_count");
+    if (dense)
+        need(n_ff_ > 0, "a dense layer's feed_forward_length is 0, so the FFN scratch would be sized for nothing");
+    else
+        need(n_used_ >= 1 && n_used_ <= kMaxUsed && n_used_ <= n_expert_, "bad expert_used_count");
 
     // a block from another file must be this model's: a pruned model's has fewer experts to choose among
-    if (block_ && block_ != gg_.get()) {
+    if (!dense && block_ && block_ != gg_.get()) {
         const TensorInfo* gate = tensor(n_layer_, "ffn_gate_inp.weight");
         if (!gate || gate->shape.size() != 2 || (int64_t) gate->shape[0] != n_embd_ ||
             (int64_t) gate->shape[1] != n_expert_)
@@ -1613,20 +1627,20 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     const MetaValue* arch = file.get("general.architecture");
     const std::string name = arch ? arch->s : std::string();
     // Clover is a qwen35moe model trained to also guess a block of tokens at once (Qwen35)
-    const bool qwen35 = name == "qwen35moe" || name == "clover_moe";
+    const bool qwen35 = name == "qwen35moe" || name == "clover_moe" || name == "qwen35";
     const bool gigachat = name == "deepseek2" || name == "gigachat_audio";
     if (o.kv_format == KvFmt::kQ8_0 && !qwen35 && name != "kolibri1" && name != "flint" && name != "lfm2moe"
         && !gigachat)
-        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, kolibri1, flint, lfm2moe and "
+        throw std::runtime_error("--kv q8_0 is supported for qwen35moe, qwen35, kolibri1, flint, lfm2moe and "
                                  "deepseek2/gigachat_audio models in v1; "
                                  "this is a '" + name + "' model");
     // A voice clip is a fresh prompt. Parking chats for the next request is not this model's cache.
     if (gigachat && (o.conversation_cache_auto || o.conversation_cache_mib > 0))
         throw std::runtime_error("--conversation-cache-mib parking is not supported for deepseek2/gigachat_audio "
                                  "(this is a '" + name + "' model); pass 0");
-    // K8V4 is qwen35moe's and Flint's: Q8_0 keys (q8_0's own) and rotated Q4_0 values.
+    // K8V4 is qwen35moe's, the dense qwen35's and Flint's: Q8_0 keys (q8_0's own) and rotated Q4_0 values.
     if (o.kv_format == KvFmt::kK8V4 && !qwen35 && name != "flint")
-        throw std::runtime_error("--kv k8v4 is supported for qwen35moe and flint models; this is a '" + name +
+        throw std::runtime_error("--kv k8v4 is supported for qwen35moe, qwen35 and flint models; this is a '" + name +
                                  "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
@@ -5251,11 +5265,15 @@ void Engine::draft_rows_of(const Row* rows, const int32_t* tokens, int n, Likeli
     axpy(ao_, 1.f, x, n * n_embd_, true, st_);
     rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
     kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
-    moe_router(L, n);
-    ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-    moe_shared(L, n_layer_, n);
-    tok_ = nullptr;   // a guess's row has no token of the sequence
-    if (moe(L, n_layer_, n)) moe_add(n);
+    if (routes_experts()) {
+        moe_router(L, n);
+        ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
+        moe_shared(L, n_layer_, n);
+        tok_ = nullptr;   // a guess's row has no token of the sequence
+        if (moe(L, n_layer_, n)) moe_add(n);
+    } else {
+        dense_draft_ffn(xn_, n);
+    }
     axpy(fo_, 1.f, x, n * n_embd_, true, st_);
     rms_norm(x, fp(d_head_), step_h_, n_embd_, n, rms_eps_, st_);
     Dev head = output_;   // the matrix's first rows are the common tokens'
@@ -5773,11 +5791,15 @@ void Engine::draft_step(int32_t token, int i) {
     axpy(ao_, 1.f, x, n_embd_, true, st_);
     rms_norm(x, fp(L.ffn_norm), xn_, n_embd_, 1, rms_eps_, st_);
     kernels::native_quantize_q8_1(xn_, xq_, n_embd_, 1, st_);
-    moe_router(L, 1);
-    ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
-    moe_shared(L, n_layer_, 1);
-    tok_ = nullptr;   // a guess's row has no token of the sequence
-    if (moe(L, n_layer_, 1)) moe_add(1);
+    if (routes_experts()) {
+        moe_router(L, 1);
+        ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "router");
+        moe_shared(L, n_layer_, 1);
+        tok_ = nullptr;   // a guess's row has no token of the sequence
+        if (moe(L, n_layer_, 1)) moe_add(1);
+    } else {
+        dense_draft_ffn(xn_, 1);
+    }
     axpy(fo_, 1.f, x, n_embd_, true, st_);
     rms_norm(x, fp(d_head_), own, n_embd_, 1, rms_eps_, st_);
     Dev head = output_;   // the matrix's first rows are the common tokens'

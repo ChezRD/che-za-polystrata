@@ -653,26 +653,42 @@ inline ModelFamily model_family(const GgufFile& g) {
 }
 
 /// Qwen3.6-35B-A3B's guard: every key the geometry is read from must be present (core::geometry_from_gguf),
-/// and the few that the layer pattern depends on must have the values the model has.
+/// and the few that the layer pattern depends on must have the values the model has.  `arch` is `qwen35moe` or the
+/// dense `qwen35`, whose files carry the same keys but for the four expert ones and `feed_forward_length`.
 inline std::string check_architecture_qwen35moe(const GgufFile& g) {
+    const MetaValue* a = g.get("general.architecture");
+    const std::string arch = a ? a->s : std::string();
+    const bool dense = arch == "qwen35";
+    const std::string p = arch + ".";
+    static const char* const moe_keys[] = {
+        "expert_count", "expert_used_count", "expert_feed_forward_length", "expert_shared_feed_forward_length",
+    };
     static const char* const keys[] = {
-        "qwen35moe.block_count", "qwen35moe.embedding_length", "qwen35moe.attention.head_count",
-        "qwen35moe.attention.head_count_kv", "qwen35moe.attention.key_length", "qwen35moe.attention.value_length",
-        "qwen35moe.expert_count", "qwen35moe.expert_used_count", "qwen35moe.expert_feed_forward_length",
-        "qwen35moe.expert_shared_feed_forward_length", "qwen35moe.ssm.conv_kernel", "qwen35moe.ssm.state_size",
-        "qwen35moe.ssm.group_count", "qwen35moe.ssm.time_step_rank", "qwen35moe.ssm.inner_size",
-        "qwen35moe.full_attention_interval", "qwen35moe.nextn_predict_layers",
+        "block_count", "embedding_length", "attention.head_count", "attention.head_count_kv", "attention.key_length",
+        "attention.value_length", "ssm.conv_kernel", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank",
+        "ssm.inner_size", "full_attention_interval", "nextn_predict_layers",
     };
     for (const char* k : keys) {
-        const MetaValue* v = g.get(k);
-        if (!v) return std::string("missing ") + k;
-        if (!v->is_num()) return std::string(k) + " is not a number";
+        const MetaValue* v = g.get(p + k);
+        if (!v) return std::string("missing ") + p + k;
+        if (!v->is_num()) return std::string(p) + k + " is not a number";
     }
-    const MetaValue* nl = g.get("qwen35moe.block_count");
-    const MetaValue* mtp = g.get("qwen35moe.nextn_predict_layers");
-    if (mtp->u >= nl->u) return "qwen35moe.nextn_predict_layers is not smaller than qwen35moe.block_count";
-    if (g.get("qwen35moe.full_attention_interval")->u < 2)
-        return "qwen35moe.full_attention_interval must be at least 2 (the GDN / attention pattern)";
+    if (dense) {
+        const MetaValue* ff = g.get(p + "feed_forward_length");
+        if (!ff) return std::string("missing ") + p + "feed_forward_length";
+        if (!ff->is_num()) return std::string(p) + "feed_forward_length is not a number";
+    } else {
+        for (const char* k : moe_keys) {
+            const MetaValue* v = g.get(p + k);
+            if (!v) return std::string("missing ") + p + k;
+            if (!v->is_num()) return std::string(p) + k + " is not a number";
+        }
+    }
+    const MetaValue* nl = g.get(p + "block_count");
+    const MetaValue* mtp = g.get(p + "nextn_predict_layers");
+    if (mtp->u >= nl->u) return p + "nextn_predict_layers is not smaller than " + p + "block_count";
+    if (g.get(p + "full_attention_interval")->u < 2)
+        return p + "full_attention_interval must be at least 2 (the GDN / attention pattern)";
     return {};
 }
 
@@ -862,7 +878,7 @@ inline std::string check_architecture(const GgufFile& f) {
     const MetaValue* arch = f.get("general.architecture");
     if (!arch) return "missing general.architecture";
     const ModelFamily family = model_family_from_arch(arch->s);
-    if (family == ModelFamily::Qwen35Moe) return check_architecture_qwen35moe(f);
+    if (family == ModelFamily::Qwen35Moe || family == ModelFamily::Qwen35Dense) return check_architecture_qwen35moe(f);
     core::ModelGeometry g;   // anything else is refused by name by read_geometry
     std::string err = read_geometry(f, g);
     if (err.empty()) err = geometry_unsupported(g);

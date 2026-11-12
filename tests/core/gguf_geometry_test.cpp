@@ -266,15 +266,15 @@ int main(int argc, char** argv) {
               "another architecture is refused by name, by the reader and the guard");
     }
     {
-        // Qwen3.8-27B's own keys (qwen35, dense): the reader names the architecture, not the first qwen4exp key it
-        // misses (which is what generate printed before the reader checked the name)
+        // Qwen3.8-27B's own keys (qwen35, dense): the qwen4exp reader names the architecture, because it is not
+        // that family's reader; the family guard reads the file (tests/core/model_family_test.cpp has the rest).
         const std::vector<fixture::Kv> dense = {
             fixture::str("general.architecture", "qwen35"), fixture::u32("qwen35.block_count", 65),
             fixture::u32("qwen35.embedding_length", 5120), fixture::u32("qwen35.feed_forward_length", 17408),
             fixture::u32("qwen35.attention.head_count", 24), fixture::u32("qwen35.attention.head_count_kv", 4)};
         const Result r = run(d.path, dense);
         check(r.read_err == "architecture is 'qwen35', this engine requires 'qwen4exp'",
-              "a dense qwen35 file is refused by its architecture: " + r.read_err);
+              "a dense qwen35 file is refused by the qwen4exp reader, naming it: " + r.read_err);
         const Result none = run(d.path, with(dense, "general.architecture", nullptr));
         check(none.read_err == "missing general.architecture", "a file without general.architecture says so");
     }
