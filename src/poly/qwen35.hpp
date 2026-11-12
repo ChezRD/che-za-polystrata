@@ -79,6 +79,9 @@ private:
         // n_kv*(head_dim/32) blocks of 16 bytes, and as many fp16 scales a row.  v_codes/v_scales stay null.
         uint8_t*  v_q4        = nullptr;
         uint16_t* v_q4_scales = nullptr;
+        // k6v4 (opt-in): k8v4's values and a six-bit key side - k_codes/k_scales stay null, the keys are
+        // n_kv*(head_dim/32) blocks of 24 packed code bytes and as many fp16 scales a row.
+        uint8_t*  k_q6        = nullptr;
         Dev sh_gate_inp;   ///< the shared expert's gate
         // The dense FFN (a qwen35 file: ffn_gate/ffn_up/ffn_down where a qwen35moe layer has the three MoE groups).
         // Fields of their own and not Layer::sh_gate/sh_up/sh_down: those three are the *shared expert's*, read by

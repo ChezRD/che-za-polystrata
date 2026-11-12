@@ -339,10 +339,20 @@ The eight-value-group geometry (16 heads on 2 KV) measured **0.978 and 0.929** a
 quantizer's own error is **max 8.1e-2, rms 2.2e-2, against q8_0's 2.0e-2 and 5.3e-3 — 3.98× and 4.09×**, which is the
 step of six bits against eight. On the per-cell id payload of the parity test (a cell's id in every key and value,
 one-hot queries, so a wrong gather is a cell-id-sized error) the same payload gives **k6v4 2.4e-5 against k8v4
-3.3e-5**, both far under the 2.5e-3 bar and both dominated by the 4-bit values, not the keys. This is a kernels-only
-format: `--kv k6v4` is not plumbed through `Engine::open`, `qwen35.cpp` or `flint.cpp`, so no model has been run on
-it and no teacher-forced top-1 exists. In this tree it is `store_q6()` + `fdec_k6v4()` + `Kvq6`, tested by
-`poly_fattn_test k6v4`.
+3.3e-5**, both far under the 2.5e-3 bar and both dominated by the 4-bit values, not the keys.
+
+**`--kv k6v4` is reachable.** It is qwen35moe's and the dense qwen35's, like k8v4: `KvFmt::kK6V4`, the `--kv`
+parser, `Qwen35::alloc_caches`, `attn_store` (with `store_q6_at`, so a recorded launch works), and the three
+attention dispatches. A six-bit key cache is read by the decode kernel and by `attend_batch`, which dequantizes its
+blocks into the fp16 workspace with `dequant_q6_to_f16`; `attend()` has no six-bit reader and refuses one rather
+than read the codes as halves, so under k6v4 the decode kernel takes every position (`fdec_from_ = 0`). Flint is
+refused: its layers keep caches of their own and this branch adds no reader for them.
+
+One gate was blind and is not now. `cuda_spill_guard` listed the `strata_*` libraries and not `strata_poly_mmq`, so
+it had never seen `fdec_kernel`; adding the library brought 21 of its instantiations into the report, all with an
+8-to-48-byte stack frame at 255 of 255 registers and no local array. **That is not this format's doing** — `main`'s
+own `fattn.cu` measures the same 16 frames, k8v4 is 8–40 bytes and k6v4 24–32 — so it is recorded as the measured
+allowance in `ALLOWED` and left to a fix that belongs in the tile loop, not here.
 
 ## The comparison with another implementation
 

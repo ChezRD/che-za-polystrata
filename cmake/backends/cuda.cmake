@@ -351,7 +351,10 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP AND NOT S
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
     set(_strata_spill_libs)
-    foreach(_t strata_kernels strata_core strata_engine strata_prefill strata_qwen35 strata_mmq strata_mmq_w4a4 strata_kq)
+    # strata_poly_mmq holds src/poly/fattn.cu's fdec_kernel and the poly decode kernels; it was not in this list
+    # until the k6v4 branch added it, so those kernels had never been under this gate.
+    foreach(_t strata_kernels strata_core strata_engine strata_prefill strata_qwen35 strata_mmq strata_mmq_w4a4 strata_kq
+              strata_poly_mmq)
       if(TARGET ${_t})
         list(APPEND _strata_spill_libs $<TARGET_FILE:${_t}>)
       endif()

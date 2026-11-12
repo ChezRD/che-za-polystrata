@@ -1642,6 +1642,11 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
     if (o.kv_format == KvFmt::kK8V4 && !qwen35 && name != "flint")
         throw std::runtime_error("--kv k8v4 is supported for qwen35moe, qwen35 and flint models; this is a '" + name +
                                  "' model");
+    // K6V4 is the same shape: the same rotated Q4_0 values, the keys at six bits.  qwen35moe and the dense qwen35
+    // only: Flint's attention keeps its own caches per layer and needs a reader this branch does not have.
+    if (o.kv_format == KvFmt::kK6V4 && !qwen35)
+        throw std::runtime_error("--kv k6v4 is supported for qwen35moe and qwen35 models; this is a '" + name +
+                                 "' model");
     // int8 and int8k are Gemma 4's: their readers are not the arithmetic q8_0's are, so a model takes one
     // family or the other rather than a choice between them.
     if (name != "gemma4" && (o.kv_format == KvFmt::kInt8 || o.kv_format == KvFmt::kInt8K))

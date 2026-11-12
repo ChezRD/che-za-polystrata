@@ -213,6 +213,12 @@ void Qwen35::alloc_caches() {
         std::fprintf(stderr, "strata-poly: k8v4 KV cache: %zu bytes a row (K %zu, V %zu)\n", k_row + v_row, k_row,
                      v_row);
     }
+    if (opt_.kv_format == KvFmt::kK6V4 && !axes_) {
+        const size_t k_row = (size_t) n_kv_ * (head_dim_ / 32) * 26;   // 24 code bytes + 2 of scale
+        const size_t v_row = (size_t) n_kv_ * (head_dim_ / 32) * 18;
+        std::fprintf(stderr, "strata-poly: k6v4 KV cache: %zu bytes a row (K %zu, V %zu)\n", k_row + v_row, k_row,
+                     v_row);
+    }
     const size_t past_n = size_t(3) * conv_dim_, s_n = size_t(v_heads_) * s_dim_ * s_dim_;
     const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
     float* st = state_;
@@ -238,6 +244,15 @@ void Qwen35::alloc_caches() {
             const size_t scales_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);  // fp16
             const size_t q4_row = (size_t) n_kv_ * (head_dim_ / 32) * 16;
             B.k_codes = (int8_t*) kv_alloc(codes_row, 1);
+            B.k_scales = (uint16_t*) kv_alloc(scales_row, 1);
+            B.v_q4 = (uint8_t*) kv_alloc(q4_row, 1);
+            B.v_q4_scales = (uint16_t*) kv_alloc(scales_row, 1);
+        } else if (opt_.kv_format == KvFmt::kK6V4) {
+            // k8v4's values, and the keys as 24 packed code bytes a 32-value block with their scales beside them
+            const size_t scales_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
+            const size_t q6_row = (size_t) n_kv_ * (head_dim_ / 32) * 24;
+            const size_t q4_row = (size_t) n_kv_ * (head_dim_ / 32) * 16;
+            B.k_q6 = (uint8_t*) kv_alloc(q6_row, 1);
             B.k_scales = (uint16_t*) kv_alloc(scales_row, 1);
             B.v_q4 = (uint8_t*) kv_alloc(q4_row, 1);
             B.v_q4_scales = (uint16_t*) kv_alloc(scales_row, 1);
@@ -276,11 +291,26 @@ void Qwen35::assign_scratch() {
     {
         score_ = fbuf((size_t) chunk_ * n_head_ * opt_.max_context);
         if (rows_ >= kStageRows) awork_ = fbuf(heads + heads / 2 + 1 + 3 * n * n_head_);   // a prompt batch's attention
-        if (rows_ >= kStageRows && (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kK8V4)) {
+        if (rows_ >= kStageRows && (opt_.kv_format == KvFmt::kQ8_0 || opt_.kv_format == KvFmt::kK8V4 ||
+                                    opt_.kv_format == KvFmt::kK6V4)) {
             // the K and V blocks a quantized prompt batch dequantizes, side by side; work_halves_ halves each
             work_halves_ = kQ8WorkRows * (size_t) n_kv_ * head_dim_;
             q8w_ = fbuf((2 * work_halves_ + 1) / 2);
         }
+    }
+    // A six-bit key cache's readers are the decode kernel and attend_batch()'s dequantizer; nothing else reads it.
+    // A run with the decode kernel off, or with the block of guesses (attn_block_pass() is attend()'s), would reach
+    // a kernel that has no six-bit key reader - so say so at load rather than from inside a layer.  Asked here, at the
+    // end of assign_scratch(), because the two switches above are settled by now (and this function runs twice, the
+    // first pass only counting bytes).
+    if (opt_.kv_format == KvFmt::kK6V4 && !axes_) {
+        if (block_guess_)
+            throw std::runtime_error("--kv k6v4 does not support the block of guesses (STRATA_BLOCK_GUESS=1): that "
+                                     "path is attend()'s, and attend() has no six-bit key reader");
+        if (!fdec_)
+            throw std::runtime_error("--kv k6v4 needs the decode kernel: it is the only kernel that reads a six-bit "
+                                     "key cache on this path (STRATA_FDEC=0 turns it off, and a card without it for "
+                                     "this shape cannot run the format)");
     }
     if (gdn_mma_.initialize([&] {
 #ifdef STRATA_POLY_GDN_MMA
@@ -317,6 +347,10 @@ void Qwen35::assign_scratch() {
     if (!(fd && std::atoi(fd) == 0) && !fdec_) {
         fdec_ = fdec_fits(head_dim_, n_head_, n_kv_, (int) opt_.max_context, (size_t) chunk_ * n_head_ * opt_.max_context);
         fdec_from_ = fd && std::atoi(fd) == 1 ? 0 : 4096;
+        // A six-bit key cache has no reader in attend(), so where the decode kernel fits it takes every position:
+        // below 4,096 the old path was the faster one, but under k6v4 the old path would have to be given a reader
+        // it does not have, and the decode kernel is the format's own.
+        if (opt_.kv_format == KvFmt::kK6V4) fdec_from_ = 0;
         if (fdec_ || (fd && std::atoi(fd) == 1))
             std::fprintf(stderr, "strata-poly: STRATA_FDEC: decode attention %s\n",
                          !fdec_ ? "unchanged (no kernel for it on this card)"
@@ -576,13 +610,20 @@ void Qwen35::attn_store(Block& B, int64_t pos, int n) {
     head_norm_rope(kraw_, head_dim_, fp(B.k_norm), k_, head_dim_, n_kv_, n_rot_, theta_scale_, first, n, rms_eps_, st_,
                    nullptr, axes, sections_, at ? at + 1 : nullptr);
     lin(B.wv, xn_, v_, n, xq_);
-    if (opt_.kv_format == KvFmt::kK8V4) {
+    if (opt_.kv_format == KvFmt::kK8V4 || opt_.kv_format == KvFmt::kK6V4) {
         // the values are rotated a head row at a time before Q4_0 (the attention's output is rotated back); the
-        // keys are q8_0's, unrotated, so the scores are q8_0's own
+        // keys are unrotated, so the scores are the key format's own - q8_0's under k8v4, six-bit under k6v4
+        const bool q6 = opt_.kv_format == KvFmt::kK6V4;
         fwht_rows(v_, v_, n * n_kv_, head_dim_, st_);
-        if (at) {
+        if (at && q6) {
+            store_q6_at(k_, B.k_q6, B.k_scales, n_kv_ * head_dim_, at, n, 0, st_);
+            store_q4_at(v_, B.v_q4, B.v_q4_scales, n_kv_ * head_dim_, at, n, 0, st_);
+        } else if (at) {
             store_q8_at(k_, B.k_codes, B.k_scales, n_kv_ * head_dim_, at, n, 0, st_);
             store_q4_at(v_, B.v_q4, B.v_q4_scales, n_kv_ * head_dim_, at, n, 0, st_);
+        } else if (q6) {
+            store_q6(k_, B.k_q6, B.k_scales, n_kv_ * head_dim_, pos, n, st_);
+            store_q4(v_, B.v_q4, B.v_q4_scales, n_kv_ * head_dim_, pos, n, st_);
         } else {
             store_q8(k_, B.k_codes, B.k_scales, n_kv_ * head_dim_, pos, n, st_);
             store_q4(v_, B.v_q4, B.v_q4_scales, n_kv_ * head_dim_, pos, n, st_);
@@ -623,8 +664,9 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
                    st_, nullptr, axes, sections_, at ? at + 1 : nullptr);
     attn_store(B, pos, n);
     const float scale = 1.f / std::sqrt((float) head_dim_);
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0, v4 = opt_.kv_format == KvFmt::kK8V4;
-    const bool quant = q8 || v4;
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0, v4 = opt_.kv_format == KvFmt::kK8V4,
+               v6 = opt_.kv_format == KvFmt::kK6V4;
+    const bool quant = q8 || v4 || v6;
     // a prompt batch through cuBLAS; a few tokens with the kernels that give a token the same bits in any company
     if (n >= kStageRows) {
         // a prompt batch: the fp16 path passes the caches where they lie (null caches and no workspace under a
@@ -634,18 +676,25 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
         uint16_t* kw = quant ? (uint16_t*) q8w_ : nullptr;
         uint16_t* vw = quant ? kw + work_halves_ : nullptr;
         const size_t score_floats = (size_t) chunk_ * n_head_ * opt_.max_context;
-        if (!(fattn_ && (v4 ? fattn_k8v4(q_, Kvq8{B.k_codes, B.k_scales}, Kvq4{B.v_q4, B.v_q4_scales}, pos, n, att_, head_dim_,
-                                          n_head_, n_kv_, scale, score_, score_floats, st_)
-                             : q8 ? fattn_q8(q_, Kvq8{B.k_codes, B.k_scales}, Kvq8{B.v_codes, B.v_scales}, pos, n,
-                                             att_, head_dim_, n_head_, n_kv_, scale, score_, score_floats, st_)
-                                  : fattn_f16(q_, B.keys, B.vals, pos, n, att_, head_dim_, n_head_, n_kv_, scale,
-                                              score_, score_floats, st_))))
+        // A six-bit key cache has no fattn_kernel (llama.cpp's reads q8_0 and fp16 blocks), so it takes the
+        // attend_batch() branch below, where its keys are dequantized into the workspace with the values.
+        if (!(fattn_ && !v6 &&
+              (v4 ? fattn_k8v4(q_, Kvq8{B.k_codes, B.k_scales}, Kvq4{B.v_q4, B.v_q4_scales}, pos, n, att_, head_dim_,
+                               n_head_, n_kv_, scale, score_, score_floats, st_)
+                  : q8 ? fattn_q8(q_, Kvq8{B.k_codes, B.k_scales}, Kvq8{B.v_codes, B.v_scales}, pos, n,
+                                  att_, head_dim_, n_head_, n_kv_, scale, score_, score_floats, st_)
+                       : fattn_f16(q_, B.keys, B.vals, pos, n, att_, head_dim_, n_head_, n_kv_, scale,
+                                   score_, score_floats, st_))))
             attend_batch(blas_, q_, kc, vc, pos, n, score_, score_floats, awork_, att_, head_dim_, n_head_, n_kv_, scale,
-                         st_, 0, 0, false, quant ? Kvq8{B.k_codes, B.k_scales} : Kvq8{},
+                         st_, 0, 0, false, v6 ? Kvq8{} : (quant ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}),
                          q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{}, kw, vw, quant ? work_halves_ : 0, nullptr,
-                         v4 ? Kvq4{B.v_q4, B.v_q4_scales} : Kvq4{});
+                         v4 || v6 ? Kvq4{B.v_q4, B.v_q4_scales} : Kvq4{},
+                         v6 ? Kvq6{B.k_q6, B.k_scales} : Kvq6{});
     } else if (!(fdec_ && pos >= fdec_from_ &&
-                 (v4 ? fdec_k8v4(q_, Kvq8{B.k_codes, B.k_scales}, Kvq4{B.v_q4, B.v_q4_scales}, pos, n, at, at ? room(n) : 0, att_,
+                 (v6 ? fdec_k6v4(q_, Kvq6{B.k_q6, B.k_scales}, Kvq4{B.v_q4, B.v_q4_scales}, pos, n, at,
+                                  at ? room(n) : 0, att_, head_dim_, n_head_, n_kv_, scale, score_,
+                                  (size_t) chunk_ * n_head_ * opt_.max_context, st_)
+                      : v4 ? fdec_k8v4(q_, Kvq8{B.k_codes, B.k_scales}, Kvq4{B.v_q4, B.v_q4_scales}, pos, n, at, at ? room(n) : 0, att_,
                                   head_dim_, n_head_, n_kv_, scale, score_,
                                   (size_t) chunk_ * n_head_ * opt_.max_context, st_)
                       : q8 ? fdec_q8(q_, Kvq8{B.k_codes, B.k_scales}, Kvq8{B.v_codes, B.v_scales}, pos, n, at,
@@ -656,10 +705,11 @@ void Qwen35::attn(Block& B, int64_t pos, int n) {
         attend(q_, quant ? nullptr : B.keys, quant ? nullptr : B.vals, pos, n, score_, chunk_, att_, head_dim_,
                n_head_, n_kv_, scale, st_, 0, 0, false, at, at ? room(n) : 0, /*score_floats*/ 0,
                quant ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{}, nullptr, /*part_floats*/ 0,
-               v4 ? Kvq4{B.v_q4, B.v_q4_scales} : Kvq4{});
+               v4 || v6 ? Kvq4{B.v_q4, B.v_q4_scales} : Kvq4{},
+               v6 ? Kvq6{B.k_q6, B.k_scales} : Kvq6{});
     // the values were rotated before they were stored: the mix of them comes back rotated, so it is turned back
     // before the gate (the gate is elementwise in the unrotated head)
-    if (v4) fwht_rows(att_, att_, n * n_head_, head_dim_, st_);
+    if (v4 || v6) fwht_rows(att_, att_, n * n_head_, head_dim_, st_);
     mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
     lin(B.wo, att_, ao_, n);
 }
@@ -674,13 +724,15 @@ void Qwen35::attn_block_pass(Block& B, int64_t pos, int n) {
     head_norm_rope(qg_, 2 * head_dim_, fp(B.q_norm), q_, head_dim_, n_head_, n_rot_, theta_scale_, first, n, rms_eps_,
                    st_, nullptr, axes, sections_, at ? at + 1 : nullptr);
     attn_store(B, pos, n);
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0, v4 = opt_.kv_format == KvFmt::kK8V4;
-    const bool quant = q8 || v4;
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0, v4 = opt_.kv_format == KvFmt::kK8V4,
+               v6 = opt_.kv_format == KvFmt::kK6V4;
+    const bool quant = q8 || v4 || v6;
     attend(q_, quant ? nullptr : B.keys, quant ? nullptr : B.vals, pos, n, score_, chunk_, att_, head_dim_, n_head_,
            n_kv_, 1.f / std::sqrt((float) head_dim_), st_, 0, 0, true, at, at ? room(n) : 0, 0,
            quant ? Kvq8{B.k_codes, B.k_scales} : Kvq8{}, q8 ? Kvq8{B.v_codes, B.v_scales} : Kvq8{}, nullptr, /*part_floats*/ 0,
-           v4 ? Kvq4{B.v_q4, B.v_q4_scales} : Kvq4{});
-    if (v4) fwht_rows(att_, att_, n * n_head_, head_dim_, st_);
+           v4 || v6 ? Kvq4{B.v_q4, B.v_q4_scales} : Kvq4{},
+           v6 ? Kvq6{B.k_q6, B.k_scales} : Kvq6{});
+    if (v4 || v6) fwht_rows(att_, att_, n * n_head_, head_dim_, st_);
     mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
     lin(B.wo, att_, ao_, n);
 }
@@ -693,8 +745,9 @@ void Qwen35::attn_rows(Block& B, int n) {
     lin(B.wk, xn_, kraw_, n, xq_);
     lin(B.wv, xn_, v_, n, xq_);
     const float scale = 1.f / std::sqrt((float) head_dim_);
-    const bool q8 = opt_.kv_format == KvFmt::kQ8_0, v4 = opt_.kv_format == KvFmt::kK8V4;
-    const bool quant = q8 || v4;
+    const bool q8 = opt_.kv_format == KvFmt::kQ8_0, v4 = opt_.kv_format == KvFmt::kK8V4,
+               v6 = opt_.kv_format == KvFmt::kK6V4;
+    const bool quant = q8 || v4 || v6;
     const size_t kv = (size_t) n_kv_ * head_dim_, hq = (size_t) n_head_ * head_dim_;
     for (int i = 0, m; i < n; i += m) {
         const Row& r = rows_of_[i];
@@ -708,11 +761,17 @@ void Qwen35::attn_rows(Block& B, int n) {
                        rms_eps_, st_, nullptr, nullptr, sections_, ai + 1);
         Kvq8 kq{}, vq{};
         Kvq4 vq4{};
+        Kvq6 kq6{};
         uint16_t *kc = nullptr, *vc = nullptr;
         if (quant) {
-            kq = {(int8_t*) seq_buf(r.seq, B.k_codes), (uint16_t*) seq_buf(r.seq, B.k_scales)};
-            store_q8_at(k_ + i * kv, (int8_t*) kq.codes, (uint16_t*) kq.scales, (int) kv, ai, m, 0, st_);
-            if (v4) {
+            if (v6) {
+                kq6 = {(uint8_t*) seq_buf(r.seq, B.k_q6), (uint16_t*) seq_buf(r.seq, B.k_scales)};
+                store_q6_at(k_ + i * kv, (uint8_t*) kq6.q6, (uint16_t*) kq6.scales, (int) kv, ai, m, 0, st_);
+            } else {
+                kq = {(int8_t*) seq_buf(r.seq, B.k_codes), (uint16_t*) seq_buf(r.seq, B.k_scales)};
+                store_q8_at(k_ + i * kv, (int8_t*) kq.codes, (uint16_t*) kq.scales, (int) kv, ai, m, 0, st_);
+            }
+            if (v4 || v6) {
                 vq4 = {(uint8_t*) seq_buf(r.seq, B.v_q4), (uint16_t*) seq_buf(r.seq, B.v_q4_scales)};
                 fwht_rows(v_ + i * kv, v_ + i * kv, m * n_kv_, head_dim_, st_);
                 store_q4_at(v_ + i * kv, (uint8_t*) vq4.q, (uint16_t*) vq4.scales, (int) kv, ai, m, 0, st_);
@@ -732,16 +791,18 @@ void Qwen35::attn_rows(Block& B, int n) {
         pos_ = keep;
         const size_t sf = (size_t) chunk_ * n_head_ * opt_.max_context;
         if (!(fdec_ && r.pos >= fdec_from_ &&
-              (v4 ? fdec_k8v4(q_ + i * hq, kq, vq4, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
+              (v6 ? fdec_k6v4(q_ + i * hq, kq6, vq4, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
+                               scale, score_, sf, st_)
+                  : v4 ? fdec_k8v4(q_ + i * hq, kq, vq4, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
                               scale, score_, sf, st_)
                   : q8 ? fdec_q8(q_ + i * hq, kq, vq, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_, n_kv_,
                                  scale, score_, sf, st_)
                        : fdec_f16(q_ + i * hq, kc, vc, r.pos, m, ai, sized, att_ + i * hq, head_dim_, n_head_,
                                   n_kv_, scale, score_, sf, st_))))
             attend(q_ + i * hq, kc, vc, r.pos, m, score_, chunk_, att_ + i * hq, head_dim_, n_head_, n_kv_, scale, st_,
-                   0, 0, false, ai, sized, 0, kq, vq, nullptr, /*part_floats*/ 0, vq4);
+                   0, 0, false, ai, sized, 0, kq, vq, nullptr, /*part_floats*/ 0, vq4, kq6);
     }
-    if (v4) fwht_rows(att_, att_, n * n_head_, head_dim_, st_);
+    if (v4 || v6) fwht_rows(att_, att_, n * n_head_, head_dim_, st_);
     mul_sigmoid(att_, qg_ + head_dim_, head_dim_, n * n_head_, 2 * head_dim_, false, st_);
     lin(B.wo, att_, ao_, n);
 }
