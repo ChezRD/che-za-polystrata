@@ -20,7 +20,7 @@
 //                              to 170,000 rows; a token alone and with others, and from a position on the card,
 //                              to the bit; and the GB/s of cache read at 4K/32K/128K/256K
 //        poly_fattn_test sweep  one token's decode cost against the context, with nothing else in the process
-//        poly_fattn_test k8v4  fdec_k8v4() (q8_0 keys, Q4_0 values) against attend() over the same cache and
+//        poly_fattn_test k8v4 [--heads N]  fdec_k8v4() (q8_0 keys, Q4_0 values) against attend() over the same cache and
 //                              against the doubles, at the same contexts and in the same GB/s terms.  Before this
 //                              the kernel had no test at all (grep -rln fdec_k8v4 over the tests was empty).
 //                              Also the two identity claims the plan rests on: k8v4's key bytes ARE store_q8's,
@@ -49,6 +49,9 @@ constexpr int kDim = 256, kKvHeads = 2, kWidth = kKvHeads * kDim, kMaxRows = 131
 // The contexts row 1 and row 2 of the optimization stack's Phase 0 are judged at (OPTIMIZATION-STACK.md §0.3).
 constexpr long long kContexts[] = {4096, 32768, 131072, 262144};
 int kHeads = 16;   // gqa16 selects 32; the existing group-8 geometry remains the default
+// --heads N: run the k8v4 checks at N query heads on this file's 2 KV heads, so the groups the decode kernel now
+// serves can be checked each on its own (12 = Qwen3.8-Flash, 6 = Qwen3.8-27B dense, 8 = Qwen3.6 / Flint).
+int kHeadsArg = 0;
 constexpr size_t kScore = size_t(16) << 20;   // Qwen35's score_ (kScoreFloats)
 constexpr float kRoomBatch = 2e-2f, kRoomDoubles = 7.5e-3f;   // the bounds, as shares of the largest result (at least 1)
 
@@ -298,11 +301,12 @@ int k8v4_main() {
                nullptr, 0, 0, kq, Kvq8{}, nullptr, 0, v4);
     };
     auto dec = [&](long long pos, int n, bool on_card) {
-        int room = 1024;
-        while (room < pos + n) room *= 2;
+        // the exact row count, not a power-of-two room: a rounded room reads up to twice the cache and reports twice
+        // the work (MB-ROW-1-5.md §10 item 2).
+        const int room = (int) std::min<long long>(pos + n, kRows);
         if (on_card) cudaMemcpy(at, &pos, sizeof pos, cudaMemcpyHostToDevice);
-        return fdec_k8v4(dq, kq, v4, pos, n, on_card ? at : nullptr, std::min(room, kRows), out, kDim, kHeads,
-                         kKvHeads, scale, score, kScore, nullptr);
+        return fdec_k8v4(dq, kq, v4, pos, n, on_card ? at : nullptr, room, out, kDim, kHeads, kKvHeads, scale, score,
+                         kScore, nullptr);
     };
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0);
@@ -324,10 +328,9 @@ int k8v4_main() {
     cudaDeviceSynchronize();
     std::printf("k8v4 decode: q8_0 keys + Q4_0 values, %d B a cell against q8_0's %d B\n", kCellBytesK8V4,
                 kCellBytesQ8);
-    std::printf("%s\n", "   pos   rows   from attend()   vs doubles   GB/s read   % of 288   % of 280   "
-                        "q8_0 GB/s   ratio   ms");
+    std::printf("%s\n", "   pos   rows   from attend()   vs doubles   k8v4 vs q8_0 bits   verdict");
     int bad = 0;
-    double k8_gbs[4] = {0}, q8_gbs[4] = {0};
+
     for (int ci = 0; ci < 4; ++ci) {
         const long long pos = kContexts[ci];
         const int n = 1;
@@ -367,24 +370,17 @@ int k8v4_main() {
                     most_ref = std::max(most_ref, (float) std::fabs(ref[a] - o[i]));
                 }
             }
-        const float ms = time([&] { dec(pos, n, false); });
-        const double gbs = (double) kCellBytesK8V4 * (pos + n) / (ms * 1e6);
-        // the q8_0 arm of the same read at this context, for the ratio the row turns on
-        const Cache Kq = K;
-        const double msq = time([&] {
-            const int chunk = std::min<size_t>(4, kScore / (size_t(kHeads) * (pos + n)));
-            attend(dq, nullptr, nullptr, pos, n, score, chunk, out, kDim, kHeads, kKvHeads, scale, nullptr, 0, 0,
-                   false, nullptr, 0, 0, kq, kq, nullptr, 0, Kvq4{});
-        });
-        (void) Kq;
-        const double gbsq = (double) kCellBytesQ8 * (pos + n) / (msq * 1e6);
-        k8_gbs[ci] = gbs;
-        q8_gbs[ci] = gbsq;
+        // The correctness of this case is settled above.  Its TIMING is taken by poly_kv_read_bench, which runs one
+        // arm alone; here the attend() reference for the next context has just written tens of MB through the shared
+        // score buffer, so a time measured in this loop is the harness's, not the kernel's (measured: 14.8 ms at
+        // 256K here against 1.41 ms in the isolated bench).
+
+
+
         const bool ok = same && most <= 1e-2f && most_fd <= 1e-2f;
         bad += !ok;
-        std::printf("%s %6lld  %4d  %12.2e  %11.2e  %9.1f  %8.1f%%  %8.1f%%  %10.1f  %6.3f  %6.3f%s\n",
-                    ok ? "ok  " : "FAIL", pos, n, most, most_fd, gbs, 100.0 * gbs / 288.0, 100.0 * gbs / 280.0, gbsq,
-                    gbs / gbsq, ms, same ? "" : "  BITS DIFFER");
+        std::printf("%s %6lld  %4d  %12.2e  %11.2e  %s  %s\n", ok ? "ok  " : "FAIL", pos, n, most, most_fd,
+                    same ? "same alone and on-card" : "BITS DIFFER", ok ? "" : "<-- out of tolerance");
     }
 
     // ---- the identity: on a cache both formats hold exactly, the two decode kernels must agree to the bit.
@@ -395,6 +391,9 @@ int k8v4_main() {
     // fp16 exactly, and code +-127 decodes back to amax exactly; Q4_0 gives d = amax/8 = 127*2^-(k+3), also fp16
     // exact, and code 0 decodes to amax exactly.  Nothing is lost on either side, so any difference below is the
     // kernels' arithmetic and nothing else.  (A power of two would NOT work: 2^-6/127 is not an fp16.)
+    // 32 cells a token attends means the cache holds the 32 rows 0..31; the token's own position is 31, since a
+    // token at position p attends rows 0..p.  (The off-by-one that produced `inf` at 256K earlier, again: p + 1
+    // rows are read.)
     constexpr int kExactRows = 32;   // <= 32 cells, as the plan asks
     std::vector<float> xv((size_t) kExactRows * kWidth);
     for (int r = 0; r < kExactRows; ++r)
@@ -447,29 +446,40 @@ int k8v4_main() {
     const Kvq4 ev4{evq, evq_s};
     float* eout;
     cudaMalloc(&eout, size_t(kExactRows) * kHeads * kDim * sizeof(float));
+    // 32 CELLS is one token at position 32 attending the 32 cached cells - NOT 32 tokens.  (An earlier version
+    // passed n = kExactRows, which reads 32 tokens of queries out of a buffer that holds kMaxN = 2 and produced
+    // NaN from token 8 on; the caches were fine, the query buffer was not the shape the call assumed.)
     auto run_exact = [&](bool k8v4) {
-        cudaMemset(eout, 0, size_t(kExactRows) * kHeads * kDim * sizeof(float));
-        const bool ok = k8v4 ? fdec_k8v4(dq, ekq, ev4, 0, kExactRows, nullptr, kExactRows, eout, kDim, kHeads, kKvHeads,
-                                         scale, score, kScore, nullptr)
-                             : fdec_q8(dq, ekq, ekq, 0, kExactRows, nullptr, kExactRows, eout, kDim, kHeads, kKvHeads,
-                                       scale, score, kScore, nullptr);
-        return ok ? download(eout, size_t(kExactRows) * kHeads * kDim) : std::vector<float>();
+        cudaMemset(eout, 0, size_t(kHeads) * kDim * sizeof(float));
+        const bool ok = k8v4 ? fdec_k8v4(dq, ekq, ev4, kExactRows - 1, 1, nullptr, kExactRows, eout, kDim, kHeads,
+                                         kKvHeads, scale, score, kScore, nullptr)
+                             : fdec_q8(dq, ekq, ekq, kExactRows - 1, 1, nullptr, kExactRows, eout, kDim, kHeads,
+                                       kKvHeads, scale, score, kScore, nullptr);
+        return ok ? download(eout, size_t(kHeads) * kDim) : std::vector<float>();
     };
     const std::vector<float> oq8 = run_exact(false), ov4 = run_exact(true);
     const bool identical = !oq8.empty() && oq8 == ov4;
     float idiff = 0.f;
-    size_t ibad = 0;
+    size_t ibad = 0, ifirst = 0;
+    bool ifound = false;
     for (size_t i = 0; i < oq8.size() && i < ov4.size(); ++i)
         if (oq8[i] != ov4[i]) {
+            if (!ifound) { ifound = true; ifirst = i; }
             ++ibad;
-            idiff = std::max(idiff, std::fabs(oq8[i] - ov4[i]));
+            const float d = std::fabs(oq8[i] - ov4[i]);
+            if (d == d) idiff = std::max(idiff, d);   // NaN-safe: a NaN difference is not a magnitude
         }
-    std::printf("\nidentity (%d cells, every block an exact power of two in both formats):\n", kExactRows);
+    std::printf("\nidentity (%d cells, one token at position %d; every block an exact 127*2^-k in both formats):\n",
+                kExactRows, kExactRows - 1);
     std::printf("  the two stores hold the same numbers: %zu of %d values differ", ndiff, kExactRows * kWidth);
     if (ndiff) std::printf(" (a format difference, not a kernel one), worst %.3g", worst);
     std::printf("\n");
     std::printf("  %s: fdec_k8v4 %s fdec_q8 (%zu of %zu values differ, worst %.3g)\n", identical ? "ok  " : "FAIL",
                 identical ? "is bit-identical to" : "DIFFERS from", ibad, oq8.size(), idiff);
+    if (!identical && ifound)
+        std::printf("        first at %zu (token %zu, head %zu, dim %zu): q8 %.9g k8v4 %.9g\n", ifirst,
+                    ifirst / (size_t(kHeads) * kDim), (ifirst / kDim) % kHeads, ifirst % kDim,
+                    (double) oq8[ifirst], (double) ov4[ifirst]);
     bad += !identical;
     std::printf(bad ? "k8v4: %d failed\n" : "k8v4: all passed\n", bad);
     return bad ? 1 : 0;
@@ -670,14 +680,19 @@ int main(int argc, char** argv) {
         else if (arg == "k8v4") k8v4 = true;
         else if (arg == "sweep") sweep = true;
         else if (arg == "gqa16") kHeads = 32;
+        else if (arg == "--heads" && i + 1 < argc) kHeadsArg = std::atoi(argv[++i]);
         else {
             std::fprintf(stderr, "usage: poly_fattn_test [dec|k8v4] [gqa16]\n");
             return 2;
         }
     }
+    if (kHeadsArg > 0) kHeads = kHeadsArg;
     std::printf("query heads %d, KV heads %d, group %d\n", kHeads, kKvHeads, kHeads / kKvHeads);
+    // The refusals this checks are of shapes no kernel can take: a group fattn has no instantiation for (24 heads
+    // on 2 KV is group 12, which fdec DOES now take - see fdec_group_ok), zero KV heads, and a scratch of no floats.
+    // A shape one path accepts and another refuses is not a refusal: match it against the path it is given to.
     if (fattn_fits(kDim, 24, kKvHeads, kBatch, kScore) ||
-        fdec_fits(kDim, 24, kKvHeads, 1024, kScore) ||
+        fdec_fits(kDim, 24, kKvHeads, 1024, 0) ||
         fattn_fits(kDim, kHeads, 0, kBatch, kScore) ||
         fdec_fits(kDim, kHeads, 0, 1024, kScore) ||
         fattn_fits(kDim, kHeads, kKvHeads, kBatch, 0) ||

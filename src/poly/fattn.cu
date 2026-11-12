@@ -262,6 +262,21 @@ constexpr int kSplit = 1024;   // keys a CUDA block takes, counted from the cach
 constexpr int kTile = 64;      // keys a block takes at a time: 16 a warp
 constexpr int kDecRows = 32;   // 4 tokens x 8 heads, or 2 x 16; the scratch has the same size
 
+// The groups the decode kernel is instantiated for: 8 and 16 were the only two while every model it served was
+// one of those; 6 (Qwen3.8-27B dense) and 12 (Qwen3.8-Flash) are the same template with another Group, and 4 keeps
+// the dim-64 shapes.
+//
+// WHAT THE KERNEL ACTUALLY REQUIRES, which is weaker than it looks: rows are numbered `token * Group + head` and a
+// launch holds at most Q = MT * 16 of them (MT is 1 while the tokens' rows fit 16, else 2), so a launch carries
+// kDecRows / Group tokens and `row < Q <= kDecRows` keeps every split's scratch apart.  So any Group <= kDecRows
+// works; the group does NOT have to divide kDecRows, it only has to divide into it at least once.  Groups 6 and 12
+// carry 5 and 2 tokens a launch against 8's 4 and 16's 2, which is a slightly shorter batch and nothing else.
+bool fdec_group_ok_impl(int n_head, int kv_heads, int tokens) {
+    if (kv_heads <= 0 || n_head % kv_heads != 0) return false;
+    const int g = n_head / kv_heads;
+    return (g == 4 || g == 6 || g == 8 || g == 12 || g == 16) && tokens * g <= 2 * kDecRows && kDecRows / g >= 1;
+}
+
 __device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
@@ -692,8 +707,9 @@ bool fattn_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64
 }
 
 bool fdec_fits(int dim, int n_head, int kv_heads, int rows, size_t scratch_floats) {
-    if ((dim != 128 && dim != 256) || kv_heads <= 0 || (n_head != 8 * kv_heads && n_head != 16 * kv_heads) || rows <= 0)
-        return false;
+    // The decode kernel's group (query heads a KV head) is a template parameter whose value only has to satisfy
+    // any Group <= kDecRows that divides into it at least once (see fdec_group_ok_impl for why that is enough).
+    if ((dim != 128 && dim != 256) || kv_heads <= 0 || !fdec_group_ok_impl(n_head, kv_heads, 1) || rows <= 0) return false;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) return false;
     const size_t need = dim == 128 ? fdec_floats<128>(rows, kv_heads) : fdec_floats<256>(rows, kv_heads);
@@ -728,22 +744,39 @@ bool run_dec(const float* q, const void* kc, const uint16_t* ks, const void* vc,
 
 }  // namespace
 
+bool fdec_group_ok(int n_head, int kv_heads, int tokens) { return fdec_group_ok_impl(n_head, kv_heads, tokens); }
+
+// The group dispatch, written once instead of twice per format: every entry point differs only in vm, and the two
+// dimensions and five groups are the same five instantiations the three formats share.
+template <int D, int VM>
+bool run_dec_grp(int g, const float* q, const void* kc, const uint16_t* ks, const void* vc, const uint16_t* vs,
+                 int64_t pos, int n, const long long* at, int room, float* out, int n_head, int kv_heads, float scale,
+                 float* scratch, size_t scratch_floats, void* stream, const float* sinks) {
+    switch (g) {
+        case 4: return run_dec<D, VM, 4>(q, kc, ks, vc, vs, pos, n, at, room, out, D, n_head, kv_heads, scale, scratch,
+                                         scratch_floats, stream, sinks);
+        case 6: return run_dec<D, VM, 6>(q, kc, ks, vc, vs, pos, n, at, room, out, D, n_head, kv_heads, scale, scratch,
+                                         scratch_floats, stream, sinks);
+        case 8: return run_dec<D, VM, 8>(q, kc, ks, vc, vs, pos, n, at, room, out, D, n_head, kv_heads, scale, scratch,
+                                         scratch_floats, stream, sinks);
+        case 12: return run_dec<D, VM, 12>(q, kc, ks, vc, vs, pos, n, at, room, out, D, n_head, kv_heads, scale,
+                                           scratch, scratch_floats, stream, sinks);
+        case 16: return run_dec<D, VM, 16>(q, kc, ks, vc, vs, pos, n, at, room, out, D, n_head, kv_heads, scale,
+                                           scratch, scratch_floats, stream, sinks);
+        default: return false;
+    }
+}
+
 bool fdec_q8(const float* q, Kvq8 kq8, Kvq8 vq8, int64_t pos, int n, const long long* at, int room, float* out,
              int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream, const float* sinks) {
     if (!fdec_allowed()) return false;
     if (!kq8.scales || !vq8.scales) return false;
-    if (dim == 128)
-        return n_head == 16 * kv_heads
-                   ? run_dec<128, 1, 16>(q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room, out, dim,
-                                         n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks)
-                   : run_dec<128, 1, 8>(q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room, out, dim,
-                                        n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
-    if (dim == 256)
-        return n_head == 16 * kv_heads
-                   ? run_dec<256, 1, 16>(q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room, out, dim,
-                                         n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks)
-                   : run_dec<256, 1, 8>(q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room, out, dim,
-                                        n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
+    if (!fdec_group_ok_impl(n_head, kv_heads, 1)) return false;
+    const int g = n_head / kv_heads;
+    if (dim == 128) return run_dec_grp<128, 1>(g, q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room,
+                                               out, n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
+    if (dim == 256) return run_dec_grp<256, 1>(g, q, kq8.codes, kq8.scales, vq8.codes, vq8.scales, pos, n, at, room,
+                                               out, n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
     return false;
 }
 
@@ -751,36 +784,24 @@ bool fdec_k8v4(const float* q, Kvq8 kq8, Kvq4 vq4, int64_t pos, int n, const lon
                int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream, const float* sinks) {
     if (!fdec_allowed()) return false;
     if (!kq8.scales || !vq4.q || !vq4.scales) return false;
-    if (dim == 128)
-        return n_head == 16 * kv_heads
-                   ? run_dec<128, 2, 16>(q, kq8.codes, kq8.scales, vq4.q, vq4.scales, pos, n, at, room, out, dim,
-                                         n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks)
-                   : run_dec<128, 2, 8>(q, kq8.codes, kq8.scales, vq4.q, vq4.scales, pos, n, at, room, out, dim,
-                                        n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
-    if (dim == 256)
-        return n_head == 16 * kv_heads
-                   ? run_dec<256, 2, 16>(q, kq8.codes, kq8.scales, vq4.q, vq4.scales, pos, n, at, room, out, dim,
-                                         n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks)
-                   : run_dec<256, 2, 8>(q, kq8.codes, kq8.scales, vq4.q, vq4.scales, pos, n, at, room, out, dim,
-                                        n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
+    if (!fdec_group_ok_impl(n_head, kv_heads, 1)) return false;
+    const int g = n_head / kv_heads;
+    if (dim == 128) return run_dec_grp<128, 2>(g, q, kq8.codes, kq8.scales, vq4.q, vq4.scales, pos, n, at, room, out,
+                                               n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
+    if (dim == 256) return run_dec_grp<256, 2>(g, q, kq8.codes, kq8.scales, vq4.q, vq4.scales, pos, n, at, room, out,
+                                               n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
     return false;
 }
 
 bool fdec_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64_t pos, int n, const long long* at,
               int room, float* out, int dim, int n_head, int kv_heads, float scale, float* scratch,
               size_t scratch_floats, void* stream, const float* sinks) {
-    if (dim == 128)
-        return n_head == 16 * kv_heads
-                   ? run_dec<128, 0, 16>(q, keys, nullptr, vals, nullptr, pos, n, at, room, out, dim, n_head, kv_heads,
-                                         scale, scratch, scratch_floats, stream, sinks)
-                   : run_dec<128, 0, 8>(q, keys, nullptr, vals, nullptr, pos, n, at, room, out, dim, n_head, kv_heads,
-                                        scale, scratch, scratch_floats, stream, sinks);
-    if (dim == 256)
-        return n_head == 16 * kv_heads
-                   ? run_dec<256, 0, 16>(q, keys, nullptr, vals, nullptr, pos, n, at, room, out, dim, n_head, kv_heads,
-                                         scale, scratch, scratch_floats, stream, sinks)
-                   : run_dec<256, 0, 8>(q, keys, nullptr, vals, nullptr, pos, n, at, room, out, dim, n_head, kv_heads,
-                                        scale, scratch, scratch_floats, stream, sinks);
+    if (!fdec_group_ok_impl(n_head, kv_heads, 1)) return false;
+    const int g = n_head / kv_heads;
+    if (dim == 128) return run_dec_grp<128, 0>(g, q, keys, nullptr, vals, nullptr, pos, n, at, room, out, n_head,
+                                               kv_heads, scale, scratch, scratch_floats, stream, sinks);
+    if (dim == 256) return run_dec_grp<256, 0>(g, q, keys, nullptr, vals, nullptr, pos, n, at, room, out, n_head,
+                                               kv_heads, scale, scratch, scratch_floats, stream, sinks);
     return false;
 }
 

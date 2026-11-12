@@ -491,6 +491,11 @@ if(STRATA_NATIVE_EXPERTS)
         set_tests_properties(iq_nibble_parity_synthetic PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
       endif()
     endif()
+    # Phase 0 row 2 on the path the Qwen3.8-Flash packs run: strata's QSA decode attention over a k8v4 pool
+    # (src/kernels/qsa_decode_attn.cu), at the compiled geometry, as ns a cell and GB/s
+    add_executable(qsa_k8v4_bench src/kernels/qsa_k8v4_bench.cpp)
+    target_include_directories(qsa_k8v4_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(qsa_k8v4_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     # Phase 0 row 5 (docs/../OPTIMIZATION-STACK.md §0.3): the Q8_1 activation quantizers at the MoE path's shapes,
     # as GB/s of activations in plus int8 out (a benchmark, no test)
     add_executable(q8_1_quant_bench src/kernels/q8_1_quant_bench.cpp)

@@ -305,6 +305,17 @@ macro(strata_poly_targets)
                                                     Threads::Threads)
       add_test(NAME poly_kv_q4_test COMMAND poly_kv_q4_test)
     endif()
+    if(STRATA_BUILD_TESTS)
+      # Phase 0 row 2 (OPTIMIZATION-STACK.md §0.3): every poly KV read path for a geometry, as ns a cell and GB/s,
+      # so a model family the engine serves can be measured without editing the bench (a benchmark, no test)
+      add_executable(poly_kv_read_bench ${_strata_poly_root}/src/poly/kv_read_bench.cpp
+                                         ${_strata_poly_root}/src/poly/kernels.cu)
+      target_include_directories(poly_kv_read_bench PRIVATE ${_strata_poly_root}/include ${_strata_poly_root}/src/poly
+                                                           ${_strata_gpu_include_directories})
+      # strata_poly_mmq already holds fattn.cu (the decode and flash-attention kernels), so it is linked, not rebuilt
+      target_link_libraries(poly_kv_read_bench PRIVATE strata_poly_mmq ${_strata_gpu_blas_target}
+                                                      ${_strata_gpu_runtime_target} Threads::Threads)
+    endif()
     # --kv int8/int8k's kernels (store_int8 / attend_int8) against ggml's own quantizer and against attend() over the
     # same numbers in fp16.  The reference is ggml-cpu's quantize_row_q8_0_ref, hence the ggml links; under HIP the
     # mma tier's probes are behind STRATA_USE_HIP (the dp4a tier is what runs there anyway).
