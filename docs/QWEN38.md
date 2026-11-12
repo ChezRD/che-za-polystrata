@@ -77,9 +77,10 @@ return what a zero expert count would leave in their arrays.
 
 ## VRAM: what fits on a 16 GB card
 
-The weights are 10.93 GB and there is no expert cache to fall back on: either the file and the cache fit, or the
-load fails in `dmalloc`. Head width 256, 4 KV heads, 17 stacks (16 attention layers + the MTP block). The @256K
-column is what the *cache* would cost there, not what this card holds — see the next section for what fits.
+The weights are 10.42 GB in the file, 10.02 GiB in VRAM (`token_embd` stays in the file), and there is no expert
+cache to fall back on: either the file and the cache fit, or the load fails in `dmalloc`. Head width 256, 4 KV
+heads, 17 stacks (16 attention layers + the MTP block). The @256K column is what the *cache* would cost there, not
+what this card holds — see the next section for what fits.
 
 | KV format | bytes a token a layer | a token (17 stacks) | @32K | @128K | @256K |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -88,11 +89,13 @@ column is what the *cache* would cost there, not what this card holds — see th
 | fp16 | 4,096 | 69,632 | 2.12 GiB | 8.50 GiB | 17.00 GiB |
 
 The recurrent state does not grow with the context: 48 GDN layers × (3 × conv channels + 48 × 128 × 128) floats =
-**156.9 MB**, held as fp32 today (144 MiB a session; the fp16 follow-up halves it to 72 MiB, and
-`docs/QUANT_MICROBENCH.md` is why fp16 and not int8).
+**149.6 MiB**, held as fp32 today (the fp16 follow-up halves it to 72 MiB, and `docs/QUANT_MICROBENCH.md` is why
+fp16 and not int8). Beside it sits `snap_`, three copies of it for a drafting window: **448.9 MiB**, which
+[The context this card serves](#the-context-this-card-serves) says should not be allocated when nothing drafts.
 
-On the RTX 4060 Ti this was measured on (16,380 MiB), 10.93 GB of weights + 6.91 GiB of k8v4 KV ≈ **17.8 GiB** does
-not fit at 256K. Measured ceilings are in [The context this card serves](#the-context-this-card-serves).
+On the RTX 4060 Ti this was measured on (16,380 MiB), 10.02 GiB of weights in VRAM + 6.91 GiB of k8v4 KV ≈
+**16.9 GiB** does not fit at 256K with the desktop holding 2.9 GiB. Measured ceilings are in
+[The context this card serves](#the-context-this-card-serves).
 
 ### The KV cache is two formats here, not one
 
@@ -134,27 +137,42 @@ same 32 ids as `--no-draft`, so a guess never changes a token, only the speed.
 
 ## The context this card serves
 
-Measured on the RTX 4060 Ti (16,380 MiB, ~2.9 GiB held by the desktop), `--kv-whole` and `--vram-reserve-mib 256`,
-the largest `--max-context` that loads:
+**An earlier version of this page said 61,440 and called it the card's wall. That was wrong** — it was the ceiling
+of a run with `--kv-whole --prompt-batch 512` and a snapshot buffer nothing reads. `docs/HYPERQWEN.md` §1 has the
+reading; the numbers are here.
 
-| KV | largest context that loads | KV a layer a token | KV at that context |
-| --- | ---: | ---: | ---: |
-| k8v4 | **61,440** | 1,664 B | 1.66 GiB |
-| q8_0 | **47,104** | 2,176 B | 1.66 GiB |
-| fp16 | **26,624** | 4,096 B | 1.77 GiB |
+The weights are **10,020 MiB** in VRAM (the tensors are 10,418 MiB; `token_embd` is 398 MiB and stays in the file,
+read a row at a time). Then state 149.6 MiB, and `snap_` — the recurrent-state copies a token-guessing window needs —
+**448.9 MiB**. A token costs 28,288 B at k8v4 (17 attention stacks × 1,664 B).
 
-The three ceilings land within 0.11 GiB of each other, which is the check that they are the same limit: what is left
-of the card after the 10.9 GB file and the scratch. A token costs `17 x` those bytes, because there are **17
-attention stacks** (16 attention layers + the MTP block): 28,288 B, 36,992 B and 69,632 B a token.
+| what the engine holds | context at k8v4 |
+| --- | ---: |
+| weights + state + snap + `--prompt-batch 512` scratch | 61,440 *(measured)* |
+| weights + state + snap + `--prompt-batch 128` scratch | ~75,000 |
+| **weights + state, no snap, `--prompt-batch 128`** | **~109,400** |
+| the same, with the desktop at 1,000 MiB instead of 2,920 | ~178,000 |
 
-**No LRU eviction, no spill: a context above these does not load.** `dmalloc` fails with `no VRAM for scratch` or
-`no VRAM for the attention cache`, which is the honest answer for a dense model with no expert cache to give back.
-`--prompt-batch` above 512 also costs enough scratch to lose a few thousand tokens of context (the 61,440 figure is
-with `--prompt-batch 512`); the default of 1024 balances the other way.
+**`snap_` is allocated for every dense run and read only by a drafting window.** `alloc()` sizes it from
+`opt_.window`, `Qwen35::snaps_spread()` is true, and `kSnapPlaces` is 3, so it is 3 × 149.6 MiB whether or not the
+model drafts. `keep()` is the only reader, and `main.cpp` only calls `window()` when `lookup > 0 || e.drafts()`.
+Guarding it with `opt_.draft` returns 16,639 tokens of context for a one-line change.
+
+The other two terms are flags, not defects. `--kv-whole` gives the whole context VRAM at load and turns off the
+growing cache, so a context that does not fit fails at load instead of at the token that needs it; the default
+growing path is the right instrument for finding a ceiling. `--prompt-batch` sizes `g_`, `u_` and `h_` at
+`rows_ × 17408` floats each — 68 MiB each at the default 1024, 17 MiB at 128.
+
+**A dense model also runs with `reserve_mib_ == 0`, `budget_ == 0` and no expert arena**, because
+`fill_expert_cache()` returns at `n_moe_ == 0`. That makes `mind_vram()` dead, so nothing gives VRAM back or takes
+it as it frees. It is not a wall — `dmalloc` simply fails when the card is out — but it explains why the engine
+cannot recover from a transient squeeze the way an expert model can.
+
+k8v4 versus q8_0 versus fp16 at the same scratch: 61,440 / 47,104 / 26,624, all within 0.11 GiB of the same wall,
+which is the check that the limit is the card and not the format.
 
 ## What is not tested
 
-- **256K.** It does not fit this card: 10.93 GB of weights + 6.91 GiB of k8v4 KV ≈ 17.8 GiB against 16.0. LSA does
+- **256K.** It does not fit this card: 10.02 GiB of weights + 6.91 GiB of k8v4 KV ≈ 16.9 GiB against 16.0. LSA does
   not change that — it cuts the compute of finding keys, not the memory of storing them (see below).
 - **The MTP block's own K and V at 256K**, for the same reason.
 - **HIP, Metal and SYCL.** Only the CUDA `sm_89` build was compiled and run. The dense branch is engine code with no
@@ -178,7 +196,7 @@ GLM-5.3-Flash."
 
 **LSA cuts the cost of finding keys, not of storing them.** The paper's own words: *"It reduces the cost of finding
 the keys, not of storing them: the KV cache still grows linearly."* The cache at 256K stays 6.91 GiB (k8v4) or
-9.03 GiB (q8_0), so 10.93 GB of weights + 6.91 GiB of KV is still ~17.8 GiB and **LSA does not make 256K fit a 16 GB
+9.03 GiB (q8_0), so 10.02 GiB of weights + 6.91 GiB of KV is still ~16.9 GiB and **LSA does not make 256K fit a 16 GB
 card**. What it removes is the attention's arithmetic: at 256K, 16 attention layers over all 262,144 keys with 24
 query heads of 256 values is **~13.5 PFLOP** (2·T²·d·H). The paper's Qwen bucket setting is `k = 4,096` long-range
 keys plus `n_sink = 4` and `n_w = 512`, so a query attends to at most **4,612 of 262,144 keys = 1.76%**.

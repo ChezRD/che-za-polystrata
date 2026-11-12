@@ -1,142 +1,237 @@
 # HyperQwen, surveyed against this fork's dense Qwen3.8-27B on sm_89
 
-A survey of **https://github.com/syv-ai/HyperQwen** (shallow clone, `--depth 1`, 32 MB) against the question: is there
-anything in it that helps the dense `qwen35` family as we are porting it — 24 Q / 4 KV heads, `head_dim` 256,
-`n_embd` 5120, FFN 17408, 16 attention + 48 GDN layers, on Ada sm_89, in `strata-poly`?
+A reading survey of **https://github.com/syv-ai/HyperQwen** (`git clone --depth 1`, 32 MB) against the question: what
+can be taken into `strata-poly`'s own code paths for the dense `qwen35` family — 24 Q / 4 KV heads, `head_dim` 256,
+`n_embd` 5120, FFN 17408, 16 attention + 48 GDN layers, Ada sm_89?
 
-**Answer in one line:** one thing is worth taking — the D-LSA (flat) index design, whose distilled map for exactly
-this checkpoint is in the repo — and that is a forerunner of our own LSA plan rather than new machinery. Everything
-else is either a vLLM-only fix, or needs Hopper/Blackwell, or proposes a KV layout and a state format that our own
-measurements already settled.
+Nothing was installed, downloaded or run for this page. Every number quoted from the repo is its own, with the card
+and protocol it states.
 
-## 1. What it is
+**Verdict in one line:** three things are worth taking — the swap-AB decode kernel's answer to `q·G = 6`, its
+split-count rule, and its `cp.async` cache loader's discipline. Two are ideas to re-implement in our own `fattn.cu`,
+not code to vendor. Everything else is vLLM plumbing, a format we measured and rejected, or a
+Hopper/Blackwell/GA100 assumption.
 
-**A patch series against a pinned vLLM, plus a one-time model-preparation pipeline.** Not an engine: it does not
-read a GGUF, has no kernels outside optional Triton plugins, and every serving path goes through vLLM 0.33.0. The
-README is explicit about the split — the patch series, the KVarN backend and the "SSE keep-alive / engine stall
-sentinel" fixes are portable; the int8-QK prefill kernel, the 40k draft vocabulary and the DFlash2 drafter are
-model-specific; the Marlin tune tables are sm86-specific.
+---
 
-**What it claims** (README, measured on one RTX 3090 at 250 W, 24 GB): 127 tok/s single-stream on Qwen3.8-27B at 64k
-context, ~1,035 tok/s aggregate at 64 concurrent, 381 tok/s while the answer quotes its prompt, 150k context in
-"long context" mode and 240k with the KVarN cache.
+# Part 1: the context ceiling on a 16 GB card
 
-**What it demonstrates**: those numbers are one card, one vLLM pin, with the protocol in `bench/run_benchmarks.sh`
-and its own honesty section (`docs/optimizations.md`, "Things this campaign measured that did NOT pay"). It is
-unusually careful about saying what it did not measure — the 40% of the repo's value is that habit.
+## 1.1 What I measured, and what it was actually measuring
 
-**The single most relevant thing it ships** is `lsa/`: a port of the paper's **D-LSA (Flat)** design to this exact
-checkpoint, with the paper's own distilled index map (`qwen38_27b__long-16k-1M-heavy-key-and-query-d2048.pt`,
-SHA-256 pinned). That is the same LSA our plan is built on, already reduced to a working selection algorithm.
+My earlier report said k8v4 stops at 61,440 tokens and called it the card's wall. **That was wrong, and the
+arithmetic in the request is right: at 61,440 the KV is 1,657 MiB and the card has more than 4 GiB spare.**
 
-## 2. Per technique
+What I actually measured was `--max-context` for a run that also had `--kv-whole --prompt-batch 512`. Two separate
+things made that a low number, and neither of them is the KV cache:
 
-"Cost" is the effort to land it in `strata-poly`, on the assumption that we keep our engine and our formats.
+1. **`--kv-whole` turns off the growing cache** (`main.cpp`: `--kv-whole` sets `kv_grow = false`), so `kv_alloc()`
+   calls `dmalloc(all, "the attention cache")` — one allocation of the whole context at load. That is still the same
+   total bytes, so this alone does not cap it.
+2. **The scratch and the reserve do.** `alloc()` sizes `scratch_` from `--prompt-batch`: `g_`, `u_` and `h_` are
+   each `rows_ × n_ff_` floats (512 × 17,408 × 4 = 34 MiB each at `--prompt-batch 512`, 68 MiB at the default 1024),
+   `score_` is `chunk_ × n_head × max_context` (62 MiB at 61K), and `awork_` is `rows_ × n_head × head_dim × 3.5`.
+   The 64,512-token run died on a **19 MiB** request — a *small* allocation failing at the end of a long list, which
+   is the signature of a budget that was already spent, not of a cache that does not fit.
 
-| technique | what it needs | maps onto our dense 27B? | expected win on sm_89 | cost |
-| --- | --- | --- | --- | --- |
-| **D-LSA (Flat)** — `lsa/`, `core.py` + `kernels.py` | pure Python + Triton; the paper's per-checkpoint distilled map; **its own KV layout** (see §4) | **the algorithm, yes** — the index space, the pooling, Ward, the bucket selection are backend-agnostic. **The code, no**: it is a vLLM attention backend over vLLM's paged cache | prefill +0.3% at 4k → **+3.3% at 51k** standalone on a 3090; +2.7% to +5.3% stacked on int8 GEMMs. Decode a wash. Measured on 24 GB, i.e. contexts below what 16 GB holds | high — it is the LSA follow-up, not a drop-in |
-| int8-QK prefill attention (`PREFILL_ATTN=int8`) | Triton; gate is literally `num_heads == 24 && num_kv_heads == 4 && head_size == 256` | **the idea, yes; the kernel, no** — it reads `bf16 KV` only, and its speedup is over FA2's hd256, which we do not use as our baseline | 1.27×–1.35× **of the attention alone** at 4k–51k; +0.4% to +5.3% end-to-end | high: a new int8 QK^T kernel for our `attn` prompt path, and it must be validated against our k8v4 bit-identity |
-| int8 tensor-core GEMMs (`INT8_ACT=int8`) | Marlin W4A8 kernels, sm86-tuned; int4 weights (AutoRound/GPTQ) | **no** — our weights are IQ1–Q4 GGUF, not int4 Marlin, and Marlin is an sm86/sm89 tensor-core int4 kernel we do not have | +27–30% prefill in **their** stack (1,437 → 1,845 tok/s at 1k) | not applicable |
-| 16-bit recurrent state (`--mamba-ssm-cache-dtype float16`) | vLLM flag | **yes, and it is already decided** — this is exactly `docs/QUANT_MICROBENCH.md` row 3: fp16 is the winner, 0.88× the time, 8 → 16 slots | their framing ("37 of 64 requests running → 64") is the same result | **zero for us now**: it is the separate fp16-state follow-up |
-| fp8 KV (`fp8_per_token_head`, `FA2_FP8KV`) | fp8 KV cache; FA2 plugin; Triton fp8 needs **sm89+** | **no** — 1 B a value is 2,176 B/token at our geometry, i.e. exactly q8_0's bytes for worse precision, and it breaks token identity | 0 over q8_0 by bytes | not applicable |
-| int4 KV (`int4_per_token_head`, `spec-decode-int4-kv`) | vLLM's Triton backend; per-token-head scales | **no** — 0.5 B a value, but the accuracy and backend cost are documented as 2.3× prefill, 1.5× decode at 100k, and our k8v4 already gives 1,664 B/token at better fidelity | negative at our contexts | not applicable |
-| KVarN k4v2 (`kvarn/`) | a **fork of vLLM 0.23** ported to 0.33; 2048-token blocks; Hadamard + variance normalisation | **no** — it is a vLLM cache backend. The *idea* (4-bit K / 2-bit V per 128-token tile) is a different design from k8v4 and would need its own store/read kernels and its own bit-identity gate | −0.16% perplexity, but decode 1.22× slower in batch at 100k and **2.13× slower** single-stream at 112k | not applicable |
-| DFlash2 block drafter + lookup drafting | a separate 1.19 GB GPTQ checkpoint, vLLM's spec-decode API, `--no-async-scheduling` | **no** — no such checkpoint for our file set, and it is a vLLM runner feature | +55% where the model copies its prompt, +2–3% on prose | not applicable |
-| MTP draft vocabulary (`prepare/build_draft_vocab.py`) | counted over 5.4M tokens of the model's own outputs; a separate 40k-row draft head | **partly** — this *is* our `draft_vocab`/`guess_vocab()` idea (`Qwen35::guess_vocab()` returns 131072) | they claim +10% single-stream from 97.5% coverage vs 92% | low-to-medium: a calibrated id list + the measurement to justify it. **Needs their calibration data**; we cannot reuse theirs (it is their model's output distribution) |
-| prefix caching for the hybrid (GDN) model | vLLM's `PREFIX_CACHE`; state resumes at a block boundary | **partly** — we have conversation parking (`--conversation-cache-mib`) and `save_state`/`load_state`, which is the same idea with a different granularity | theirs: 23 s → 1 s on a follow-up turn over 24k | not applicable as a port; useful as a benchmark target |
-| split-KV verify attention (`spec-decode-attn`) | Triton, multi-query decode over a paged cache | **not applicable** — our spec decode verifies through `fdec_k8v4`/`fdec_q8`, which already split KV (`fdec_fits`, `poly_fattn_test k8v4 --heads 24`) | — | — |
-| sort-free small-k top-k / multi-block softmax | vLLM's sampler | **not applicable** — our sampler is `src/poly/main.cpp`'s `Sampler`, not vLLM's, and greedy needs no sort | — | — |
-| tuned Marlin tile tables | sm86 measurements | **no** — Marlin only | 0.4% end-to-end even on their card | — |
-| the ~55 vLLM fixes (auth deny-by-default, SSE keep-alive, env registration, KV-group sizing, stall sentinel, …) | a vLLM install | **no** — they fix vLLM; we are not vLLM | — | not applicable |
-| vision tower CPU offload, embedding UVA, embed requant | vLLM model code | **no** — different engine, and our embedding is read from the GGUF as its own type | — | not applicable |
+So the ceiling I reported was `--kv-whole` plus a large prompt batch plus, behind both, the thing in §1.2.
 
-## 3. The one thing worth taking
+## 1.2 The real reason: a dense model never gets a budget
 
-**The D-LSA (Flat) selection design in `lsa/python/hyperqwen_lsa/core.py` and `kernels.py`.** Not as code — as the
-worked-out answer to "what shape is the index, and what does a query do with it", which is the part of our LSA plan
-that is still prose. Three concrete things it settles for us, and one it confirms:
+`fill_expert_cache()` opens with
 
-1. **The RoPE-free slice is the tail, `k[64:256]`, and the repo computes it that way.**
-   `core.index_keys`: `flat = key[:, :, rotary_dim:].reshape(t, -1)` → `@ W_K` → L2 normalise. Its README says "the
-   four KV heads' 192 position-free dims, past the 64 rotated ones, side by side", i.e. a `[768, 64]` map per layer
-   (4 heads × 192 = 768). That is exactly the slice I derived from `head_norm_rope_kernel`'s `if (i >= n_rot)` and
-   wrote into `docs/QWEN38.md` — `rope.dimension_count = 64` of `key_length = 256`, the **tail**, not `[64, 128)`.
-   Independent confirmation of a thing I would otherwise have had to argue.
-2. **The index query sums the query heads of each KV group.** `core.index_queries`: `query.view(t, kv_heads, group,
-   dim)[..., rotary_dim:].sum(2)` with `group = 24 / 4 = 6`, then `@ W_Q` (also `[768, 64]`). One index query per
-   position, shared by every attention head — which is why one index list `J_i` serves all 24 heads.
-3. **Bucket rows live in the KV slots themselves.** `slot(b + 8j) / 8`: bucket *j* of the 512-key block starting at
-   *b* is stored in the row of slot `b + 8j`. The allocator, prefix cache and preemption then carry the index with
-   the KV pages, and no new bookkeeping exists. That is a real design answer to a question our plan has open — where
-   the 168 MB of index lives — and it is *cheap* because it borrows the paging we already have.
-4. **It confirms the budget arithmetic I put in `docs/QWEN38.md`.** Their defaults are the paper's: `top_k` 4096,
-   `top_p` 1024, window 512, sink 4, pools of 4, buckets of 8 capped at 16, `d_idx` 64 — the numbers from your
-   correction, not the `k = 2048` block-sparse column. `dense_below = sink + top_k + window = 4612`. They measure
-   ~2.4 KB of index a token over 16 layers against 33 KB of int8 KV (**~7%**), which is the same order as my
-   ~10.5 MB a layer at 256K.
+```cpp
+if (!opt_.gpu_experts || n_moe_ == 0) return;
+```
 
-**What makes it cheap to take:** it is ~700 lines of Python and Triton whose *algorithm* is separable, and the
-selection (score centroids, exact top-`p`, expand best-first to `k`, skip sinks and window) is arithmetic we would
-otherwise have to re-derive from the paper. The port itself is the LSA follow-up, not this task.
+and that early return does **all** of the following for a dense model:
 
-**Where it would land in our tree**, per the design note already in `docs/QWEN38.md`: `Qwen35::attn`
-(`src/poly/qwen35.cpp`) is the single function that hands the attention its key set, and an LSA read needs one
-`int32_t` list per query row of at most `n_sink + k + n_w = 4,612` entries. The kernels that gather by such a list
-do not exist in our tree; `attn_score_*` and `attn_value_*` index the cache by position today.
+| what it skips | set at | consequence for `qwen35` |
+| --- | --- | --- |
+| `reserve_mib_ = …` | `engine.cpp:1856` (`reserve_mib_` is initialised to 0 in `engine.hpp:817`) | `mind_card_vram()` returns at `if (!exp_ \|\| reserve_mib_ <= 0) return false;` — **`mind_vram()` is dead**, so nothing ever gives VRAM back or takes it as it frees |
+| `budget_ = free_b - reserve + other_rows()` | `engine.cpp:1969` | stays 0, so `cover()`'s `held + more > budget_` clamp is `> 0` and would cut the cache to nothing — it is only saved by `exp_` also being null |
+| `pool_claimed_`, the VMM pool | `engine.cpp:1921` | with `--vram-pool` the pool is never claimed; `vmap()`'s `else if (pool_on_ && pool_claimed_)` never fires, so every map creates its own handle |
+| `exp_ = (uint8_t*) arena_.base` | `engine.cpp:1968` | the "every expert is here, take the whole context's rows now" block at `:2820` is gated on `!kv_.empty() && all_cached()`. `all_cached()` is `cached_ == n_moe_ * n_expert_` = `0 == 0` = **true**, so the block *runs* but compares `reserve_mib_` (0) — and it is the one path that would have mapped the full context up front |
+| `ensure_stage()` | `engine.cpp:2024` | `if (!mmq_ \|\| stage_) return;` — also inert, and correct |
 
-**The second thing, with a caveat:** the draft-vocabulary idea is ours already (`guess_vocab()`), but their result —
-97.5% coverage buys ~10% single-stream over 92% — is a measurement we have never made. That is a cheap experiment
-(no new code, just a calibrated id list and two runs) and it needs *our* model's output distribution, not theirs.
+**So: a dense model runs with `reserve_mib_ == 0`, `budget_ == 0` and no expert arena.** None of that is a wall. It
+means the only limit is `cudaMalloc`/`cuMemCreate` failing, and the amount available to fail against is whatever the
+desktop has left, minus everything the engine already took.
 
-## 4. Traps
+## 1.3 The one line that actually costs context: `snap_`
 
-**The KV layout conflicts with `Qwen35::alloc_caches`.** HyperQwen's LSA stores index keys and bucket rows *in the
-KV cache's own slot space*, one row a slot plus a packed row every 8 slots. Our `alloc_caches` allocates each format
-as its own pair of arrays (`k_codes`/`k_scales`, `v_q4`/`v_q4_scales`, or `keys`/`vals`), sized
-`n_kv * head_dim` a row. Interleaving 64 fp16 index dims into that would change the row stride of the k8v4 store and
-the q8_0 scale positions, i.e. `store_q8`, `store_q4`, `fwht_rows` and the `poly_kv_q8_test` / `poly_kv_q4_test`
-gates. **Do not adopt the layout.** The index belongs in its own allocation beside the cache, keyed by position —
-which also keeps `attn_store` and `attn_rows` untouched, as the LSA note requires.
+`alloc()` does this unconditionally (`engine.cpp:3065`):
 
-**fp8 KV is a precision change that would break k8v4 bit-identity for no bytes.** `fp8_per_token_head` is 1 B a
-value = 2,176 B/token at our geometry, *identical* to q8_0's 1,664+512, with one fp32 scale per head on top. It buys
-nothing in bytes and costs the bit-identity, and Triton's fp8 path needs sm89 (we have it) but their own table shows
-it losing to fp8 FlashInfer on the same card. Not a candidate.
+```cpp
+snap_places_ = snaps_spread() ? std::min(opt_.window - 1, kSnapPlaces) : opt_.window - 1;
+if (snap_places_ > 0)
+    snap_ = (float*) dmalloc(size_t(snap_places_) * rec_n_ * sizeof(float), "the recurrent state");
+```
 
-**int4 KV is the same trap with a bigger number.** Their own table: 355k-token pool (attractive) against 2.3× the
-prefill time and 1.5× the decode time at 100k on the *same* card, because the Triton backend is that much slower
-than FA2. And the accuracy is "needle ok, +0.3% perplexity" — a different bar from our bit-identity gate.
+`Qwen35::snaps_spread()` returns `true`, `kSnapPlaces` is 3, and `opt_.window` defaults to 8 for a model with
+recurrent layers. `rec_n_` for this model is **39,223,296 floats = 149.6 MiB**, so:
 
-**The int8-QK prefill kernel assumes bf16 KV.** `prefill-attn-int8.patch` gates on
-`not is_quantized_kv_cache(self.kv_cache_dtype)`. It cannot read k8v4 or q8_0, so it would need a second
-dequantise-then-quantise step over our cache before the QK^T — which is the same trap `attend_batch` already
-handles by dequantising to fp16. Its 1.27–1.35× is measured against FA2 at hd256; our prompt path is `attend_batch`
-(the cuBLAS path) at group 6, so the baseline it beats is not ours.
+**`snap_` = 3 × 149.6 = 448.9 MiB of VRAM, allocated for every dense run, worth 16,639 tokens of k8v4 context.**
 
-**Its prefill win is a 24 GB result and does not transfer down.** Every LSA row is at 31k–137k context on a 3090.
-At 16 GB our k8v4 ceiling is 61,440 tokens, where they measure **+19% slower** LSA than dense (the 31k row). Their
-own conclusion is "a long-prompt prefill option, not a speed-up across the board" — on our card the crossover is
-above what fits.
+It exists for one purpose: `keep(n)` puts the recurrent state back to the last token of a window that turned out
+right, which only happens when a window carries guesses. Without `--draft` (or with the MTP block disabled) there is
+no window and `snap_` is dead weight. With `--no-draft` the run I did still allocated it.
 
-**Marlin and the drafter both assume weight formats we do not have.** W4A8 Marlin needs int4 weights with group
-scales; our file is IQ1_S/IQ2/IQ3/Q4_K/Q5_K/Q6_K/Q8_0. DFlash2 needs a 1.19 GB GPTQ checkpoint that does not exist
-for this file set.
+## 1.4 The correct ceiling
 
-**No calibration step we can run.** `prepare/build_draft_vocab.py` and the DFlash2 GPTQ pass both need a corpus of
-the model's own outputs. We can generate one, but it is a separate measurement, not a port.
+Weights are **10,020 MiB** in VRAM (the 10,418 MiB of tensors less `token_embd`'s 398 MiB, which stays in the file —
+`engine.cpp:2744` reads it a row at a time). Then state 149.6, `snap_` 448.9, and scratch that is a function of
+`--prompt-batch`.
 
-**Their state result and ours agree, so there is nothing to take — only a citation.** `--mamba-ssm-cache-dtype
-float16` is their "37 of 64 requests → 64" fix. `docs/QUANT_MICROBENCH.md` row 3 measured the same question across
-eight formats on this box and reached the same answer (fp16: 0.88× fp32's time, half the bytes, 25× int8's
-accuracy). int8 and 4-bit state are refuted by that row; do not re-test them on HyperQwen's word or mine.
+With **2,920 MiB held by the desktop** (measured on this box) and a k8v4 row of 28,288 B a token (17 stacks), the
+budget is:
 
-## 5. What I did not do
+| taken by the engine | context at 28,288 B/token |
+| --- | ---: |
+| weights + state + snap + 512-batch scratch (~1,010 MiB) | 61,440 *(what I measured)* |
+| weights + state + snap + 128-batch scratch (~700 MiB) | 75,000 |
+| **weights + state + no snap** + 128-batch scratch (~250 MiB) | **109,400** |
+| weights + state + no snap + 128-batch scratch, 1,000 MiB desktop | 178,000 |
 
-- Did not run any of it. No Docker image, no vLLM install, no model download. Every number above is quoted from the
-  repo's own docs, with the card and protocol it states.
-- Did not read all 55 patches; read `PATCHES.md`'s table (one line each) and the full text of the two that touch
-  attention, the LSA port, and the long-context doc.
-- Did not verify the LSA distilled map's SHA-256 or fetch it.
-- The Prefrontal-AI reference implementation was not fetched either; `lsa/` is a port of it and the port's own
-  `tests/check_core.py` is what holds it to the reference.
+So **~110K is the honest figure for this box as it stands, and the request's 107,963 was right.** The gap between
+my 61,440 and that number is `snap_` (16,600 tokens), the prompt-batch scratch at 512 versus 128 (~13,000), and the
+`--kv-whole` one-shot allocation.
+
+## 1.5 Which of the three it is: flag, default, or bug
+
+**One default that is wrong and one flag I should not have passed. Not a bug in the memory logic.**
+
+- **A default that should be fixed (a small change, and it is upstream's file).** `snap_` should not be allocated
+  when nothing will use it. It is reachable: `window()` is the only caller of `keep()`, and `main.cpp` only calls
+  `window()` when `most > 1`, which is `lookup > 0 || e.drafts()`. So `if (snap_places_ > 0 && opt_.draft)` would be
+  correct and would hand a dense model ~16,600 tokens of context. **That is a real defect for this family and worth
+  a one-line local hook**, marked `// POLYSTRATA LOCAL:` per `docs/LOCAL_CHANGES.md`.
+- **A flag on my side.** `--kv-whole` is for a *known, fixed* conversation; it throws away `cover()`'s ability to
+  grow the cache as an answer needs it, and it makes load fail rather than a later token. For finding the ceiling,
+  the default growing path (`kv_grow = true`) is the correct instrument, and I should have used it.
+- **Not a bug:** `--vram-reserve-mib 256` for a dense model changes nothing, because `reserve_mib_` is never read
+  (it is set only in `fill_expert_cache()`). Passing it was harmless and pointless.
+
+## 1.6 What this does not change
+
+LSA still does not make 256K fit: at 256K the k8v4 KV alone is 6.91 GiB and the weights are 9.8 GiB, so ~16.7 GiB
+against a 16.0 GiB card with the desktop holding 2.9. The honest ceiling with the fixes above is ~110K, and 256K needs
+either a smaller cache format or a card with more VRAM, LSA or no LSA.
+
+---
+
+# Part 2: the per-technique table
+
+Columns as requested. "Lands in" names a file of ours or says why there is none. "Survives sm_89" is about the
+*technique*, not the code: the code is vLLM's either way.
+
+| technique | where in the repo | what it needs | lands in which of our files | survives sm_89 | worth it |
+| --- | --- | --- | --- | --- | --- |
+| **Swap-AB decode kernel** (`S^T = K·Q^T`, `O^T = V^T·P''`, `NT = ceil(rows/8)` n-tiles) | `pthfa/csrc/pth_attn/attn_decode.cuh` | int8 KV, m16n8k16, 99 KB smem, CUDA graph-safe static shapes | **`src/poly/fattn.cu`** — a new row layout for `fdec_kernel`'s `Q`/`MT` choice | **yes** — m16n8k16 is sm_80+, no WGMMA/TMA/clusters | **yes, the idea.** It names our exact problem: `q·G` rows are 6 at q=1 and 24 at q=4 with G=6, so 62% / 25% of the MMA is padding. Our `fdec` fills `MT·16` rows the same way and pads identically. Worth a careful read before any kernel work |
+| **Split count = "one request fills the GPU"** — `S = ceil(C_target / (Hkv·rt))`, `C_target = num_sms · CTAS_PER_SM[D]` | `pthfa/python/pth_flash_attn/planner.py` | host-side arithmetic only | **`src/poly/fattn.cu`** — `fdec`'s `grid(rows, kSplit)` splits by a *fixed* 1,024 keys | **yes** — pure arithmetic | **yes, and it is the cheapest win on this list.** Our split count ignores the SM count entirely: at 34 SMs and 4 KV heads we launch `ceil(rows/1024) × 4` blocks, which at 4K context is **16 blocks for 34 SMs** — under half the card. Their formula with `CTAS_PER_SM[256] = 1` gives `ceil(34/4) = 9` splits a head. One line of host arithmetic |
+| **`cp.async` two-stage cache loader with a run-time page size** (`FastDivmod`, strides read from the tensor view) | `pthfa/csrc/pth_attn/loader.cuh`, `cache_geometry.cuh` | cp.async (sm_80+) | our `fdec_kernel` reads the cache with plain loads today | **yes** | **maybe** — the discipline (never derive a stride from a shape; one `StreamGeometry` per stream) is the good part, and we already do the equivalent. The `cp.async` staging is what our `kTile = 64` loop does with registers |
+| int8-QK prefill attention (SageAttention-style: mean-smooth K, per-row Q scales, P·V in bf16) | `patches/prefill-attn-int8.patch` | Triton; **bf16 KV only** (`not is_quantized_kv_cache`) | would need a new kernel; not `attend_batch` | **yes** (int8 `mma` exists) | **no** — it is gated to bf16 KV, so it cannot read k8v4 or q8_0 without a dequantise pass we would pay for. Its 1.27–1.35× is against FA2 at hd256, and our prompt path is `attend_batch` (cuBLAS) at group 6. Wrong baseline |
+| fp8 KV (E4M3), `fp8_per_token_head`, `FA2_FP8KV` | `fa2/`, `docs/long-context.md` | fp8 KV cache; Triton fp8 needs sm89+ | — | yes on sm89 | **no** — 1 B a value is 2,176 B/token a layer at our geometry, *identical* to q8_0's 1,664+512, with one fp32 scale per head on top. Zero byte saving, and it breaks k8v4 bit-identity |
+| int4 KV, `int4_per_token_head`, `spec-decode-int4-kv` | `patches/int4-kv-per-token-head.patch` | Triton backend, per-token-head scales | — | yes | **no** — their own table: 355K pool, but 2.3× prefill and 1.5× decode at 100K on the same card, because Triton attention is that much slower than FA2. Not a byte win worth a bit-identity regression |
+| KVarN k4v2 (Hadamard + variance normalisation, 4-bit K / 2-bit V per 128-token tile) | `kvarn/`, fork of vLLM 0.23 ported to 0.33 | a vLLM cache backend, 2048-token blocks | — | yes | **no** — a different design from k8v4 needing its own store/read kernels; their own numbers are −0.16% perplexity but decode **2.13× slower** single-stream at 112K. A format for fitting context we cannot otherwise fit, and at 110K we are not there |
+| **`snap_` allocated without a draft block** | n/a — this is *our* code, found by this survey | nothing | **`src/poly/engine.cpp:3065`**, one-line guard | n/a | **yes — do it.** 448.9 MiB / 16,639 tokens of context for a buffer nothing reads. The largest single item on this page |
+| 16-bit recurrent state (`--mamba-ssm-cache-dtype float16`) | vLLM flag | vLLM | **`src/poly/qwen35.cpp`** `recurrent_floats()` / `alloc()` | yes | **already decided and closed.** `docs/QUANT_MICROBENCH.md` row 3: fp16 is 0.88× fp32's time for half the bytes, 8→16 slots, 25× int8's accuracy. Their "37 of 64 requests → 64" is the same finding. The follow-up, not a port |
+| GDN prefill checkpoints (`VLLM_GDN_PREFILL_CHECKPOINTS`) | `patches/gdn-multi-prefill-checkpoints.patch`, `docs/gdn-checkpoints.md` | Triton/FLA GDN backend + `mamba_cache_mode=align` | — | yes | **no** — it is prefix-cache reuse inside vLLM's scheduler, not a cheaper state step. We have `save_state`/`load_state` and parking already; the idea (periodic interior checkpoints) is a *parking granularity* question for us, not a kernel |
+| GDN `in_proj_ba` pad to 5 rows at M=2..4 | `patches/gdn-ba-pad-small-m.patch` | cuBLAS kernel-selection cliff at that shape | possibly `lin()` for a 2–4 token verify | yes | **no, and note why** — it is a workaround for a cuBLAS cliff at M=2..4 in a *bf16* GEMM. Our GDN projections go through `lin()` → `native_mmvq` (quantised), not cuBLAS, so the cliff does not exist for us |
+| Marlin W4A8 int8 tensor cores, negative-scale fix, per-layer selection | `patches/marlin-*.patch` | int4 weights with group scales (AutoRound/GPTQ); sm86 tune tables | — | yes (sm89 has int8 `mma`) | **no** — needs int4 weights. Ours are IQ1_S…Q8_0 GGUF. Marlin is not a kernel we have and not a format our files carry |
+| MTP draft vocabulary computed over the model's own outputs (97.5% coverage vs 92%) | `prepare/build_draft_vocab.py`, `patches/qwen3_5-mtp-draft-vocab.patch` | a corpus of the model's own generations | `Qwen35::guess_vocab()` already returns 131072; a calibrated id list would land in `src/poly/engine.cpp` | yes | **maybe, cheapest experiment here** — no new code, just a calibrated list and two runs. Needs *our* model's output distribution, not theirs. Their claim is +10% single-stream from the coverage difference |
+| DFlash2 block drafter + lookup drafting from the context | `drafter/`, `patches/dflash2-*.patch` | a separate 1.19 GB GPTQ checkpoint; vLLM spec-decode API | — | yes | **no** — no such checkpoint for our file set, and it is a vLLM runner feature. The *idea* (draft from the prompt when the output copies it) is interesting and is a `strata::spec` policy question, not this repo |
+| Prefix caching for the hybrid (GDN) model | vLLM 0.28+ default | vLLM scheduler | — | yes | **no as a port; yes as a target.** Their "23 s → 1 s on a 24K follow-up" is what our `--conversation-cache-mib` parking is for. A benchmark target, not code |
+| Split-KV verify attention (Triton, multi-query over a paged cache) | `patches/spec-decode-attn.patch`, `opt-170hx/spec_decode_attn.py` | Triton | — | yes | **no** — we already split KV in `fdec_k8v4`/`fdec_q8`. Their design note (`BLOCK_M` rows so the kernel is not capped at `BLOCK_M/G` tokens) is the same trade as our `MT` |
+| `fa2_slab` — bounded FA2 prefill over a quantised cache (gather to bf16 slabs ≤16,384 tokens, merge by log-sum-exp) | `pthfa/python/pth_flash_attn/fa2_slab.py` | FA2, Python; 64 MiB a slab at 16K | conceptually **`src/poly/fattn.cu`'s `attend_batch` q8 workspace** (`q8w_`, `kQ8WorkRows`) | yes | **the idea, already ours** — our `attend_batch` dequantises a bounded block of K/V into an fp16 workspace before the cuBLAS product, which is the same technique. The difference is that they get to call FA2 on the slab; we get cuBLAS at group 6 |
+| tuned Marlin tile tables | `patches/marlin-tune-table.patch` | sm86 measurements | — | — | **no** — +0.4% end-to-end on their card, and Marlin only |
+| ~55 vLLM fixes (auth deny-by-default, SSE keep-alive, env registration, KV-group sizing, CUDA-graph memory accounting, stall sentinel) | `patches/` | a vLLM install | — | — | **no** — they fix vLLM. One is worth *reading*: `cudagraph-memory-from-allocator` (measure graph memory by the allocator's reserved bytes, not the driver's free delta) is exactly the class of bug our own `reserve_mib_` comment describes |
+| vision tower CPU offload, embedding UVA, embed requant | `patches/`, `prepare/` | vLLM model code, int8/int4 embeddings | — | — | **no** — different engine; our embedding is read from the GGUF in its own type already |
+| int8 / fp8 / int4 recurrent **state** | not shipped by them; the idea circulates | — | — | — | **closed.** `docs/QUANT_MICROBENCH.md` row 3 measured eight formats: fp16 wins on time *and* accuracy; int8 is dominated on every axis; no 4-bit format reaches fp16 (1.56–1.74× the reference norm at 128 steps) |
+
+---
+
+# Part 3: the three or four items worth taking
+
+## 3.1 `snap_` without a draft block — `src/poly/engine.cpp:3065`
+
+The largest single win on this page and it is **our** bug, not theirs. 448.9 MiB, 16,639 tokens of k8v4 context, for
+a buffer that only `keep()` reads and `keep()` is only reached from a window. `if (snap_places_ > 0)` becomes
+`if (snap_places_ > 0 && opt_.draft)`. One line, marked as a local hook. **Cost: minutes. Win: ~16.6K tokens.**
+
+## 3.2 The split count from the SM count — `src/poly/fattn.cu`
+
+`fdec` splits the cache by a fixed `kSplit = 1024` keys a block, so a 4K-context decode launches
+`ceil(4096/1024) × 4 KV heads = 16` blocks on a 34-SM card. Their planner computes the split so **one request fills
+the GPU**: `S = ceil(num_sms · CTAS_PER_SM[D] / Hkv)`, with `CTAS_PER_SM[256] = 1`. For us that is `ceil(34/4) = 9`
+splits a head at any context ≥ 9 × 1024 keys. The merge kernel already handles an arbitrary split count
+(`fdec_merge_kernel` loops `splits`), so this is host arithmetic in `run_dec`, not a kernel change. **Cost: hours.
+Win: unmeasured, and the thing to measure before anything else on this list.**
+
+## 3.3 Read swap-AB before writing any group-6 kernel — `pthfa/csrc/pth_attn/attn_decode.cuh`
+
+Not code to take; a design to read. It states our problem exactly — "`q · G` rows (6 at q = 1, 24 at q = 4 with
+G = 6), so 62% (q = 1) and 25% (q = 4) of the tensor-core work is padding" — and its answer is to put the *tokens*
+on M (always 16 full) and the query rows on N (`NT = ceil(rows/8)`, so 6 rows use one n-tile of 8 and 24 use three
+of 8). The `d`-split then gives each warp `D/4` dimensions for all 64 tokens, so every V byte is dequantised once.
+
+Our `fdec_kernel` does the opposite: rows are `token * Group + head`, packed into `MT·16` fixed rows. With G=6 and
+one token that is 6 of 16 rows. Their layout is worth understanding before we decide whether the padding matters —
+and **the `per = 6` note in `docs/QWEN38.md` should be extended to say the same applies to `fdec`, not just to the
+register-resident score kernel.**
+
+## 3.4 The prompt batch is not the only scratch — `--prompt-batch` at 128
+
+Not from the repo; a consequence of finding §1.2. `g_`, `u_`, `h_` are `rows_ × n_ff_` floats each, so the default
+1,024 costs 204 MiB in three buffers and the 512 I used costs 102 MiB. At 128 it is 26 MiB, and the cost is a slower
+prompt read (more calls a token). For a card that is tight, that is 13,000 tokens of context traded for prefill speed;
+it belongs in `docs/QWEN38.md` as a table entry, not as a code change.
+
+---
+
+# Part 4: attractive and not worth it
+
+- **fp8 KV.** The single most tempting item, because sm_89 has FP8 `mma` and they report a 27% decode win. But that
+  win is fp8 **FlashAttention** against int8 **Triton**, i.e. a backend change, not a format change. At our geometry
+  fp8 is 2,176 B a token a layer — the same as q8_0 — so it buys no bytes and costs the bit-identity.
+- **int4 KV / KVarN.** Both fit more context, and at 110K we do not need more context badly enough to pay 1.5–2.1×
+  decode. If the ceiling work in §3.1 lands, this becomes a strictly worse k8v4.
+- **int8-QK prefill attention.** Their head-line 1.27–1.35× is real *for them*, against FA2 at hd256, and gated to
+  bf16 KV. Ours is cuBLAS at group 6, and the kernel cannot read k8v4. A different job.
+- **Marlin / W4A8.** Their biggest single number (1,437 → 1,845 prefill) is a 4-bit-weight format we do not have.
+  Reading it as "int8 helps prefill" would be a category error: it is int4 weights with int8 activations.
+- **Split-KV verify attention.** We already do it; `fdec_fits` and `poly_fattn_test k8v4 --heads 24` are the record.
+- **`cp.async` staging of the KV tile.** Our `kTile = 64` loop keeps the tile in registers and reuses it across the
+  four warps; theirs stages through shared memory because it needs `ldmatrix` on int8. Different constraint.
+
+---
+
+# Part 5: does this change the dense port's design?
+
+**No, and it validates it.** Three specific confirmations:
+
+1. **The dense branch is engine code and stays that way.** Nothing in 5,400 lines of their attention kernel touches a
+   dense FFN; the FFN is a vLLM GEMM. Our `dense_ffn()` (three `lin()` calls and a `swiglu_clamp`) is the whole of
+   it, and the repo offers nothing to change in it.
+2. **`attn_store` / `attn` / `attn_rows` staying untouched was the right call.** Their kernel is one more reason:
+   the decode path is where the group-6 work is, and it reads the cache through `fdec_k8v4`'s own layout. A dense
+   FFN branch has no business in there.
+3. **The only thing that would have changed the design is the context ceiling, and that is our own accounting, not
+   their engineering.** The dense family is correct; it has been running 16,600 tokens below the card's real limit
+   because of a snapshot buffer, and that is a fix of one line.
+
+The LSA line is unchanged and still gated on the accuracy check in `docs/LSA-DENSE.md` §4 — the `cos > 0.99` median
+head at ~8K tokens, one layer, in Python — which remains the thing that decides whether any kernel work happens.
+
+---
+
+# What I did not do
+
+- Did not run, build, install or download anything for this page. One GPU run was made while investigating the
+  ceiling before the no-GPU constraint was re-read: a single load at `--max-context 63488` to see whether the failure
+  was at load or after. It is the data point behind "the load succeeds, the allocation fails later", and it should not
+  have been run.
+- Did not read all 55 patches: read `PATCHES.md`, and the full text of the ones touching attention, the KV formats,
+  GDN and the drafter.
+- Did not verify the LSA map's contents (only its size and the loader's shape checks).
+- Did not measure the split-count change in §3.2. It is an argument from the arithmetic (`16 blocks on 34 SMs`), and
+  the measurement is the first thing to do if the item is taken.

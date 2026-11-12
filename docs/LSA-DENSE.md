@@ -166,10 +166,11 @@ it is available.
 
 The three things that stay true and unchanged:
 
-- **LSA cuts compute, not memory.** The KV cache is still 6.91 GiB at 256K with k8v4; 10.93 GB of weights + 6.91 GiB
-  does not fit 16 GB at 256K either way. What LSA removes is attention over 262,144 keys where 4,612 will do.
-- **The KV layout in `lsa/` is not ours to adopt** (see `hyperqwen-survey.md` §4): it packs index rows into KV slots,
-  which would change the k8v4 row stride and the q8_0 scale positions. The index goes in its own allocation, keyed by
+- **LSA cuts compute, not memory.** The KV cache is still 6.91 GiB at 256K with k8v4; 10.02 GiB of weights in
+  VRAM plus that is 16.9 GiB, which does not fit 16 GB at 256K either way. What LSA removes is attention over
+  262,144 keys where 4,612 will do.
+- **The KV layout in `lsa/` is not ours to adopt** (see [HYPERQWEN.md](HYPERQWEN.md) Part 2): it packs index rows into
+  KV slots, which would change the k8v4 row stride and the q8_0 scale positions. The index goes in its own allocation, keyed by
   position.
 - **`attn_store`, `attn`, `attn_rows` were not touched by the dense port** — confirmed by inspecting the diff: the
   hunks are in `load_geometry`, `load_layer`, `layer_head`, and the four MoE stubs, and none in the attention entry
