@@ -863,6 +863,39 @@ int parity_main() {
         cudaFree(kcr4); cudaFree(ksr4); cudaFree(vqr4); cudaFree(vsr4); cudaFree(out4);
     }
 
+    // ---- 2d. MULTI-TOKEN, PARTIAL TILE.  A deadlock in the value load needed lanes that take the `key > last`
+    // exit, and every other check here ran n = 1 - one token, one tile boundary - so it never happened.  These are
+    // the positions where a tile is only partly covered: 63 and 64 (a TILE of 64), 1023/1024/1025 (a kSplit), and
+    // 1/2/3 (below the first tile), each with 2, 4 and 8 tokens.  The check is that the call returns and that a
+    // token's result does not depend on the tokens beside it (the kernel's own contract).
+    {
+        const int ns[] = {2, 4, 8};
+        const long long poss[] = {1, 2, 3, 63, 64, 1023, 1024, 1025};
+        int cases = 0;
+        for (long long pos : poss)
+            for (int n : ns) {
+                // token t alone at its own position, and the whole window together: the same bits for token 0
+                cudaMemset(out, 0x11, per_tok * rows * sizeof(float));
+                const bool ran = fdec_k8v4(dq, kq, v4, pos, n, nullptr, (int) (pos + n), out, kDim, kHeads, kKvHeads,
+                                           scale, score, score_n, nullptr);
+                if (!ran) { std::printf("FAIL smoke pos %lld n %d: refused\n", pos, n); ++bad; continue; }
+                const std::vector<float> win = download(out, per_tok);
+                cudaMemset(out, 0x22, per_tok * rows * sizeof(float));
+                fdec_k8v4(dq, kq, v4, pos, 1, nullptr, (int) (pos + 1), out, kDim, kHeads, kKvHeads, scale, score,
+                          score_n, nullptr);
+                const std::vector<float> one = download(out, per_tok);
+                const bool same = std::equal(one.begin(), one.end(), win.begin());
+                if (!same) {
+                    std::printf("FAIL smoke pos %lld n %d: token 0 changed with its neighbours\n", pos, n);
+                    ++bad;
+                }
+                ++cases;
+            }
+        std::printf("%s multi-token partial-tile smoke: %d cases (n = 2/4/8 at pos 1..1025, tile and split "
+                    "boundaries) returned, per-token results unchanged\n", bad == 0 ? "ok  " : "FAIL", cases);
+        std::fflush(stdout);
+    }
+
     // ---- 3. determinism: the same call twice, bit for bit.  Also the answer to "is the 35% bimodality at 128K and
     // 256K the kernel or the harness": the same input twice must give the same BITS, and if it does, a time that
     // moves by 35% is the machine, not the arithmetic.
