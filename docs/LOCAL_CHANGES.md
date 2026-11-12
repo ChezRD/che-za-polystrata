@@ -37,6 +37,17 @@ the Strata project's 0.2.13.1 release) is recorded in [SYNC-2026-11-11.md](SYNC-
 - 256K with the resident-budget mode: 50.19 tok/s, MTP 94.7%, 31.42 GiB page-locked, 2,522
   slots. Plain mmap without the resident budget gives 25.92 tok/s and is not the model's speed.
 
+## Qwen3.8-27B, the dense `qwen35` family
+
+- The family, the layout and the FFN are upstream-shaped and candidates for a PR: `ModelFamily::Qwen35Dense`,
+  the `qwen35` layer table, `Engine::load_shape()`'s dense widths, `Qwen35::dense_ffn()`. `docs/QWEN38.md`.
+- **`window()` takes `snap_` on the first window of more than one token** instead of `alloc()` taking it for
+  every run: one marked block, `// POLYSTRATA LOCAL: snap-alloc begin/end` in `src/poly/engine.cpp`. It is a
+  fork-local hook until upstream moves the allocation; the guard cannot be `opt_.draft` because `--lookup`
+  opens windows too (see `docs/HYPERQWEN.md` §1.5).
+- `Qwen35::guess_vocab()` returns 0 for a dense model (the whole table) and 131072 for the MoE family; the
+  token table is in code-point order, so the prefix holds 2.8% of the Cyrillic ids. `docs/QWEN38.md`.
+
 ## Upstream
 
 - IQ1_S and IQ4_NL gate/up are generic type additions and candidates for upstream PRs with

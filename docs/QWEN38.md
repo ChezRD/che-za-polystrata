@@ -135,6 +135,51 @@ the same prompt token ids). Two prompts, both identical for every token:
 **The MTP block also matches.** The same prompt with the draft block on (`--window 4` and `--window 8`) produces the
 same 32 ids as `--no-draft`, so a guess never changes a token, only the speed.
 
+All of the above was re-run on the merge commit, not taken from the branch that wrote this page: the two prompts are
+32/32 and 40/40 against the llama.cpp ids above, and `--window 4` / `--window 8` give the same 32. The load line is
+`loaded in 1.4 s; dense (no routed experts, no expert cache), 8 CPU threads`.
+
+## The token table is in code-point order, and the draft head pays for it
+
+`tokenizer.ggml.tokens` for this file is **not** ordered by frequency. Id 0 is `!`, ids 0-255 are the byte alphabet
+in GPT-2's order, and from there the ids follow **Unicode code point**, with 10 `[PAD…]` ids at the end (248,310 to
+248,319). So "the first N ids" is a prefix of the code-point range, not the N commonest tokens — and the scripts are
+distributed through it very unevenly. Counted over the 248,320 ids, decoding each with the byte-level BPE table
+(`tools/strata_tokenizer.py`), splitting at 131,072:
+
+| script | ids inside 131,072 | ids outside | % inside |
+| --- | ---: | ---: | ---: |
+| ASCII/Latin | 93,242 | 48,631 | 65.7% |
+| Cyrillic | **516** | **18,064** | **2.8%** |
+| Han | 35,024 | 20,304 | 63.3% |
+| Hangul | 266 | 6,541 | 3.9% |
+
+A token counts for a script when every non-space character in it is that script's. The Cyrillic position is the one
+that matters and it is worse than the count suggests: **146 of the 15,541 Cyrillic merges of four characters or more
+are inside** (0.9%), and the 516 inside are 58 single letters, 172 pairs and 140 triples. The rest of the long merges
+— `установленного`, `финансирования`, `экономического` — are all past the prefix.
+
+A Russian paragraph through the full table tokenizes to 92 ids, 40 of them inside 131,072 and 52 outside, and those
+52 carry **77.3%** of its bytes. So a draft head restricted to the prefix can propose Russian a letter or a pair at a
+time and almost never the merge the model actually writes.
+
+**`Qwen35::guess_vocab()` returns 0 for a dense model**, which `draft_rows()` reads as "the whole vocabulary", 248,320
+rows. The MoE `qwen35` family keeps its 131,072: the table argues the same way there, but this page measured the dense
+model only.
+
+**What it costs, measured on this card.** `output.weight` is Q4_K, 5120 × 248,320 = **682.0 MiB**, 2,880 B a row, and
+it is resident in VRAM whole either way — `upload_as` refuses any shape but the tensor's, so `draft_rows()` only
+changes how many rows the guess's `lin()` reads, not the footprint. At 288 GB/s the extra 117,248 rows are **1,172 µs
+a guess** on paper. Measured end to end on a repeated English prompt with `--window 8` and
+`--draft-vocab 131072` against `--draft-vocab 0` (5 runs each, clocks pinned at 2820 MHz), **the extra read costs
++520 µs a guess** — under half the naive figure, because the guess's head read overlaps the block's other work.
+English answers lose about 4% of their tokens a second and produce **the same ids**.
+
+**Russian gains far more than English loses.** With a Russian continuation forced token by token (`--follow`) so the
+two arms do the same work, `--draft-vocab 131072` accepted **11 of 42** guesses and `--draft-vocab 0` accepted
+**21 of 32** — 21.97 against 28.31 tokens/s, same ids. The prefix draft was not merely slower; most of its Russian
+guesses were the wrong token.
+
 ## The context this card serves
 
 **An earlier version of this page said 61,440 and called it the card's wall. That was wrong** — it was the ceiling
@@ -143,24 +188,42 @@ reading; the numbers are here.
 
 The weights are **10,020 MiB** in VRAM (the tensors are 10,418 MiB; `token_embd` is 398 MiB and stays in the file,
 read a row at a time). Then state 149.6 MiB, and `snap_` — the recurrent-state copies a token-guessing window needs —
-**448.9 MiB**. A token costs 28,288 B at k8v4 (17 attention stacks × 1,664 B).
+**448.9 MiB**, if the run opens one. A token costs 28,288 B at k8v4 (17 attention stacks × 1,664 B).
 
-| what the engine holds | context at k8v4 |
+Measured on this page's RTX 4060 Ti with `--no-draft --lookup 0 --kv k8v4 --kv-whole`, which is a run that opens no
+window: **102,400 tokens at `--prompt-batch 128`** (102,450 fails on a 140 MiB scratch request) and **94,000 at
+`--prompt-batch 512`** (94,500 fails, 368 MiB). The same two runs before `snap_` became lazy: 85,000 and 73,000. So
+the buffer was worth **+17,400 and +21,000 tokens** here, more than the 16,639 it costs on paper because freeing it
+also leaves room for the graph a first call captures.
+
+| what the engine holds | context at k8v4, `--prompt-batch 128` |
 | --- | ---: |
-| weights + state + snap + `--prompt-batch 512` scratch | 61,440 *(measured)* |
-| weights + state + snap + `--prompt-batch 128` scratch | ~75,000 |
-| **weights + state, no snap, `--prompt-batch 128`** | **~109,400** |
-| the same, with the desktop at 1,000 MiB instead of 2,920 | ~178,000 |
+| weights + state + snap, `--kv-whole` | 85,000 *(measured)* |
+| **weights + state, no snap** | **102,400** *(measured)* |
+| the same, with the desktop at 1,000 MiB instead of 3,043 | ~178,000 *(arithmetic)* |
 
-**`snap_` is allocated for every dense run and read only by a drafting window.** `alloc()` sizes it from
-`opt_.window`, `Qwen35::snaps_spread()` is true, and `kSnapPlaces` is 3, so it is 3 × 149.6 MiB whether or not the
-model drafts. `keep()` is the only reader, and `main.cpp` only calls `window()` when `lookup > 0 || e.drafts()`.
-Guarding it with `opt_.draft` returns 16,639 tokens of context for a one-line change.
+**`snap_` is now taken by `window()`, on the first window of more than one token** (`engine.cpp`, the
+`POLYSTRATA LOCAL: snap-alloc` block), and not by `alloc()`. `alloc()` sized it from `opt_.window`,
+`Qwen35::snaps_spread()` is true, and `kSnapPlaces` is 3, so it was 3 × 149.6 MiB for every dense run whether or not
+the model drafted.
+
+**The guard cannot be `opt_.draft`,** which is what this page said before the merge. `keep()` is the only reader and
+`window()` the only writer, and `main.cpp` opens a window when `most > 1`, which is `lookup > 0 || drafts()`.
+`--lookup` guesses from repeats of the conversation and defaults to **3**, so it opens windows with no draft block,
+and `keep()` restores the recurrent state for those windows too. Guarding on `opt_.draft` gave
+
+```
+strata-poly: cudaGraphInstantiate: an illegal memory access was encountered
+```
+
+on a `--no-draft --lookup 3` run: `snap_bits_` was set, `snap_at_` was null, and the recurrent kernels were handed
+`snap_at_ + (B.past - state_)`. Lazy allocation is correct for every caller and still hands a run that opens no window
+the whole buffer's worth of context.
 
 The other two terms are flags, not defects. `--kv-whole` gives the whole context VRAM at load and turns off the
-growing cache, so a context that does not fit fails at load instead of at the token that needs it; the default
-growing path is the right instrument for finding a ceiling. `--prompt-batch` sizes `g_`, `u_` and `h_` at
-`rows_ × 17408` floats each — 68 MiB each at the default 1024, 17 MiB at 128.
+growing cache, so a context that does not fit fails at load instead of at the token that needs it; it is also the only
+deterministic "does this context fit" reading, which is why the ceilings above use it. `--prompt-batch` sizes `g_`,
+`u_` and `h_` at `rows_ × 17408` floats each — 68 MiB each at the default 1024, 17 MiB at 128.
 
 **A dense model also runs with `reserve_mib_ == 0`, `budget_ == 0` and no expert arena**, because
 `fill_expert_cache()` returns at `n_moe_ == 0`. That makes `mind_vram()` dead, so nothing gives VRAM back or takes

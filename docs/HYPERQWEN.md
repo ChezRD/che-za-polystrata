@@ -73,8 +73,10 @@ recurrent layers. `rec_n_` for this model is **39,223,296 floats = 149.6 MiB**, 
 **`snap_` = 3 × 149.6 = 448.9 MiB of VRAM, allocated for every dense run, worth 16,639 tokens of k8v4 context.**
 
 It exists for one purpose: `keep(n)` puts the recurrent state back to the last token of a window that turned out
-right, which only happens when a window carries guesses. Without `--draft` (or with the MTP block disabled) there is
-no window and `snap_` is dead weight. With `--no-draft` the run I did still allocated it.
+right, which only happens when a window carries guesses. Without a guess there is no window and `snap_` is dead
+weight. With `--no-draft` the run I did still allocated it. **This was fixed after the survey: `alloc()` no longer
+takes it and `window()` does, on the first window of more than one token.** See §1.5 and §3.1 for why the guard is
+not `opt_.draft`, and `docs/QWEN38.md` for the measured ceilings.
 
 ## 1.4 The correct ceiling
 
@@ -101,13 +103,19 @@ my 61,440 and that number is `snap_` (16,600 tokens), the prompt-batch scratch a
 **One default that is wrong and one flag I should not have passed. Not a bug in the memory logic.**
 
 - **A default that should be fixed (a small change, and it is upstream's file).** `snap_` should not be allocated
-  when nothing will use it. It is reachable: `window()` is the only caller of `keep()`, and `main.cpp` only calls
-  `window()` when `most > 1`, which is `lookup > 0 || e.drafts()`. So `if (snap_places_ > 0 && opt_.draft)` would be
-  correct and would hand a dense model ~16,600 tokens of context. **That is a real defect for this family and worth
-  a one-line local hook**, marked `// POLYSTRATA LOCAL:` per `docs/LOCAL_CHANGES.md`.
+  when nothing will use it. `window()` is the only writer of it and `keep()` the only reader, and `main.cpp` opens a
+  window when `most > 1`, which is `lookup > 0 || e.drafts()`. **This page first said the guard was
+  `opt_.draft`, and that is wrong:** `--lookup` defaults to 3 and opens windows with no draft block, so
+  `if (snap_places_ > 0 && opt_.draft)` crashed a `--no-draft --lookup 3` run with an illegal memory access — the
+  recurrent kernels write through `snap_at_`, which is `snap_`, which was then null. The fix that shipped takes the
+  buffer in `window()` on the first window of more than one token instead, marked `// POLYSTRATA LOCAL:` per
+  `docs/LOCAL_CHANGES.md`; it is correct for every caller and still hands a run that opens no window the whole
+  448.9 MiB. `docs/QWEN38.md` has the measured ceilings, before and after.
 - **A flag on my side.** `--kv-whole` is for a *known, fixed* conversation; it throws away `cover()`'s ability to
-  grow the cache as an answer needs it, and it makes load fail rather than a later token. For finding the ceiling,
-  the default growing path (`kv_grow = true`) is the correct instrument, and I should have used it.
+  grow the cache as an answer needs it, and it makes load fail rather than a later token. For *using* a long context,
+  the default growing path (`kv_grow = true`) is the correct instrument. For *measuring* one, `--kv-whole` is the
+  honest one, because it makes "does this context fit" a decision at load rather than a guess about which token will
+  hit the wall — the ceilings in `docs/QWEN38.md` use it for that reason.
 - **Not a bug:** `--vram-reserve-mib 256` for a dense model changes nothing, because `reserve_mib_` is never read
   (it is set only in `fill_expert_cache()`). Passing it was harmless and pointless.
 
@@ -133,7 +141,7 @@ Columns as requested. "Lands in" names a file of ours or says why there is none.
 | fp8 KV (E4M3), `fp8_per_token_head`, `FA2_FP8KV` | `fa2/`, `docs/long-context.md` | fp8 KV cache; Triton fp8 needs sm89+ | — | yes on sm89 | **no** — 1 B a value is 2,176 B/token a layer at our geometry, *identical* to q8_0's 1,664+512, with one fp32 scale per head on top. Zero byte saving, and it breaks k8v4 bit-identity |
 | int4 KV, `int4_per_token_head`, `spec-decode-int4-kv` | `patches/int4-kv-per-token-head.patch` | Triton backend, per-token-head scales | — | yes | **no** — their own table: 355K pool, but 2.3× prefill and 1.5× decode at 100K on the same card, because Triton attention is that much slower than FA2. Not a byte win worth a bit-identity regression |
 | KVarN k4v2 (Hadamard + variance normalisation, 4-bit K / 2-bit V per 128-token tile) | `kvarn/`, fork of vLLM 0.23 ported to 0.33 | a vLLM cache backend, 2048-token blocks | — | yes | **no** — a different design from k8v4 needing its own store/read kernels; their own numbers are −0.16% perplexity but decode **2.13× slower** single-stream at 112K. A format for fitting context we cannot otherwise fit, and at 110K we are not there |
-| **`snap_` allocated without a draft block** | n/a — this is *our* code, found by this survey | nothing | **`src/poly/engine.cpp:3065`**, one-line guard | n/a | **yes — do it.** 448.9 MiB / 16,639 tokens of context for a buffer nothing reads. The largest single item on this page |
+| **`snap_` allocated without a draft block** | n/a — this is *our* code, found by this survey | nothing | **`src/poly/engine.cpp:3065`**, the lazy `window()` allocation (§3.1) | n/a | **yes — shipped.** 448.9 MiB / 16,639 tokens of context for a buffer nothing reads. The largest single item on this page. Measured: +17,400 tokens at `--prompt-batch 128`, +21,000 at 512 |
 | 16-bit recurrent state (`--mamba-ssm-cache-dtype float16`) | vLLM flag | vLLM | **`src/poly/qwen35.cpp`** `recurrent_floats()` / `alloc()` | yes | **already decided and closed.** `docs/QUANT_MICROBENCH.md` row 3: fp16 is 0.88× fp32's time for half the bytes, 8→16 slots, 25× int8's accuracy. Their "37 of 64 requests → 64" is the same finding. The follow-up, not a port |
 | GDN prefill checkpoints (`VLLM_GDN_PREFILL_CHECKPOINTS`) | `patches/gdn-multi-prefill-checkpoints.patch`, `docs/gdn-checkpoints.md` | Triton/FLA GDN backend + `mamba_cache_mode=align` | — | yes | **no** — it is prefix-cache reuse inside vLLM's scheduler, not a cheaper state step. We have `save_state`/`load_state` and parking already; the idea (periodic interior checkpoints) is a *parking granularity* question for us, not a kernel |
 | GDN `in_proj_ba` pad to 5 rows at M=2..4 | `patches/gdn-ba-pad-small-m.patch` | cuBLAS kernel-selection cliff at that shape | possibly `lin()` for a 2–4 token verify | yes | **no, and note why** — it is a workaround for a cuBLAS cliff at M=2..4 in a *bf16* GEMM. Our GDN projections go through `lin()` → `native_mmvq` (quantised), not cuBLAS, so the cliff does not exist for us |
@@ -155,8 +163,14 @@ Columns as requested. "Lands in" names a file of ours or says why there is none.
 ## 3.1 `snap_` without a draft block — `src/poly/engine.cpp:3065`
 
 The largest single win on this page and it is **our** bug, not theirs. 448.9 MiB, 16,639 tokens of k8v4 context, for
-a buffer that only `keep()` reads and `keep()` is only reached from a window. `if (snap_places_ > 0)` becomes
-`if (snap_places_ > 0 && opt_.draft)`. One line, marked as a local hook. **Cost: minutes. Win: ~16.6K tokens.**
+a buffer that only `keep()` reads and `keep()` is only reached from a window.
+
+**It shipped, but not as the one-liner this page proposed.** `if (snap_places_ > 0 && opt_.draft)` is wrong: a
+window is opened by `--lookup` (default 3) as well as by a draft block, and `keep()` reads `snap_` for those windows
+too. The guard crashed a `--no-draft --lookup 3` run with an illegal memory access (§1.5). What shipped instead is
+lazy: `window()` takes the buffer on the first window of more than one token, so a run that never opens one never
+allocates it. Measured on this card, `--prompt-batch 128`, k8v4, `--kv-whole`: **85,000 → 102,400 tokens**, and
+`--prompt-batch 512`: **73,000 → 94,000**. `docs/QWEN38.md` has the runs.
 
 ## 3.2 The split count from the SM count — `src/poly/fattn.cu`
 

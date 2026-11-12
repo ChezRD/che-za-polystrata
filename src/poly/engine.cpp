@@ -3061,10 +3061,10 @@ void Engine::alloc() {
         h_guess_ = (Likeliest*) hmalloc(sizeof(Likeliest), "pinned memory");   // likeliest() writes it
     }
     if (block_guess_) h_block_ = (Likeliest*) hmalloc((size_t) opt_.window * sizeof(Likeliest), "pinned memory");
-    // window(): the state after tokens of it, for keep(), and every token's logits
+    // window(): the state after tokens of it, for keep(), and every token's logits.  The buffer itself is taken by
+    // window(), on the first window of more than one token: see the POLYSTRATA LOCAL block there for why it is not
+    // sized here.
     snap_places_ = snaps_spread() ? std::min(opt_.window - 1, kSnapPlaces) : opt_.window - 1;
-    if (snap_places_ > 0)
-        snap_ = (float*) dmalloc(size_t(snap_places_) * rec_n_ * sizeof(float), "the recurrent state");
     // step() with guesses: every sequence's state after its first row
     if (opt_.batch_mtp && opt_.batch > 0 && rec_n_ > 0)
         step_snap_ = (float*) dmalloc(size_t(opt_.batch + 1) * rec_n_ * sizeof(float), "the recurrent state");
@@ -5640,6 +5640,18 @@ void Engine::window(const int32_t* tokens, int t) {
     if (t < 1 || t > opt_.window) throw std::logic_error("a window takes 1 to max_window() tokens");
     OnCard here(device_, split_);
     end_read();
+    // POLYSTRATA LOCAL: snap-alloc begin
+    // The recurrent state after a window's tokens, which keep() puts back when a guess was wrong.  It is taken on the
+    // first window of more than one token rather than in alloc(), because a run that opens no window never reads it
+    // and alloc() was charging every such run 448.9 MiB: kSnapPlaces copies of Qwen3.8-27B's 149.6 MiB state, which
+    // is 16,639 tokens of k8v4 context.  It cannot be guarded on opt_.draft, which is what alloc() would do: a
+    // window is opened when `most > 1`, and main.cpp's `most` is `lookup > 0 || drafts()` -- --lookup, on by default
+    // at 3, opens windows with no draft block, and keep() reads this buffer for those windows too.  Guarding on
+    // opt_.draft crashed a `--no-draft --lookup 3` run with cudaGraphInstantiate/illegal memory access, because a
+    // null snap_at_ with snap_bits_ set is a null pointer the recurrent kernels write through.
+    if (t > 1 && snap_places_ > 0 && !snap_)
+        snap_ = (float*) dmalloc(size_t(snap_places_) * rec_n_ * sizeof(float), "the recurrent state");
+    // POLYSTRATA LOCAL: snap-alloc end
     // the two ways are a choice only with experts on the CPU; a call that records launches says nothing of them
     const bool timed = t > 1 && !all_cached();
     const bool recorded = std::exchange(recorded_, false);
