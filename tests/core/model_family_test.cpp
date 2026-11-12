@@ -52,12 +52,16 @@ struct Dims {
 // Qwen3.6-35B-A3B (unsloth/Qwen3.6-35B-A3B-MTP-GGUF, every quant) and Qwen3.8-Flash-Next, as their files say
 const Dims kQwen36 = {41, 2048, 16, 2, 256, 256, 8, 512, 512, 4, 128, 16, 32, 4096, 4, 1, 0, 0, 0, 0};
 const Dims kFlashNext = {48, 2560, 24, 2, 256, 512, 10, 640, 640, 4, 128, 16, 48, 6144, 4, 0, 4, 320, 4, 128};
+// Qwen3.8-27B (unsloth/Qwen3.8-27B-GGUF, UD-IQ3_XXS): a dense qwen35 file, 64 trunk layers + 1 MTP block
+const Dims kQwen38 = {65, 5120, 24, 4, 256, 0, 0, 17408, 0, 4, 128, 16, 48, 6144, 4, 1, 0, 0, 0, 0};
 // tiny models of each family for the layout checks (every tensor F32, a few KB)
 const Dims kTiny36 = {5, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 1, 0, 0, 0, 0};
+const Dims kTiny38 = {5, 64, 2, 1, 16, 0, 0, 32, 0, 4, 8, 2, 4, 32, 4, 1, 0, 0, 0, 0};
 const Dims kTinyFlash = {8, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 0, 2, 8, 2, 8};
 
 std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
     const std::string p = std::string(arch) + ".";
+    const bool dense = std::string(arch) == "qwen35";
     std::vector<Kv> kv = {fixture::str("general.architecture", arch),
                           fixture::u32(p + "block_count", d.block_count),
                           fixture::u32(p + "embedding_length", d.embd),
@@ -65,17 +69,22 @@ std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
                           fixture::u32(p + "attention.head_count_kv", d.heads_kv),
                           fixture::u32(p + "attention.key_length", d.key_len),
                           fixture::u32(p + "attention.value_length", d.key_len),
-                          fixture::u32(p + "expert_count", d.experts),
-                          fixture::u32(p + "expert_used_count", d.used),
-                          fixture::u32(p + "expert_feed_forward_length", d.ff),
-                          fixture::u32(p + "expert_shared_feed_forward_length", d.ff_sh),
                           fixture::u32(p + "ssm.conv_kernel", d.conv),
                           fixture::u32(p + "ssm.state_size", d.state),
                           fixture::u32(p + "ssm.group_count", d.groups),
                           fixture::u32(p + "ssm.time_step_rank", d.v_heads),
                           fixture::u32(p + "ssm.inner_size", d.inner),
                           fixture::u32(p + "full_attention_interval", d.interval)};
-    if (std::string(arch) == "qwen35moe") {
+    if (dense) {
+        // a dense file carries feed_forward_length and no expert keys at all
+        kv.push_back(fixture::u32(p + "feed_forward_length", d.ff));
+    } else {
+        kv.push_back(fixture::u32(p + "expert_count", d.experts));
+        kv.push_back(fixture::u32(p + "expert_used_count", d.used));
+        kv.push_back(fixture::u32(p + "expert_feed_forward_length", d.ff));
+        kv.push_back(fixture::u32(p + "expert_shared_feed_forward_length", d.ff_sh));
+    }
+    if (std::string(arch) == "qwen35moe" || dense) {
         kv.push_back(fixture::u32(p + "nextn_predict_layers", d.nextn));
     } else {
         kv.push_back(fixture::u32(p + "hyper_connection.count", d.hc));
@@ -108,6 +117,8 @@ bool geometry_of(const fs::path& p, strata::core::ModelGeometry& g, int64_t& k, 
     return strata::core::geometry_from_gguf(f, g, k, err);
 }
 
+bool has(const std::string& s, const char* part) { return s.find(part) != std::string::npos; }
+
 std::string layout_error(const fs::path& dir, const char* arch, const Dims& d, uint64_t vocab,
                          void (*mutate)(std::vector<Tensor>&)) {
     const fs::path meta = dir / "meta.gguf";
@@ -115,7 +126,7 @@ std::string layout_error(const fs::path& dir, const char* arch, const Dims& d, u
     strata::core::ModelGeometry g;
     int64_t k = 0;
     std::string err;
-    if (std::string(arch) == "qwen35moe") {
+    if (std::string(arch) == "qwen35moe" || std::string(arch) == "qwen35") {
         if (!geometry_of(meta, g, k, err)) return "geometry: " + err;
     } else {
         // the qwen4exp guard pins Flash-Next's own block count and widths, so the tiny model's geometry is set here
@@ -209,6 +220,11 @@ int main(int argc, char** argv) {
         check(e.find("Qwen3.6-35B-A3B") != std::string::npos && e.find("does not run it yet") != std::string::npos,
               "the engine guard refuses Qwen3.6: recognised, not supported yet");
         check(strata::check_engine_architecture(b).empty(), "the engine guard runs qwen4exp");
+        const fs::path q38 = d.path / "q38.gguf";
+        fixture::write(q38, metadata("qwen35", kQwen38, 8), {});
+        const std::string e38 = strata::check_engine_architecture(strata::GgufFile(q38.string()));
+        check(e38.find("Qwen3.8-27B") != std::string::npos && e38.find("strata-poly") != std::string::npos,
+              "the engine guard refuses Qwen3.8-27B by name and points at strata-poly: " + e38);
         std::vector<Kv> kv = metadata("qwen35moe", kQwen36, 8);
         for (auto it = kv.begin(); it != kv.end(); ++it)
             if (it->key == "qwen35moe.ssm.time_step_rank") { kv.erase(it); break; }
@@ -259,9 +275,60 @@ int main(int argc, char** argv) {
               "an inconsistent ssm.inner_size is refused");
     }
     {
+        // Qwen3.8-27B: the dense qwen35 family reads, its geometry is the file's, and it has no experts at all
+        const fs::path q38 = d.path / "q38g.gguf";
+        fixture::write(q38, metadata("qwen35", kQwen38, 248320), {});
+        strata::core::ModelGeometry g;
+        int64_t k = 0;
+        std::string err;
+        const bool ok = geometry_of(q38, g, k, err);
+        check(ok, "Qwen3.8-27B geometry reads" + (ok ? std::string() : ": " + err));
+        check(g.family == strata::ModelFamily::Qwen35Dense && g.n_layers == 64 && g.n_mtp_layers == 1 &&
+                  g.n_embd == 5120,
+              "Qwen3.8-27B (dense): 64 trunk layers + 1 MTP block, hidden 5120");
+        check(g.n_qsa_layers() == 16 && g.n_gdn_layers() == 48 &&
+                  strata::core::layer_kind(g, 3) == strata::core::LayerKind::Attention &&
+                  strata::core::layer_kind(g, 64) == strata::core::LayerKind::Mtp,
+              "Qwen3.8-27B: 16 attention / 48 GDN layers, layer 64 is the MTP block");
+        check(g.ssm_k_heads == 16 && g.ssm_v_heads == 48 && g.ssm_conv_channels == 10240 && g.ssm_value_dim == 6144,
+              "Qwen3.8-27B GDN: 16 K groups, 48 V heads, conv 10240, inner 6144");
+        check(g.n_head == 24 && g.n_head_kv == 4 && g.head_dim == 256 && !g.has_indexer() && !g.has_hyper_connections(),
+              "Qwen3.8-27B attention: 24 Q / 4 KV x 256, no indexer, no hyper-connections");
+        check(g.n_expert == 0 && g.n_expert_used == 0 && k == 0 && g.n_ff == 0 && g.n_ff_shexp == 0 &&
+                  g.n_ff_dense == 17408,
+              "Qwen3.8-27B has no experts: n_ff_dense 17408, every MoE width 0, top-k 0");
+        const std::string mm = strata::core::compiled_geometry_mismatch(g);
+        check(has(mm, "the model is Qwen3.8-27B"), "Qwen3.8-27B does not match the compiled kernels: " + mm);
+        // a dense file that carries expert keys is still read as dense: feed_forward_length is the FFN's width
+        Dims with_experts = kQwen38;
+        with_experts.experts = 256;
+        const fs::path we = d.path / "q38e.gguf";
+        fixture::write(we, metadata("qwen35", with_experts, 8), {});
+        check(geometry_of(we, g, k, err) && g.n_expert_used == 0 && g.n_ff_dense == 17408,
+              "a qwen35 file with expert_count and no expert_used_count stays dense");
+    }
+    {
         // the layout tables
         check(layout_error(d.path, "qwen35moe", kTiny36, 16, nullptr).empty(),
               "a complete qwen35moe file passes its layout (incl. the nextn MTP block)");
+        check(layout_error(d.path, "qwen35", kTiny38, 16, nullptr).empty(),
+              "a complete dense qwen35 file passes its layout");
+        std::string e38 = layout_error(d.path, "qwen35", kTiny38, 16, [](std::vector<Tensor>& ts) {
+            for (auto it = ts.begin(); it != ts.end(); ++it)
+                if (it->name == "blk.1.ffn_up.weight") { ts.erase(it); break; }
+        });
+        check(e38 == "missing blk.1.ffn_up.weight", "a dense qwen35 file without ffn_up is refused");
+        e38 = layout_error(d.path, "qwen35", kTiny38, 16, [](std::vector<Tensor>& ts) {
+            ts.push_back({"blk.0.ffn_gate_inp.weight", {64, 4}, F32, 99});
+        });
+        check(has(e38, "blk.0.ffn_gate_inp.weight") && has(e38, "not in the"),
+              "a dense qwen35 file with a router tensor is refused: " + e38);
+        e38 = layout_error(d.path, "qwen35", kTiny38, 16, [](std::vector<Tensor>& ts) {
+            for (auto& t : ts)
+                if (t.name == "blk.2.ffn_gate.weight") t.shape[1] += 1;
+        });
+        check(has(e38, "blk.2.ffn_gate.weight") && has(e38, "wants"),
+              "a dense qwen35 file's wrong FFN width is refused, naming both shapes");
         const std::string ef = layout_error(d.path, "qwen4exp", kTinyFlash, 16, nullptr);
         check(ef.empty(), "a complete qwen4exp file passes its layout (hyper-connections, indexer)" +
                               (ef.empty() ? std::string() : ": " + ef));

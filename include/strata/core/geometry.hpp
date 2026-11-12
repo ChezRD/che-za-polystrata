@@ -58,6 +58,9 @@ struct ModelGeometry {
     int64_t n_ff_shexp = 640;       ///< the shared expert's FFN width (qwen4exp: equal to n_ff, read_geometry checks)
     ModelFamily family = ModelFamily::Qwen4Exp;
     int64_t n_mtp_layers = 0;       ///< MTP blocks inside the model file, after the trunk (qwen35moe: blk.40)
+    /// The dense FFN's width (`feed_forward_length`), for the families that have one instead of routed experts
+    /// (qwen35: 17408).  A field of its own because `n_ff` is the *routed expert's* width in every MoE kernel.
+    int64_t n_ff_dense = 0;
 
     constexpr bool has_indexer() const { return idx_q_heads > 0; }              ///< false: dense attention only
     constexpr bool has_hyper_connections() const { return hc > 0; }             ///< false: plain pre-norm residual
