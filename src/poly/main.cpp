@@ -1539,10 +1539,16 @@ int main(int argc, char** argv) {
         loaded = Engine::open(cmd.o);
         recovering = false;
         Engine& engine = *loaded;
-        std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU threads\n",
-                     ms_since(t0) / 1000.0, engine.cached_experts(), engine.total_experts(), engine.cached_gib(),
-                     engine.threads());
-        if (engine.ram_experts_mib() >= 0)
+        if (engine.has_experts())
+            std::fprintf(stderr, "strata-poly: loaded in %.1f s; %d of %d routed experts in VRAM (%.1f GiB), %d CPU "
+                                 "threads\n",
+                         ms_since(t0) / 1000.0, engine.cached_experts(), engine.total_experts(), engine.cached_gib(),
+                         engine.threads());
+        else
+            std::fprintf(stderr, "strata-poly: loaded in %.1f s; dense (no routed experts, no expert cache), %d CPU "
+                                 "threads\n",
+                         ms_since(t0) / 1000.0, engine.threads());
+        if (engine.has_experts() && engine.ram_experts_mib() >= 0)
             std::fprintf(stderr, "strata-poly: %lld MiB of RAM for the %.1f GiB of experts outside VRAM; the others "
                                  "come from the file cache when a token needs them (--ram-experts-mib, -1 for all)\n",
                          (long long) engine.ram_experts_mib(), engine.outside_gib());

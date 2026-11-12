@@ -352,6 +352,10 @@ public:
     /// is given back.
     void trim();
     int cached_experts() const { return cached_ + (next_ ? next_->cached_experts() : 0); }
+    /// Whether any of this engine's layers routes experts at all.  False for a dense model (qwen35), which has no
+    /// expert cache: the counters below are then 0 and `all_cached()` is vacuously true, which would read as
+    /// "every expert is here" if nothing said otherwise.
+    bool has_experts() const { return n_moe_ > 0 || (next_ && next_->has_experts()); }
     /// The RAM held for the experts outside VRAM, in MiB, as load() settled Options::ram_experts_mib (-1: all of
     /// them), and those experts' GiB.
     int64_t ram_experts_mib() const { return opt_.ram_experts_mib; }
@@ -475,9 +479,16 @@ protected:
     }
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
+    /// Whether a layer of this model routes experts at all.  False for a dense family (qwen35, Qwen3.8-27B), whose
+    /// FFN is one SwiGLU and whose draft block therefore runs its own FFN instead of the router and the shared
+    /// expert.  The draft block is shared code, so it asks this rather than the engine branching on the family.
+    virtual bool routes_experts() const { return true; }
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
     /// experts' input (xn_).
     virtual void router_scores(const Layer& L, int n);
+    /// The draft block's FFN where a layer has no routed experts (routes_experts() false): gate, up, the SwiGLU and
+    /// down, of the block's own matrices, into fo_.  A model whose layers route (the default) never calls it.
+    virtual void dense_draft_ffn(const float* x, int n) { (void) x, (void) n; }
     /// What is done to `rows` rows of logits on the card before they are copied out.
     virtual void finish_logits(float* logits, int rows) { (void) logits, (void) rows; }
     /// What a token's embedding is multiplied by on its way in.
