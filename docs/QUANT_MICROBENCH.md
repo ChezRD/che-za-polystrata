@@ -32,7 +32,7 @@ what the plan's tables use.
 
 | row | operation | metric | measured | % of 288 (280) | verdict | unlocks |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | k8v4 KV **store**: q8_0 keys + Hadamard-rotated Q4_0 values, 832 B a cell | GB/s of DRAM traffic, counting the source read | **235.1 GB/s** (82% of peak) | **81.6% (84.0%)** | **PASS**, with the bar revised | -23.5% footprint for -29% store time against q8_0 |
+| 1 | k8v4 KV **store**: q8_0 keys + Hadamard-rotated Q4_0 values, 832 B a cell | GB/s of DRAM traffic, counting the source read | **235.1 GB/s** (82% of peak) | **81.6% (84.0%)** | **PASS**, with the bar revised | the store is 23.5% smaller and 29% faster than q8_0's (the *read* is a different answer, row 2) |
 | 2 | KV **read**: decode attention over the k8v4 cache | GB/s of cache read at 256K | **152.6 GB/s** | **53.0% (54.5%)** | **FAIL** the 60% bar by 7 points; the row's finding stands | 5.4 ns a cell at 128K–256K, which sizes LSA's wider-list penalty |
 | 3 | int8 GDN recurrent state (LeapQuant's floor) | µs a layer at T=1, int8 against fp32 | **20.2 µs int8 vs 15.1–16.8 µs fp32 = 0.70–0.83×** | — (the state is L2-resident; see §2.1) | **FAIL**: below the 1.3× stop rule | **closes the LeapQuant line** on this card |
 | 4 | int8 state + compensator tokens + window buffer | — | **not run** | — | **NOT RUN — gated by row 3's FAIL** | nothing; the plan runs it only if row 3 passes |
