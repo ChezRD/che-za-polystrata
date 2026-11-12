@@ -11,9 +11,9 @@ of these survive as *mechanisms* even though their implementation does not. This
 | # | mechanism | fits our code? | the number | days | verdict |
 | --- | --- | --- | --- | ---: | --- |
 | **B** | **swap-AB decode** (`S^T = K·Q^T`, `O^T = V^T·P''`), tokens on MMA's M, query rows on N | the *idea* yes, the code no — `fdec_kernel` would be re-indexed, not rewritten | **6.25% padding at `--window 8`, 25% at `--window 4`, 62.5% at `--no-draft`.** But the kernel is **memory-bound at 11% of the roofline**, so the padding costs nothing measurable | 0 to read, 4–6 to build | **out.** The premise was wrong: the MMA is idle either way |
-| **C** | split count from SM count, `S = ceil(num_sms·CTAS_PER_SM/Hkv)` | **partly** — `kSplit` is a `constexpr` baked into three places, so it is a constant change, not a planner | `CTAS_PER_SM = 2` (register-bound, `REG:255`, 11,264 B smem). Split count reaches 68 CTAs at **17,408 tokens**; below that the card is underfilled | 1–2 | **only at ≤16K, and there decode is already fast.** The one real gain is `kSplit` 1024 → 256 |
-| **A** | int8-QK prefill (3-way int8 split, `m16n8k32`) | **no**, for a reason that is arithmetic, not porting | `Q·Kᵀ` is **0.41%** of a 32K prefill's FLOPs, **0.76%** at 61K. A 2× faster QK is **0.21% / 0.38%** end-to-end. Measured on sm_86: +1.1/+1.3%; **sm_89 unmeasured** | 8–10 | **out.** Two orders of magnitude below its own 1.6% precedent |
-| **D** | calibrated draft vocabulary | **yes**, and it is already half-built | `guess_vocab()` returns **131072 as a constant** (`qwen35.hpp:34`). The head matvec is **360 MiB / 1,311 µs** at 131072 rows against **682 MiB / 2,483 µs** at the full vocabulary. `likeliest` is one 1024-thread block | 1–2 | **in, as a measurement.** The win is bytes off the head matvec, not hit rate |
+| **C** | split count from SM count | **yes, as one constant** — `kSplit` has 4 functional sites and none of them is a planner | `CTAS_PER_SM = 2` (register-bound). 1024 fills the card at **17,408** tokens; **256 fills it at 4,352**. Blocks/SM stay 2 either way; scratch 7.6 → 30.2 MiB at 61K | 0.5 | **in, as a `constexpr` experiment.** Helps only ≤17K, worth sub-1% |
+| **A** | int8-QK prefill (3-way int8 split, `m16n8k32`) | **no**, on difficulty — the arithmetic leaves it alive | `Q·Kᵀ` is **5.83%** of a 32K dense prefill and `P·V` another 5.83%; attention is **17.7%** total. Three int8 MMAs against fp16-hi/lo's two at 2× rate is **1.33×**, worth **~1.45%** of prefill at 32K, ~2.5–3% at 61K | 8–10 | **out on cost, not share.** Real but small win, large bill |
+| **D** | calibrated draft vocabulary | **yes — the flag exists and takes a prefix** (`--draft-vocab N`, `engine.hpp:233`) | head is **52%** of a guess (360 of 694.5 MiB). 131,072 → 65,536 rows is **5.88% → 4.36%** of a 43 ms token. Plus **500 MiB of VRAM** back if `output_` becomes the gathered head — ~18,500 tokens of k8v4 | 1–2 | **in, first.** Above the 2% bar on time, and the VRAM half is bigger |
 | **E** | GDN interior checkpoints | yes, onto `save_state`/`load_state` | 149.6 MiB a state; a checkpoint every 4,096 tokens at 61K is **15 × 149.6 = 2.2 GiB** | — | **out, one paragraph below** |
 | **F** | prefix caching, as a test | already there | `--conversation-cache-mib` parks a whole conversation; theirs caches a prefix at block granularity | 0.5 | **in, as an experiment** |
 | **G** | `cudagraph-memory-from-allocator` | our accounting is **already correct** | we add the graphs to `reserve_mib_`, the same class of fix | 0 | **out — already done** |
@@ -150,6 +150,38 @@ the scratch grows linearly in the count (`part` is `splits × 4 × 32 × 256 × 
 instead of 17,408 — one constant, one rebuild, and it helps *every* context below 17K rather than needing a planner.
 Even that is a sub-1% decode change. **It is a one-line experiment to run once the card is free, not a work item.**
 
+### C.5 The `kSplit` 256 change surface, exactly
+
+`kSplit` is `constexpr int kSplit = 1024` at `fattn.cu:261` and appears at **exactly four functional sites**:
+
+| site | use | changes at 256? |
+| --- | --- | --- |
+| `:333`, `:335` | the kernel's `r0 = split * kSplit`, `r1 = min(r0 + kSplit, last + 1)` | no — it is the loop bound |
+| `:728` | `const int splits = grid(rows, kSplit)` | no — recomputed |
+| `:630` | `fdec_floats` = `grid(rows,kSplit) · kv_heads · kDecRows · (D+2)` | no — recomputed |
+| `:607` | the merge's `splits = int(p / kSplit) + 1` | no — recomputed |
+
+**Nothing else changes, because neither the register count nor the shared memory depends on `kSplit`.** Verified by
+reconstructing both from the declarations — `Qs[Q·(D+8)] + Ps[Q·(TILE+8)] + red[2][W][Q]` at `D=256, TILE=64`:
+MT=1 gives 8,448 + 2,304 + 512 = **11,264 B** and MT=2 gives **22,528 B**, both matching `cuobjdump`'s `SHARED:`
+exactly. `TILE = 64` is the tile inside the loop and is a separate constant from `kSplit`.
+
+**So the resident blocks do NOT double.** They stay **2 a SM**, register-bound at `REG:255` (32,640 of 65,536
+registers used by four warps of 255), and 256 keys a block does not touch that.
+
+What *does* change is the split count and therefore the scratch: `part` is
+`splits × kv_heads × kDecRows × (D+2)` floats, so
+
+| context | kSplit 1024 | kSplit 256 |
+| ---: | ---: | ---: |
+| 4,096 | 0.50 MiB | 2.02 MiB |
+| 17,408 | 2.14 MiB | 8.57 MiB |
+| 61,440 | 7.56 MiB | 30.23 MiB |
+
+`fdec_fits` already checks `need <= scratch_floats` (`:715`) and `score_` is `chunk_ × n_head × max_context`
+floats — at 61K that is 62 MiB, so a 30 MiB `part` fits inside it. **One `constexpr` and a rebuild**, with
+`poly_fattn_test k8v4 --heads 24` as the gate. The gain is that the card fills at 4,352 tokens instead of 17,408.
+
 ---
 
 ## A. int8-QK prefill — the recipe, and why it does not fit
@@ -195,81 +227,169 @@ instruction count is `D/32 = 8` steps a head against fp16's `D/16 = 16`, and the
 the same fraction. What changes is the *destination*: an int8 path would be a new kernel beside `attend_batch`, and
 the group-6 padding is identical.
 
-### A.4 The measured ceiling — the arithmetic that closes it
+### A.4 The share of prefill — corrected, and it does not close
 
-A dense 27B prefill at 32K, in FLOPs (causal, so `T²/2` pairs):
+**An earlier version of this section said `Q·Kᵀ` was 0.41% of a 32K prefill. That was wrong by the layer count: it
+was one layer's 6.6 TFLOP over the whole prefill, and there are 16 attention layers.** The correct table, causal
+(`T²/2` pairs), 32,768 tokens:
 
-| term | TFLOP | share |
+| component | TFLOP | share |
 | --- | ---: | ---: |
-| FFN (64 layers × 3 matrices × 5120×17408) | 1,121.5 | **69.7%** |
-| GDN (48 layers) | 364.4 | 22.7% |
-| attention projections (16 layers) | 110.0 | 6.8% |
-| `Q·Kᵀ` (16 layers, 24 heads, d=256) | **6.6** | **0.41%** |
-| `P·V` | 6.6 | 0.41% |
+| FFN (64 layers × 3 × 5120×17408) | 1,121.5 | 61.98% |
+| GDN projections (48 layers) | 364.4 | 20.14% |
+| GDN delta rule (48 layers) | 2.5 | 0.14% |
+| **`Q·Kᵀ` (16 layers, 24 heads, d=256)** | **105.6** | **5.83%** |
+| `P·V` (16 layers) | 105.6 | 5.83% |
+| attention projections (16 layers) | 110.0 | 6.08% |
+| **total** | **1,809.4** | |
 
-At **61,440** tokens the attention term grows quadratically: `Q·Kᵀ` is **23.2 TFLOP of 3,039 = 0.76%**.
+Attention is **17.7%** of a dense prefill, not 1.6%. So the arithmetic does not close the item, and A is **out on
+difficulty, not on share**: a group-6 prompt kernel at `m16n8k32` is 8–10 days, and the ceiling it buys is now
+computable.
 
-**So a perfect, free `Q·Kᵀ` — an infinite speedup — is worth 0.41% of prefill at 32K and 0.76% at 61K.** Halving
-it, the best int8 can do, is **0.21% and 0.38%**. Our measured 1.6–1.8% on Flash was paid for by the *whole* v3 path
-(which also replaced the projections' arithmetic); the dense model has no indexer and a 17,408-wide FFN that is 70%
-of the work.
+**What int8 would actually recover.** The v3 recipe is three int8 MMAs (`h`, `l`, `m`) for the non-K operand, chosen
+because three int8 MMAs cost less than the fp16 hi+lo's two. On Ada int8 `mma` is 2× fp16's rate, not sm_120's 3.1×,
+so three int8 ops are **1.5 fp16-equivalents against fp16-hi/lo's 2.0 — 1.33×**. On `Q·Kᵀ` alone that is
+`5.83% × (1 − 1/1.33) = **1.45%** of prefill` at 32K, before the group-6 kernel's own padding (6 of 16 rows, so
+another 0.63× of that), and `P·V` is a second product the recipe also covers.
 
-**Verdict: out, and not because of porting difficulty.** The dense model's prefill is an FFN GEMM problem; no
-attention kernel can move it. And the one measured datapoint on a card near ours is +1.1% / +1.3% (sm_86) — so even
-a working port would land an order of magnitude below what the QSA path already earns, on a model where the FFN is
-70% of prefill.
+At 61,440 tokens the attention share roughly doubles — `Q·Kᵀ` and `P·V` grow as `T²` while the FFN stays `T` — so
+the same 1.33× is worth perhaps **2.5–3%** there. That is the same order as the +1.1%/+1.3% measured on sm_86 and the
++1.6%/+1.8% on sm_120, which now makes sense: those were **whole-path** numbers on models whose prefill also has an
+indexer taking a share.
+
+**Verdict: out on difficulty, and the trade is honest.** 8–10 days for a new group-6 prefill kernel, to buy ~1.5% of
+prefill at 32K and ~2.5–3% at 61K, against an FFN that is 62% of the work and a GDN that is 20%. It is not the
+"0.41%, forget it" the first pass claimed — it is a real but small win with a large bill, and it should be ranked
+below the draft head (D), which is 1–2 days for a comparable slice of decode.
 
 ---
 
 ## D. Draft vocabulary — the mechanism is bytes, not hit rate
 
-### D.1 What `guess_vocab()` is
+### D.1 The finding: the machinery exists and takes a prefix
 
-`qwen35.hpp:32-34`, with the comment above it:
+**`--draft-vocab N` already does what this item needs — except that `N` is a count of the first ids.** Two places
+say so, and neither of us noticed on the first pass:
 
 ```cpp
-// English answers write no token past 77,000, Chinese prose one in twenty past 131,072, and guesses from the
-// first 131,072 still write a Chinese answer faster than from all 248,320
-int guess_vocab() const override { return 131072; }
+// engine.hpp:233-236
+int draft_rows() const {
+    const int v = opt_.draft_vocab >= 0 ? opt_.draft_vocab : guess_vocab();
+    return v > 0 ? std::min(v, n_vocab_) : n_vocab_;
+}
 ```
 
-**A hardcoded constant with an undocumented provenance** — not a frequency list, not measured on this model, not
-per-language. It is a guess about a guess.
+```cpp
+// main.cpp:1410, and the usage line at :1243
+--draft-vocab N     the block guesses among the vocabulary's first N tokens
+```
 
-### D.2 What a calibrated list needs
+So the flag exists, it is honoured, and `draft_rows()` is used as **`head.n_out = draft_rows()`** before
+`lin(head, …)` (`engine.cpp:5280`, `:5806`, `:5831`) — a row *count* on a contiguous matrix. That is the gap: the
+first 131,072 ids are whatever the tokenizer put there, not the ids a model emits. **`guess_vocab()` is
+`return 131072` (`qwen35.hpp:34`) with a comment whose provenance is not recorded** — a prefix picked for a reason
+nobody wrote down.
 
-It must come from **a corpus of the model's own output**: a token outside the list can never be proposed, so the list
-is a statement about the output distribution. It cannot be derived from the MTP block's weights — those say which
-tokens the block can *score*, not which the target will *write*, and the two differ exactly where a calibration
-would help.
+`native_mmvq` reads its weight block **contiguously** (`native_mmvq.cu:3908` takes `const void* weights` and
+`n_out`; the launch walks rows from the base). A prefix therefore works for free and an arbitrary id set does not.
 
-The cheap version: run the model over a few thousand tokens of its own generations, histogram the ids, take the
-smallest prefix-plus-set that covers 97.5%. The 131072 constant is a *prefix*, which is the wrong shape as well as
-the wrong size — the common tokens are not contiguous in this vocabulary.
+### D.2 Where the draft's time actually goes
 
-### D.3 The mechanism, and whether our bottleneck is theirs
+One guess, one row, is a pass through the MTP block plus the head matvec (`draft_rows_of`, `engine.cpp:5224`). Byte
+counts from this GGUF's own tensor types, time at 288 GB/s:
 
-Their framing is "coverage 92% → 97.5%, +10% speed". Ours is different in a way that matters:
+| stage | tensor | MiB | µs |
+| --- | --- | ---: | ---: |
+| `d_proj_` | `blk.64.nextn.eh_proj` Q6_K | 41.0 | 149 |
+| `attn_q` | `blk.64.attn_q` Q6_K | 49.2 | 179 |
+| `attn_k` / `attn_v` | Q8_0 ×2 | 10.6 | 39 |
+| `attn_output` | `blk.64.attn_output` Q6_K | 24.6 | 90 |
+| `ffn_gate` / `ffn_up` / `ffn_down` | Q6_K ×3 | 209.1 | 761 |
+| **block subtotal** | | **334.5** | **1,218** |
+| **head matvec** | `output.weight` Q4_K, `draft_rows()` rows | **360.0** | **1,311** |
+| **total, one guess** | | **694.5** | **2,529** |
 
-- **`draft_rows()` (`engine.hpp:233`) is the head matvec's row count**, not a softmax width.
-  `head.n_out = draft_rows(); lin(head, …)` (`engine.cpp:5280`, `:5806`).
-- The head is `output.weight`, Q4_K, 5120 × n_out. At 131,072 rows that is **360 MiB read a guess**, at 288 GB/s
-  **1,311 µs**; at the full 248,320 rows **682 MiB / 2,483 µs**. **The vocabulary size is the whole cost of a draft**,
-  and it is a bandwidth cost, not a softmax cost.
-- `likeliest` (`kernels.cu:2305`) is **one block of 1,024 threads** over `n_out` floats — 512 KiB at 131,072 —
-  and it does compute a softmax, but a truncated one: it sums `expf(x - m)` only over `x > m - 20` and returns
-  `prob = 1/sum` beside the argmax. **Its cost is a single block's read of `n_out` floats, not a full-vocabulary
-  reduction**, so it does not scale the way a real softmax would; the matvec is what costs.
+**The head is 52% of a guess and the block is 48%.** So a vocabulary cut touches **at most half** the cost of a
+draft — and the block half is irreducible without quantising the MTP block itself, which is a different item.
 
-**So the mechanism worth taking is "a smaller, calibrated `n_out`", and its win is linear in bytes.** Their +10%
-came from their coverage gap; ours would come from shrinking 360 MiB toward the ~92% the constant already covers.
+The `Likeliest` selection is not a cost: `likeliest` (`kernels.cu:2305`) is one block of 1,024 threads over
+`n_out` floats, 512 KiB at 131,072 — 1.8 µs of bandwidth, and it is an argmax with a truncated softmax
+(`expf(x - m)` only over `x > m − 20`), not a full-vocabulary reduction. The pinned handoff is one `Likeliest`
+struct. **Neither scales with the vocabulary in a way that matters.**
 
-**One caveat on their number transferring.** Their +10% is on a *speculating* server where every draft costs a chain
-step; our bottleneck is the same shape (bytes a draft) but the constant is already 131,072 — 53% of the vocabulary —
-so the headroom is from 360 MiB down to the ~250 MiB a 92%-coverage set needs, i.e. **a 30% cut in the matvec, not a
-10× win**, and only on the drafts that miss. Expected: single-digit percent of decode while drafting.
-**This is measurable without the card's scarce time: it is a Python histogram over stored output, and the matvec
-cost follows from the byte count.** 1–2 days, and it is the only item here with a clear positive expected value.
+### D.3 A calibrated set: what it costs in our code
+
+Two shapes are possible and one fits.
+
+**(a) Gather the rows into a dense matrix at load.** A `Dev` of `n_in × n_ids` rows, copied out of `output.weight` on
+the host at load, then `head = gathered; head.n_out = n_ids`. **This is a drop-in** — `draft_rows()` already returns a
+count, `lin()` already takes a `Dev`, and the arithmetic is identical because a row is a row. Cost in VRAM, at a
+Q4_K row of 2,880 B:
+
+| ids | MiB |
+| ---: | ---: |
+| 40,960 | 112.5 |
+| 65,536 | 180.0 |
+| 131,072 (today) | 360.0 |
+| 248,320 (full) | 682.0 |
+
+**(b) An index array consulted by the kernel.** This needs `native_mmvq_ids`-style indirection in the head's matvec —
+a new kernel path for one caller — and saves the VRAM. **Not worth it**: at 65,536 ids the gathered copy is 180 MiB,
+and the engine already holds 682 MiB of `output_` it could reuse.
+
+**So (a).** And note the accounting: today the engine uploads the **full** `output_` (682 MiB) and then truncates
+`n_out` per call, so a gathered 180 MiB head would be **added** to the 682 unless `output_` stops being uploaded
+whole. That is a second, separate 500 MiB win — quantified in D.5.
+
+### D.4 Producing the list without training
+
+Their builder (`prepare/build_draft_vocab.py`) is a **frequency count, not a training step**: it counts tokens over
+`.txt`/`.jsonl`/`.py`/`.parquet` corpus files, ranks by count with ties by id, appends special tokens, and slices
+those rows out of the int8 head. Its own docstring: 8.8M tokens of Danish web text, English Wikipedia, Python and the
+model's own chat outputs, **held-out coverage 95%**. It also warns that the result is language-specific — its shipped
+list holds **3 of the vocabulary's 55,328 Han ids and 1 of 18,580 Cyrillic** — and offers `--stats` (coverage per
+script) and `--add-scripts` to append a script's rows within a budget.
+
+Three sources, ranked by feasibility for us:
+
+1. **The model's own output on a document set (best).** This is the only one that measures the target's distribution,
+   and it needs no training: generate a few million tokens, histogram, keep the smallest set covering ~95%. Their
+   held-out number is the method's own benchmark. **Feasible**, and it is the same shape as their pipeline.
+2. **Frequency from a text corpus (second).** Cheaper — no model run — but it measures the *corpus*, not the model,
+   which is exactly the 92%-vs-97.5% gap they report. Needs tokenising with **our** tokenizer, which we can read
+   from the GGUF.
+3. **A heuristic from `output.weight` row norms (weakest).** Cheap and training-free, but a large-norm row is a token
+   the head can score *distinctly*, not a token the model *emits*. Expect materially below the corpus method, and
+   there is no measured precedent for it.
+
+**Not viable: the MTP block's weights.** They say which tokens the block can score, not which the target writes.
+
+### D.5 The honest bound — above the 2% bar, and the VRAM half is bigger
+
+A decode token at 61K is ~43 ms measured (23 tok/s), and one model step reads ~10,020 MiB of weights, which at
+288 GB/s is 36.5 ms — so the engine is at **85% of peak bandwidth** and the step is weight-read dominated, as
+expected.
+
+| one guess | MiB | of a 43 ms token |
+| --- | ---: | ---: |
+| block + head at 131,072 (today) | 694.5 | **5.88%** |
+| block + head at 65,536 | 514.5 | 4.36% |
+| block + head at 40,960 | 447.0 | 3.79% |
+| block + head at the full vocabulary | 1,016.5 | 8.61% |
+
+**So a cut from 131,072 to 65,536 saves 1.52 percentage points of a decode token — 5.88% → 4.36%.** That is *not*
+cosmetic: it is above the 2% bar, and it is per guess, so with a window of 8 it compounds across the drafts a step
+proposes. Their "+10% speed" is consistent with that magnitude once a speculating server's accept rate is folded in.
+
+**The larger prize is the double upload.** `output_` is uploaded whole (682 MiB) and `head.n_out` truncates the
+*read* per call, so the full head sits in VRAM whether it is used or not. A 65,536-row gathered head would let
+`output_` be the gathered matrix instead of the whole thing — **682 → 180 MiB of VRAM, 500 MiB back**, which on a
+card where the context ceiling is the binding constraint is worth ~18,500 tokens of k8v4.
+
+**Verdict: in, 1–2 days, and the VRAM half is the bigger half.** The list itself is a Python histogram; the wiring is
+a gathered `Dev` in `load_drafter` plus `draft_rows()` returning the list's length. Ranked first because it is the
+only item whose win is measured in both decode time *and* the context that fits.
 
 ---
 
@@ -283,11 +403,29 @@ prompt path is whether a 61K prefill should leave a checkpoint every N tokens: a
 tokens of k8v4 context, on a card that cannot spare them. **Out.** Revisit only when host-memory parking is the
 default, where the same 2.2 GiB is cheap.
 
-**F. Prefix caching as a test.** Our `--conversation-cache-mib` parks a whole conversation, theirs caches a prefix at
-block granularity; the question is whether a 24K follow-up turn already costs ~1 s. **The cheapest experiment is
-two turns of a chat over the same 24K document, `--max-new 1`, once with `--conversation-cache-mib 0` and once with
-`auto`, reading the second turn's prompt-tokens-per-second line.** No code, two runs, and it either closes the item
-or shows a gap worth a checkpoint granularity. **In, 0.5 days, after the card is free.**
+**F. Prefix caching as a test — the design, ready to hand over.** Our `--conversation-cache-mib` parks a whole
+conversation between requests; theirs caches a prefix at block granularity inside one. The question is not which is
+better, it is whether ours already gives their 23 s → 1 s.
+
+- **Material.** One 24,000-token document of ordinary prose (a Wikipedia article is fine), tokenised with this
+  model's tokenizer. `--tokens` takes a comma list, so the second turn's prompt is *document ids + the first answer's
+  ids* — no template, no chat formatting, which keeps the two runs comparable.
+- **Card settings.** `--max-context 32768 --kv k8v4 --no-draft --prompt-batch 512`, the same in both arms. `--no-draft`
+  because the metric is prompt processing, not decode.
+- **The two arms.** `--conversation-cache-mib 0` (parking off) and `--conversation-cache-mib auto` (parking on), both
+  with `--conversation-cache-slots 4`. Two requests in one process, the second being the 24K document plus ~200
+  generated tokens, `--max-new 1`.
+- **The metric: the second request's prefill time**, which `strata-poly` already prints as
+  `prompt N tokens X tok/s`. Take it twice per arm and use the second run of each (the first pays page faults).
+- **Pass looks like** the parked arm's second-request prefill at **≥5× the unparked arm's** — theirs is ~23×
+  (23 s → 1 s), and anything near 1× means our parking is not resuming the KV, which is the thing worth knowing.
+  The number to record either way is **prompt tok/s on the second request**, both arms, plus `conversation_cache_*`
+  from the `INFO` line to prove the slot was actually used.
+- **If it passes, close the item.** Their block-granular prefix cache is a refinement of a thing we already do; the
+  only gap worth a follow-up would be parking at *token* rather than *conversation* granularity, and that is a
+  different design.
+
+**In, 0.5 days of wall clock, two runs, no code.**
 
 **G. `cudagraph-memory-from-allocator`.** Their bug: the CUDA-graph memory estimate subtracted the *driver's*
 free-memory delta, which reads zero or collapses under WSL2, and refused the boot. Our accounting is a different
@@ -300,21 +438,25 @@ statement of why measuring a driver delta is the wrong instrument.
 
 ## What I would do, in order
 
-1. **D, the draft vocabulary (1–2 days).** The only item with a positive expected value and it needs no card: a
-   calibrated `n_out` shrinks the 360 MiB a draft reads, and `guess_vocab()` is currently a constant nobody
-   measured. Start by histogramming stored output over any corpus we already have.
-2. **F, the prefix-caching test (0.5 days).** Two runs, closes a question, and it is the one place where their
-   23 s → 1 s could mean we are leaving something on the table.
-3. **C's `kSplit` 1024 → 256, as a one-line experiment (hours).** One constant, `poly_fattn_test` as the gate, and it
-   is the only part of the split-count idea that touches contexts we serve. Expect under 1%.
+1. **D, the draft vocabulary (1–2 days).** The flag exists (`--draft-vocab N`) and takes a **prefix**, which is the
+   wrong subset; the fix is a gathered matrix and a list. It is worth **5.88% → 4.36%** of a decode token and
+   **up to 500 MiB of VRAM** — and on this card the VRAM is the scarcer of the two.
+2. **F, the prefix-caching test (0.5 days, two runs, no code).** Design in F above; the metric is the second
+   request's prompt tok/s across the two arms.
+3. **C's `kSplit` 1024 → 256 (hours).** One `constexpr` at `fattn.cu:261`, four recomputed sites, no register or
+   shared-memory change, scratch 7.6 → 30.2 MiB at 61K. Gate on `poly_fattn_test k8v4 --heads 24`.
 
 **Out, with the reason:** **B** because the kernel is DRAM-bound at 11% of the roofline and the padding is 6% on the
-launch that matters — swapping M and N cannot buy what the memory system is not offering; **A** because `Q·Kᵀ` is
-0.41% of a 32K prefill and a free one is worth 0.41%; **E** because 15 checkpoints cost 2.2 GiB of a card that has
-none to spare; **G** because we already budget for the graphs instead of measuring a driver delta.
+launch that matters — swapping M and N cannot buy what the memory system is not offering; **A** because 8–10 days
+for ~1.5% of prefill at 32K (and ~2.5–3% at 61K) is a bad trade against a draft head that is 1–2 days for 1.5 points
+of *decode* plus 500 MiB; **E** because 15 checkpoints cost 2.2 GiB of a card that has none to spare; **G** because
+we already budget for the graphs instead of measuring a driver delta.
 
-## Two corrections to what was quoted
+## Corrections to what was quoted
 
+- **`Q·Kᵀ` as a share of prefill: 5.83%, not 0.41%.** My 0.41% was one attention layer over the whole prefill; there
+  are 16 layers. Attention is 17.7% of a dense prefill, so **A is out on difficulty (8–10 days for a group-6
+  kernel), not on arithmetic** — the fix is to say that, and to stop calling it negligible.
 - **The 62% padding figure.** Right for `--no-draft` (6 rows of `MT=1`'s 16). At a window of 8, which is the
   default, the first launch uses 30 of 32 rows — **6.25%** — and the two launches average **25%**. And it does not
   matter either way: the kernel is at **11% of the roofline**, so the MMA has idle capacity in every configuration.
@@ -325,6 +467,10 @@ none to spare; **G** because we already budget for the graphs instead of measuri
 
 ## What needs the card
 
-Nothing above. Two things would firm it up if the card is free later, and neither is on the critical path: the
-`kSplit` 256 rebuild measured at 2K/8K/16K, and a decode measurement of `fdec` against its 11%-of-roofline estimate
-to confirm the kernel is memory-bound in practice and not on paper.
+Nothing above. Three things would firm it up if the card is free later, none on the critical path:
+
+- the `kSplit` 256 rebuild measured at 2K / 8K / 16K, which is the only way to confirm the split claim;
+- one `fdec` decode measurement against its 11%-of-roofline estimate, to confirm it is memory-bound in practice and
+  not only on paper — that is the number B rests on;
+- after the gathered head lands, one decode rate at 61K to check the 5.88% → 4.36% prediction, which is arithmetic
+  from byte counts and assumes the step stays bandwidth-bound.
