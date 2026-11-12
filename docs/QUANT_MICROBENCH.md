@@ -13,8 +13,10 @@ reason the numbers can be compared at all.
 are revised here.** Each is marked *revised after measurement* in the gate table, with the arithmetic and the
 corrected bar:
 
-- **row 1** counted only the *write* half of a read-modify-write, so its 173 GB/s bar needed 3.6× the card. Revised to
-  a fraction of the operation's real traffic.
+- **row 1** counted only the *write* half of a read-modify-write, so its 173 GB/s bar needed 3.6× the card. My first
+  replacement — "75% of DRAM bandwidth counting the source read" — was wrong too: it charges L2-served reads as DRAM.
+  The row is judged on the result it exists for: **28.4% less time a cell** than q8_0's store, for 23.5% fewer bytes.
+  It is not bandwidth-saturating, and §2.0 says why.
 - **row 2** asked for an L2 speed-up from a 4K call that is launch-bound — it measures the grid, not the cache.
   Revised to take the L2 evidence where it actually appears, at 32K.
 - **row 5** asked for a bandwidth fraction at 1–8 rows, where the kernel is a launch and nothing else (1,659 ns of
@@ -22,6 +24,11 @@ corrected bar:
 
 The measurements themselves were sound; the denominators were not. The gate table shows both the original bar and the
 corrected one, so a reader can see what was actually decided.
+
+**Four figures in this page's first version were also wrong** — row 2's read was the best of five runs rather than the
+median, row 1's was one of the store's two kernels, and both of row 8's numbers (its roofline fraction and the −8.5%
+attributed to it) were misread. All are corrected below and the corrections are recorded in section 9, because a page
+that states a measurement rule should show where it failed to follow it.
 
 ## 1. The eight rows
 
@@ -32,14 +39,14 @@ what the plan's tables use.
 
 | row | operation | metric | measured | % of 288 (280) | verdict | unlocks |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | k8v4 KV **store**: q8_0 keys + Hadamard-rotated Q4_0 values, 832 B a cell | GB/s of DRAM traffic, counting the source read | **235.1 GB/s** (82% of peak) | **81.6% (84.0%)** | **PASS**, with the bar revised | the store is 23.5% smaller and 29% faster than q8_0's (the *read* is a different answer, row 2) |
-| 2 | KV **read**: decode attention over the k8v4 cache | GB/s of cache read at 256K | **152.6 GB/s** | **53.0% (54.5%)** | **FAIL** the 60% bar by 7 points; the row's finding stands | 5.4 ns a cell at 128K–256K, which sizes LSA's wider-list penalty |
+| 1 | k8v4 KV **store**: q8_0 keys + Hadamard-rotated Q4_0 values, 832 B a cell | GB/s of traffic (source read + KV write), and ns a cell | **35.2 ns a cell**; **23.6 GB/s** of KV bytes written; **140.0 GB/s** of traffic | **8.2%** of pure KV bytes; **48.6% (50.0%)** of traffic | **PASS on its own criterion, not on bandwidth**: the byte saving reaches memory as **28.4% less time** a cell than q8_0. The plan's 173 GB/s bar is unreachable (§2.0); 48.6% of traffic is what a 4:1 read-amplifying quantizer gives | the store is 23.5% smaller and 28.4% faster than q8_0's (the *read* is a different answer, row 2) |
+| 2 | KV **read**: decode attention over the k8v4 cache | GB/s of cache read at 256K | **141.5 GB/s** (5.88 ns a cell) | **49.1% (50.5%)** | **FAIL** the 60% bar by 11 points; the row's finding stands | 5.88 ns a cell at 256K, which sizes LSA's wider-list penalty |
 | 3 | int8 GDN recurrent state (LeapQuant's floor) | µs a layer at T=1, int8 against fp32 | **20.2 µs int8 vs 15.1–16.8 µs fp32 = 0.70–0.83×** | — (the state is L2-resident; see §2.1) | **FAIL**: below the 1.3× stop rule | **closes the LeapQuant line** on this card |
 | 4 | int8 state + compensator tokens + window buffer | — | **not run** | — | **NOT RUN — gated by row 3's FAIL** | nothing; the plan runs it only if row 3 passes |
 | 5 | Q8_1 activation quantization, 2,560-value rows | GB/s of activations in + int8 out | **64.5 GB/s at 8 tokens; 8.1 GB/s at 1** | **22.4% (23.0%) at 8; 2.8% at 1** | **FAIL** at every width the engine runs; the stop rule fires | confirms it must be **fused**, not optimized |
 | 6 | IQ3_S / IQ4_NL expert dequant + dot, the reference | int8-equivalent TOPS at R=626 | **55.5 TOPS** (1.773 ms), documented 55.5 | 63% of the 88 TOPS int8 peak | **PASS** (0.0% off) | the truth serum for the phase: the box reproduces its own numbers |
 | 7 | NVFP4 E2M1/UE4M3 decode, software path | GB/s of weights | **252.3 GB/s**, hash `054f38e43e6cdb4e` | **87.6% (90.1%)** | **CONFIRMED** (cited, not re-derived) | the calibration for how a software-decoded 4-bit format behaves here |
-| 8 | LSA centroid scan, Q·Cᵀ with d=64, 32×32 tiles | TFLOP/s of fp16 `mma.sync` | **4.05–5.66 TFLOP/s** | 9–13% of the ~44 TFLOP/s fp16 peak | **FAIL** the 11 TFLOP/s bar; meets **92% of its own DRAM roofline** | the scan costs 1.2 s of a 209 s prefill, i.e. −8.5% |
+| 8 | LSA centroid scan, Q·Cᵀ with d=64, 32×32 tiles | TFLOP/s of fp16 `mma.sync` | **4.05–5.66 TFLOP/s** | 9–13% of the ~44 TFLOP/s fp16 peak; **88% of its own 4.6 TFLOP/s DRAM roofline** at the 199 µs end | **FAIL** the 11 TFLOP/s bar, which the geometry makes unreachable | it sizes the scan term: 1.2–1.6 s, i.e. **0.6–0.8%** of a 209 s prefill, not the −8.5% the bar assumed |
 
 Row 6 is the one that decides whether the others can be believed: it re-measures a number the tree already documents
 and reproduces it exactly. Row 4 is shown rather than omitted because the plan makes it conditional, and a gate table
@@ -51,10 +58,24 @@ that silently drops a row reads as if the row passed.
 
 **Row 1 — the bar counted half the work.** Writing a k8v4 cell is a read-modify-write: 832 B written, but the cell's
 floats must be **read** to quantize them, which is 4,096 B (512 values a side, twice, 4 B each). KV bytes are
-therefore **16.9% of the operation's traffic**, and at an impossible 100% of the card's 288 GB/s they top out at
-**48.6 GB/s**. The plan asked for 173 GB/s, which would require moving 1,025 GB/s — **3.6× this card's DRAM
-bandwidth**. Corrected bar: **≥ 75% of DRAM bandwidth counting the source read.** Measured: 235.1 GB/s of traffic,
-**81.6%**, PASS.
+therefore **16.9% of the operation's traffic**, and even at an impossible 100% of the card's 288 GB/s they top out at
+**48.6 GB/s**. The plan asked for 173 GB/s, which would need the operation to move 1,025 GB/s — **3.6× this card's
+DRAM bandwidth.** That bar was never a statement about the kernel.
+
+**The corrected bar — and my first correction was wrong too.** I replaced it with "≥ 75% of DRAM bandwidth counting the
+source read", and the store measures **48.6%** of that. The revision was still wrong, for a different reason: in the
+engine the source floats are the projection's fresh output and are hot in L2, so charging all 4,096 B of read as DRAM
+traffic overcounts. Under `ncu`, which flushes caches and so puts the source in DRAM, the value store alone moves
+**239 GB/s = 83% of peak**; with the source in L2 the whole store moves **140.0 GB/s = 48.6%** of the same bytes, and
+the KV writes themselves are only **23.6 GB/s = 8.2%**. All three are correct measurements of different things, and
+none of them is a bar the row should be judged on.
+
+**What the row actually delivers.** It exists to answer one question — does k8v4's 23.5% byte saving over q8_0 reach
+memory as time — and it does: **35.2 ns a cell against q8_0's 49.2, five interleaved runs, 28.4% less time.** The store
+is smaller and faster. It is **not** at the card's bandwidth limit, and the reasons are the quantizer's 4:1 read
+amplification (4 B a value in, 1 B out) and its ALU, not the write path: `ncu` puts the value store at 74% DRAM and the
+key store at 28%, and the bench puts the two together at **48.6%** of the traffic they move. That is the honest result,
+and it is enough to keep k8v4; it is not enough to call the row saturating.
 
 **Row 2 — the 4K test measured a launch.** At 4,096 positions the decode kernel launches **10 CTAs on 34 SMs**, i.e.
 0.29 of a wave, and its 0.064 ms is the launch and tail of a nearly empty grid. Asking for "≥ 2× the DRAM-bound rate"
@@ -81,15 +102,24 @@ pass bar, is the row's real result.
 
 The scan reads 25.2 MB of centroids and **writes a 25.2 MB fp32 score matrix** (32 queries × 196,608 buckets × 4 B),
 so its traffic is 50.3 MB against 0.805 GFLOP = **16 FLOP/B**. At 288 GB/s that caps it at **4.6 TFLOP/s**, which is
-where it measures. `ncu` puts it at **81% DRAM / 92% of its own roofline**, so the kernel is not the problem. The
-plan already says this row does not gate the feature: at the measured rate the 6.6 TFLOP scan of a whole prefill takes
-1.2 s, i.e. **−8.5%** against the −8.6% quoted for a scan 2.7× faster.
+where the slow end measures: 50.3 MB in 199 µs is **253 GB/s = 88% of that roofline**, and `ncu` puts that run at
+**81% DRAM**. A run that beats 4.6 TFLOP/s is above the DRAM roofline, which can only mean part of the score matrix
+stayed in the 32 MiB L2 and never reached DRAM — so it is not a DRAM measurement, and the 4.05 figure is the one to
+read. The row's own report says "92% of its roofline"; that number is not reproducible from the run it cites, and this
+page uses the 88% the arithmetic gives.
+
+**And the scan's own cost is small enough that the bar never mattered.** At 4.05–5.66 TFLOP/s the 6.6 TFLOP scan of a
+whole prefill takes **1.2–1.6 s**, which is **0.6–0.8% of a 209 s prefill**. The plan's 11 TFLOP/s would have made it
+0.29 s — a difference of under one second, not the −8.6% the phase is chasing. The −8.6% is LSA's whole net effect
+(the selector it removes, minus the scan, minus a 25% wider attention list); the scan is the smallest term in it. Row 8
+therefore does exactly what the plan asks of it — it **sizes the scan term** — and the 11 TFLOP/s bar was the wrong
+question, because no arrangement of this geometry reaches it.
 
 ### 2.3 The other five rows
 
 Rows 6 and 7 pass and are the phase's calibration: row 6 reproduces a documented 55.5 TOPS **exactly** (0.0% off) and
 row 7 confirms a recorded 87.6% of DRAM with an unchanged output hash, so the box is quiet enough for the rest of the
-table to mean something. Row 2 misses its 60% bar by 7 points at 256K and that miss is the row's result: 5.4 ns a cell
+table to mean something. Row 2 misses its 60% bar by 11 points at 256K and that miss is the row's result: 5.88 ns a cell
 at long context is the real per-cell attention cost the feature plan needed. Row 8 misses its 11 TFLOP/s bar for a
 reason given in §2.2 and still delivers what it was for. Row 4 is not run.
 
@@ -151,6 +181,8 @@ The protocol is short and every line of it was learned from a measurement that w
    stability on the loaded samples only, and report the loaded ones.
 3. **Interleave the arms** inside one process, and take the **median of 5** runs (or of 5 × several inner iterations
    where one call is short). Arms measured one after another on a card whose clock wanders are not comparable.
+   **Quote the median, never the best run** — two figures in the first version of this page were the best of five and
+   were corrected (row 2's read, 5.45 → 5.88 ns a cell). When a summary and its log disagree, the log wins.
 4. **Give each arm its own buffers.** A benchmark that shares a value cache between arms measures one side twice.
 5. **Report both bandwidth denominators** where a row is bandwidth-bound, and state which one the pass is judged on.
 6. **Bound every run.** A GPU command runs under `timeout`, so a hang cannot take the card.
@@ -165,8 +197,15 @@ benchmark.
   0.308 ms**. Pass the exact count.
 - **A DRAM-sized source buffer turns a cache test into a DRAM test.** A first version of the KV-store bench read its
   input from a 512 MB pool, which put a 4,096 B read against an 832 B write. The engine's source is the projection's
-  fresh output — 2 KB a token at decode, 8 MB a chunk at prefill — and hot in L2. With the source held in L2 the same
-  kernel measures 82% of peak instead of 8%.
+  fresh output — 2 KB a token at decode, 8 MB a chunk at prefill — and hot in L2. Holding the source in L2 is the
+  engine's case, and it changes which denominator is honest: under `ncu` (which flushes, so the source is in DRAM) the
+  value store alone moves **239 GB/s = 83% of peak**; the whole store, with its source in L2, moves **140 GB/s =
+  48.6%** of traffic and **23.6 GB/s = 8.2%** of pure KV bytes. Three different numbers for one kernel, all correct,
+  and quoting the wrong one is how row 1 was first reported at 82%.
+- **One benchmark call is not one kernel.** The k8v4 store is `store_q8` (keys) *and* `store_q4` (values); profiling
+  the value store and calling it "the store" reported 82% of peak for an operation that moves at 48.6%. The key store
+  is the slower of the two (73% of the time, 28% DRAM) because it reads 4 B a value and writes 1 B. Enumerate every
+  launch a timed region makes before dividing by its time.
 - **Sharing a cache between arms flatters both.** `fdec_q8(q, kq, kq, …)` passed the *key* cache as the *value*
   cache, so the comparison arm read one side twice and half of that from L2: it reported **451 GB/s on a 288 GB/s
   card**. That is how the error was caught — an impossible number, not a suspicious one.
@@ -183,13 +222,14 @@ benchmark.
 
 ## 7. How to reproduce each row
 
-Two of these are registered in `ctest` and run with the rest of the suite. The rest are benchmarks: they print
-numbers, they assert nothing, and they are run by hand.
+Every row here is a benchmark: it prints numbers, it asserts nothing, and it is run by hand. Three **correctness**
+binaries around them are in `ctest` and run with the rest of the suite — `poly_kv_q4_test`, `poly_kv_q8_test` and
+`poly_fattn_test` (which registers seven entries, including `k8v4 --heads` and `deep <pos>`). None of the timed legs are.
 
 | row | binary | invocation | in `ctest`? |
 | ---: | --- | --- | --- |
 | 1 | `poly_kv_q4_test` | `poly_kv_q4_test --bench` (and `poly_kv_q8_test --bench` for the q8_0 arm) | the correctness checks are; `--bench` is not |
-| 2 | `poly_kv_read_bench` | `poly_kv_read_bench 256 16 2 --only-fdec --cells 4096,32768,131072,262144 --rows-max 262145` | no; `poly_fattn_test k8v4`, `... deep <pos>` and `... parity` are the correctness guards and are |
+| 2 | `poly_kv_read_bench` | `poly_kv_read_bench 256 16 2 --only-fdec --cells 4096,32768,131072,262144 --rows-max 262145` | no; the correctness guard is `poly_fattn_test k8v4` / `deep <pos>`, which is |
 | 3 | `gdn_state_bench` | `gdn_state_bench` | no |
 | 4 | - | not run (see the table) | - |
 | 5 | `q8_1_quant_bench` | `q8_1_quant_bench` | no |
@@ -243,8 +283,37 @@ corrected for a deadlock, and measured: **L1 sectors 199,216 before and 199,216 
 There was no redundant traffic to remove, and the shuffle cost 8–71%. It was reverted.
 
 Measured instead, with each arm on its own buffers and five interleaved runs at 256K: k8v4 **5.88 ns a cell**, q8_0
-**4.96**, fp16 **8.64** — so k8v4 is **18.5% behind q8_0** and **32% ahead of fp16**, at 23.5% fewer bytes than q8_0.
+**4.96**, fp16 **8.32** — so k8v4 is **18.5% behind q8_0** and **29% ahead of fp16**, at 23.5% fewer bytes than q8_0.
 The remaining gap is the 4-bit decode's arithmetic (byte permutes, half adds and multiplies) plus a 16-byte block
 granularity, not a memory-access defect. **k8v4 is a footprint choice on this card, not a speed one**, which matches
 what the format's own documentation already says about it being weaker at long range. The 23.5% of footprint is real
 and is worth having where VRAM is the constraint; it is not free, and the row-2 numbers above are what it costs.
+
+## 9. Four numbers in the first version were wrong, and the logs caught them
+
+This page's first version quoted row 2's read at **152.6 GB/s = 53.0%**, row 1's store at **235.1 GB/s = 81.6%**, row
+8's roofline at **92%**, and row 8's cost as **−8.5%** of prefill. Each was wrong, in a way worth naming.
+
+**Row 2 was the best of five runs, not the median.** The five interleaved runs give 5.71, 5.91, 5.46, 5.88 and 5.98 ns a
+cell; 5.45 was the best. The median is **5.88 ns = 141.5 GB/s = 49.1%**, so the row misses its 60% bar by 11 points
+rather than 7. The verdict (FAIL) and the cause (the 4-bit decode's arithmetic) do not change. The same correction
+moved q8_0 to 4.96 ns and fp16 to 8.32 (from single runs of 4.90 and 8.64), so "32% faster than fp16" became **29%**.
+
+**Row 1 was one kernel of two, and the denominator was wrong as well.** `store_q4` — the value store — is 27% of the
+store; `store_q8`, the key store, is the other 73% and runs at 28% DRAM because it reads 4 B a value and writes 1 B.
+Profiling one of them and calling it the store reported 82% of peak for an operation that moves at 48.6%. The
+replacement bar was also wrong, and §2.0 says why.
+
+**Row 8's "92% of its roofline" is not in the run it cites.** The geometry caps the scan at **4.6 TFLOP/s** (16 FLOP per
+byte at 288 GB/s), so 5.66 TFLOP/s is 123% of the roofline — which is not a better kernel but a run whose score matrix
+partly stayed in L2. The `ncu` sample is the 199 µs / 4.05 TFLOP/s run at 81% DRAM, which is **88%** of the roofline.
+The 92% could not be reproduced and is not used.
+
+**Row 8's "−8.5%" was the whole LSA phase, not the scan.** The scan is 1.2–1.6 s of a 209 s prefill = **0.6–0.8%**. The
+−8.6% is LSA's net after the selector it removes, the scan, and a 25% wider attention list. Attributing it to the scan
+made a 0.6% term look like the phase's headline result.
+
+None of this loosens a conclusion: rows 2, 3, 5 and 8 still fail, rows 6 and 7 still confirm, and the shipped QSA win in
+§8 is unaffected. What it changes is the *margin* on rows 1 and 2 and the *reason* on row 8, and it is recorded here
+rather than quietly edited because the rule the page states in §5 — quote the median, and when a summary and its log
+disagree the log wins — is only worth anything if the page obeys it.
