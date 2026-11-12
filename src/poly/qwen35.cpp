@@ -199,6 +199,9 @@ size_t Qwen35::recurrent_floats() const {
     return size_t(n_gdn_) * (size_t(3) * conv_dim_ + size_t(v_heads_) * s_dim_ * s_dim_);
 }
 
+// A dense model guesses from the whole table; the MoE family keeps its prefix.  qwen35.hpp has the census.
+int Qwen35::guess_vocab() const { return dense_ ? 0 : 131072; }
+
 int Qwen35::widest() const { return std::max(d_inner_, n_head_ * head_dim_); }
 
 // The attention layers' caches, and each recurrent layer's convolution and delta-rule state in state_.
