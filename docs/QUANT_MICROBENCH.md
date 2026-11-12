@@ -2,12 +2,23 @@
 
 Before any quantized format was wired into a long-context decode loop, each operation the optimization work would
 touch was measured on its own against a documented hardware peak. This page is that record: the eight rows, what each
-one measured, its value as a fraction of the peak, whether it passed, and the decision it unlocked.
+one measured, its value as a fraction of the peak, whether it passed, and the decision it unlocked. Four further rows
+were added later in the same session and the same table — the LSA centroid scan (row 8) and, from the LSA feature
+plan's own gate list, **row W1, the Ward clustering of a cluster block** (§2.4a) — the newest of which is the one that
+retires a risk rather than opening a question.
 
 Every number below was measured on **one NVIDIA GeForce RTX 4060 Ti 16 GB** (AD106, sm_89, 34 SMs, 32 MiB L2,
 driver 615.78.08, CUDA 13.4) on 2026-11-12, with the SM clock pinned at 2,820 MHz. Nothing was measured on hardware
 this machine does not have. The commands are in section 7; the measurement protocol is in section 5, and it is the
 reason the numbers can be compared at all.
+
+**The KV cache is three formats, not one, and both engines run all three.** q8_0 is **1,088 B a cell**, k8v4 is
+**832**, fp16 is **2,048**; `strata` and `strata-poly` both support q8_0 and k8v4 and run them most of the time, with
+fp16 as the third. Rows 1 and 2 measure k8v4 because the 256K production config uses it (`docs/REAP.md`), and their
+verdict is a statement about **k8v4 against q8_0**, not about quantized KV in general. The three-way ordering —
+q8_0 the fastest read, k8v4 the smaller footprint and the faster store, fp16 the largest and slowest — is a product
+choice per configuration, and §2.3 and §8 name which file records each engine's choice. No row here should be read as
+"the" KV format.
 
 **Three of the eight pass criteria in the plan turned out to be unreachable by arithmetic, not by the kernels, and
 are revised here.** Each is marked *revised after measurement* in the gate table, with the arithmetic and the
@@ -43,20 +54,32 @@ Bandwidth-bound rows give the fraction of both denominators: **288.0 GB/s**, whi
 clock the card reports while loaded. The second is 3% lower and is the honest one for a sustained run; the first is
 what the plan's tables use.
 
+**The KV cache is not one format, and this table must not read as if it were.** Both engines — `strata` and
+`strata-poly` — run **q8_0 and k8v4**, and in practice those two are what they run most of the time; fp16 is the
+third the tree supports. They differ in bytes a cell: **q8_0 is 1,088 B**, **k8v4 is 832 B**, **fp16 is 2,048 B**
+(one cache, `include/strata/core/layer.hpp:205-232`). Rows 1 and 2 measure k8v4 because that is the format the
+256K production config uses (`docs/REAP.md`); their numbers are a statement about **that pair of formats**, not
+about quantized KV in general. What the three-way comparison actually says: **q8_0 is the faster read at long
+context, k8v4 is the smaller footprint and the faster store, and fp16 is the largest and the slowest**
+(§2.3 has the read figures for all three). That is a product choice per configuration, not a defect in either.
+
 | row | operation | metric | measured | % of 288 (280) | verdict | unlocks |
 | ---: | --- | --- | ---: | ---: | --- | --- |
-| 1 | k8v4 KV **store**: q8_0 keys + Hadamard-rotated Q4_0 values, 832 B a cell | GB/s of traffic (source read + KV write), and ns a cell | **35.2 ns a cell**; **23.6 GB/s** of KV bytes written; **140.0 GB/s** of traffic | **8.2%** of pure KV bytes; **48.6% (50.0%)** of traffic | **PASS on its own criterion, not on bandwidth**: the byte saving reaches memory as **28.4% less time** a cell than q8_0. The plan's 173 GB/s bar is unreachable (§2.0); 48.6% of traffic is what a 4:1 read-amplifying quantizer gives | the store is 23.5% smaller and 28.4% faster than q8_0's (the *read* is a different answer, row 2) |
-| 2 | KV **read**: decode attention over the k8v4 cache | GB/s of cache read at 256K | **141.5 GB/s** (5.88 ns a cell) | **49.1% (50.5%)** | **FAIL** the 60% bar by 11 points; the row's finding stands | 5.88 ns a cell at 256K, which sizes LSA's wider-list penalty |
+| 1 | **k8v4** KV **store** (832 B a cell): q8_0 keys + Hadamard-rotated Q4_0 values | GB/s of traffic (source read + KV write), and ns a cell | **35.2 ns a cell**; **23.6 GB/s** of KV bytes written; **140.0 GB/s** of traffic | **8.2%** of pure KV bytes; **48.6% (50.0%)** of traffic | **PASS on its own criterion, not on bandwidth**: the byte saving reaches memory as **28.4% less time** a cell than q8_0's 1,088 B store. The plan's 173 GB/s bar is unreachable (§2.0); 48.6% of traffic is what a 4:1 read-amplifying quantizer gives | the k8v4 store is 23.5% smaller and 28.4% faster than q8_0's (the *read* is a different answer, row 2) |
+| 2 | KV **read**: decode attention over the **k8v4** cache | GB/s of cache read at 256K | **141.5 GB/s** (5.88 ns a cell) | **49.1% (50.5%)** | **FAIL** the 60% bar by 11 points *for this format*; the row's finding stands | 5.88 ns a cell at 256K for k8v4, which sizes LSA's wider-list penalty. q8_0 is **4.96 ns** and fp16 **8.32 ns** on the same harness (§2.3) — so k8v4 is the middle read, not "the" read |
 | 3 | GDN recurrent state, 8 formats from int8 to fp4 | µs a layer at T=1, MiB a session, and relative state error at 1 and 128 steps | **see §2.1**: **fp16 is the winner** — 0.88× fp32's time for half the bytes | — (bandwidth is not the limit; §2.1) | **PASS for fp16 (footprint at near-zero time cost); NOT RUN for nothing else** | **the answer is fp16, not int8** — see §2.1 |
 | 4 | the paper's full form: a **real** rank-4 compensator fit + residual smoothing | error at 1 and 128 steps, µs a layer, MiB a session | **fit removes 12.0% of the residual (= the SVD bound); int4 1.744 → 1.71 at 128 steps, for +39% time and +24% bytes** | — | **FAIL**: 78× worse than fp16, and closing it needs r ≈ 64 (more bytes than fp16) | **no 4-bit format reaches fp16's accuracy; the footprint winner stays fp16 at 16 slots** — §2.1a |
 | 5 | Q8_1 activation quantization, 2,560-value rows | GB/s of activations in + int8 out | **64.5 GB/s at 8 tokens; 8.1 GB/s at 1** | **22.4% (23.0%) at 8; 2.8% at 1** | **FAIL** at every width the engine runs; the stop rule fires | confirms it must be **fused**, not optimized |
 | 6 | IQ3_S / IQ4_NL expert dequant + dot, the reference | int8-equivalent TOPS at R=626 | **55.5 TOPS** (1.773 ms), documented 55.5 | 63% of the 88 TOPS int8 peak | **PASS** (0.0% off) | the truth serum for the phase: the box reproduces its own numbers |
 | 7 | NVFP4 E2M1/UE4M3 decode, software path | GB/s of weights | **252.3 GB/s**, hash `054f38e43e6cdb4e` | **87.6% (90.1%)** | **CONFIRMED** (cited, not re-derived) | the calibration for how a software-decoded 4-bit format behaves here |
 | 8 | LSA centroid scan, Q·Cᵀ with d=64, 32×32 tiles | TFLOP/s of fp16 `mma.sync` | **4.05–5.66 TFLOP/s** | 9–13% of the ~44 TFLOP/s fp16 peak; **88% of its own 4.6 TFLOP/s DRAM roofline** at the 199 µs end | **FAIL** the 11 TFLOP/s bar, which the geometry makes unreachable | it sizes the scan term: 1.2–1.6 s, i.e. **0.6–0.8%** of a 209 s prefill, not the −8.5% the bar assumed |
+| W1 | **LSA Ward clustering**, one 512-key block, one CTA, 128 pools | µs a block, µs a layer, ms of prefill | **12.66 µs a block at m = 64** (14.18 at m = 32, 11.31 at m = 128); **19.45 ms of a 256K prefill** = **0.009%** | — (latency-bound, not bandwidth: 3.96% SM throughput under `ncu`) | **PASS**: 0.63× the 20 µs bar, and 0.009% of prefill, so the gate cannot kill LSA | the clustering is **not** the risk the plan ranked it as; W1 closes and the decision falls back to Phase 0's selector share — §2.4a |
 
 Row 6 is the one that decides whether the others can be believed: it re-measures a number the tree already documents
 and reproduces it exactly. Row 4 is shown rather than omitted because the plan makes it conditional, and a gate table
-that silently drops a row reads as if the row passed.
+that silently drops a row reads as if the row passed. W1 is row 9 in the numbering of the feature plan it belongs to
+(`/tmp/opencode/merge-plan/LSA-PLAN.md` §6.3) and is listed here because it is the same kind of measurement on the
+same card in the same session.
 
 ## 2. Where the rows landed, and the three revised bars
 
@@ -257,8 +280,97 @@ question, because no arrangement of this geometry reaches it.
 Rows 6 and 7 pass and are the phase's calibration: row 6 reproduces a documented 55.5 TOPS **exactly** (0.0% off) and
 row 7 confirms a recorded 87.6% of DRAM with an unchanged output hash, so the box is quiet enough for the rest of the
 table to mean something. Row 2 misses its 60% bar by 11 points at 256K and that miss is the row's result: 5.88 ns a cell
-at long context is the real per-cell attention cost the feature plan needed. Row 8 misses its 11 TFLOP/s bar for a
-reason given in §2.2 and still delivers what it was for. Row 4 is not run.
+at long context is the real per-cell attention cost the feature plan needed — **for k8v4**, with q8_0 at 4.96 and fp16
+at 8.32 on the same harness. Row 8 misses its 11 TFLOP/s bar for a reason given in §2.2 and still delivers what it was
+for. Row 4 is not run.
+
+### 2.4a Row W1: the Ward clustering is not the risk it was ranked as
+
+The LSA feature plan (`/tmp/opencode/merge-plan/LSA-PLAN.md`) ranked Ward clustering second of its risks: *"the
+paper's 0.043 ms is a cluster of 8 SMs; ours is one CTA. If the rounds serialise badly … 10 µs/block can become
+150 µs, and prefill clustering becomes ~5 s."* It has now been measured, and the answer is **12.66 µs a block at the
+plan's own m = 64**, so the risk does not fire.
+
+What was built: `src/kernels/lsa_ward_bench.cu`, one CTA a cluster block, every merge round inside the kernel with
+the block's state in shared memory and no host round trip. The keys are **the checkpoint's own** — 128 blocks of 512
+unit-norm fp16 keys produced by all twelve layers' `indexer.k_proj` and `indexer.k_norm`, pooled 4:1, dims 64..127,
+L2-normed (the plan's `ropefree` space), with a modelled token input `x` (a shared mean + a 16-cell segment + per-cell
+noise + 4 channels at 10×). The input is the only modelled part; every stage after it is the model's. The built-in
+fallback generator carries the same structure and its output is labelled as such.
+
+| block | m | blocks a layer | µs a block | µs a layer | ms of prefill | % of 209.8 s | vs the 20 µs bar |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **512 keys, 128 pools** | **32** | 128 | 14.18 | 1,815 | **21.78** | 0.010% | 0.71× |
+| **512 keys, 128 pools** | **64** | 128 | **12.66** | **1,621** | **19.45** | 0.009% | **0.63×** |
+| 512 keys, 128 pools | 128 | 128 | 11.31 | 1,447 | 17.37 | 0.008% | 0.57× † |
+| 256 keys, 64 pools | 16 | 256 | 7.41 | 1,897 | 22.77 | 0.011% | 0.37× |
+| 256 keys, 64 pools | 32 | 256 | 7.20 | 1,842 | 22.10 | 0.011% | 0.36× |
+| 256 keys, 64 pools | 64 | 256 | 6.83 | 1,748 | 20.97 | 0.010% | 0.34× † |
+
+Median of 15 runs × 50 iterations each; SM clock pinned at 2,820 and sampled at 2,805 MHz through every window.
+**Run-to-run spread at m = 64: 12.25 to 12.66 µs across the sessions** (four separate invocations of the same
+binary), i.e. ±1.7% — the median is quoted, and the bar is met by every sample rather than by the best one.
+
+**Verdict: PASS at 0.63× the bar** — 12.66 µs a block at the plan's m = 64, 19.45 ms of a 256K prefill, 0.009%.
+
+† **m = 128 with 128 pools and m = 64 with 64 pools are the no-merge floor, not a clustering result**: the block
+starts with that many pools, so zero rounds run. They are in the table because they are the exact lower bound a real
+configuration would be compared against (pool sums + Gram + emit, nothing else), and they are labelled rather than
+quoted as a pass.
+
+**Three findings the arithmetic in the plan had wrong, each of which changes a decision:**
+
+1. **The plan's 1.8 ms was ~10× too small, for two independent reasons.** §3.3 priced *512 blocks a layer × 10 µs*.
+   A cluster block is 512 **keys** = 2,048 cells, so a 256K layer has **128** blocks — 4× fewer, which alone changes
+   the answer — and the measured block is 12.66 µs, not 10. Ward at 19.45 ms is therefore **two orders of magnitude
+   below** the 0.6–0.8% the scan costs, and cannot be what decides LSA either way.
+
+2. **512 keys is the right block size, which is the opposite of what the missing DSMEM suggested.** A 512-key block
+   needs 70,496 B of the 101,376 B opt-in, so **one** fits an SM and its layer is 3.76 waves. A 256-key block needs
+   27,104 B, so **three** fit and its layer is 1.25 waves — but it needs twice the blocks, and the halves cancel:
+   **22.1 ms against 19.5**. Halving the block halves the work a block and doubles the count, and the occupancy gain
+   is slightly less than the loss.
+
+3. **Neither second arm beats one thread a row.** A warp a row (4 warps) is 13.7 µs and 191 µs at grid 1, but its
+   *layer* is 21.1 ms; eight warps is 17.2 µs / 26.5 ms. Two threads a row cuts grid-1 latency from 151 to 118 µs
+   and the round's search from 63% to 53%, but the layer is **17.6 µs / 27.0 ms**, because 256 threads halve the
+   blocks an SM holds. A four-CTA design would need two L2 barriers a round: the binary's probe measures a
+   `__threadfence` at **209 ns**, so ~0.42 µs a round, ~2% of a round — not worth building when one CTA already
+   passes at 0.63× the bar.
+
+**The rounds are few, and they are the serialisation as predicted: 4 to 8 (mean 5.6) at m = 64**, 8–15 at m = 32,
+none at m = 128, and **every block reached m in every run**. The split inside a block from `clock64` on block 0 is
+**pool + Gram 21%, rounds 71%, emit 8%**; inside a round, **the partner search is 63%**, the commit 29%, the rank
+rule 8%. `ncu` puts the kernel at **3.96% SM throughput and 8.22% warps active with 1.61 barrier stalls an issue** —
+it is latency, not work, and that is why block size and occupancy, not arithmetic, are the levers.
+
+**Quality, not just speed — a fast wrong clustering would be worthless.** At m = 64 the mean intra-bucket variance is
+**0.286 against 0.870 for random 8-key buckets, 67.1% lower** (the Ward objective, measured over all 128 blocks).
+The **size cap is respected exactly**: of 8,192 buckets, 1,474 hold 4–7 keys, 5,511 hold 8–11, 940 hold 12–15, 267
+hold 16, and **none exceeds `n_b_max` = 16**. A scalar CPU transcription of the same rules — same fp32 order, dim
+ascending, the authors' three refinements — agrees with the kernel **block for block on all 128 blocks**, member sets
+equal, bucket numbering free. `--smoke` covers 1/2/3/5/7/33-block grids and a 511-key block (a 3-key last pool):
+each pool in exactly one bucket, sizes summing to the block's keys, none over the cap, centroids unit-norm, and a
+repeat launch giving the same partition. `compute-sanitizer --tool memcheck` is clean on both block sizes.
+
+**Resource gate.** `cuobjdump --dump-resource-usage` on the shipped `ward_cta_kernel<128,128,1,true>`: **REG 146,
+STACK 0, LOCAL 0**, shared 70,496 B requested dynamically; every other **shipped** instantiation is the same
+(`146/0/0`, `146/0/0` for the two-threads-a-row and 64-pool forms, `144/0/0` for both warp forms). The two
+un-cached-Gram `recompute` instantiations are **80 registers with STACK 8 and a 4 B spill**, and are **not** the
+shipped path — the plan's contract allows a new LSA kernel no `ALLOWED` entry, so the cached arm is the one that
+ships. SASS over the **shipped** kernels: **0 `LDL`/`STL`** and **0 `QGMMA`/`UTCMMA`/`UTCCP`/`UTMALDG`/`UTMASTG`/
+`MAPASTS`/`SETMAXNREG`/`ELECT`**, no cluster and no TMA instruction; the only two `STL` and two `LDL.LU` in the whole
+binary are inside those two spill-carrying `recompute` arms, which the accounting above already excludes. The
+shipped inner loop is `LDS`/`LDS.128`, `FFMA`, `MUFU.RSQ`, `BAR.SYNC`.
+
+**What the kernel's own history is worth recording for:** its first version was wrong twice and the CPU oracle caught
+both. The merge commit's phase B read the packed triangle as `gidx(o, x)` for an arbitrary `o`, which is a different
+cell whenever `o < x` — a silent wrong answer on half the merges. And the rank rule wrote `rank[row]` while other
+threads were still counting `rank[o]`, so the partition depended on warp scheduling: 5- and 33-block grids were not
+reproducible while 1, 2, 3 and 7 were. `--oracle` exists so the next change cannot repeat them quietly.
+
+**Not tested:** no AMD, no multi-GPU, no 1M context, and no forward pass — the keys come from the checkpoint's weights
+plus a modelled input, so the *distribution* is the model's and the *activations* are not.
 
 ## 2.4 The integration decision for the state format
 
@@ -458,6 +570,7 @@ binaries around them are in `ctest` and run with the rest of the suite — `poly
 | 6 | `native_expert_bench` | `native_expert_bench <shard>.gguf 0,1,2,3 64 1 -1 -1 200` | no |
 | 7 | `nvfp4_decode_bench` | `nvfp4_decode_bench` (defaults are 40/40, 64 groups, 2 tokens, 50 iterations) | no |
 | 8 | `lsa_scan_bench` | `lsa_scan_bench` | no |
+| W1 | `lsa_ward_bench` | `lsa_ward_bench --keys <keys128.bin> --blocks 128 --m 64 --oracle 16 --runs 9 --iters 40`; `--smoke` for the invariants, `--pools 64 --keys <keys128-256.bin> --m 32` for the 256-key block, `--arm warp\|warp8\|cta256` for the other arms, `--barrier` for the fence probe | no |
 
 The build is the same for all of them:
 
@@ -503,12 +616,19 @@ the groups cover **two blocks × four windows — eight distinct addresses**. A 
 corrected for a deadlock, and measured: **L1 sectors 199,216 before and 199,216 after, requests identical at 41,648**.
 There was no redundant traffic to remove, and the shuffle cost 8–71%. It was reverted.
 
-Measured instead, with each arm on its own buffers and five interleaved runs at 256K: k8v4 **5.88 ns a cell**, q8_0
-**4.96**, fp16 **8.32** — so k8v4 is **18.5% behind q8_0** and **29% ahead of fp16**, at 23.5% fewer bytes than q8_0.
-The remaining gap is the 4-bit decode's arithmetic (byte permutes, half adds and multiplies) plus a 16-byte block
-granularity, not a memory-access defect. **k8v4 is a footprint choice on this card, not a speed one**, which matches
-what the format's own documentation already says about it being weaker at long range. The 23.5% of footprint is real
-and is worth having where VRAM is the constraint; it is not free, and the row-2 numbers above are what it costs.
+Measured instead, with each arm on its own buffers and five interleaved runs at 256K: **q8_0 4.96 ns a cell, k8v4
+5.88, fp16 8.32**. Read as a three-way choice rather than a pair: **q8_0 is the fastest read, k8v4 is 18.5% behind
+q8_0 while carrying 23.5% fewer bytes a cell, and fp16 is 68% behind q8_0.** The remaining gap for k8v4 is the 4-bit
+decode's arithmetic (byte permutes, half adds and multiplies) plus a 16-byte block granularity, not a memory-access
+defect. So the ordering is a product choice and not a defect in any of the three: **q8_0 for the read, k8v4 for the
+footprint (1,088 vs 832 B a cell) and the store (28.4% faster, row 1), fp16 when neither is the constraint and its
+2,048 B a cell fits.** Which one a configuration runs is a per-deployment decision, recorded where each is chosen,
+and there is no single global default in either engine: `docs/Q8_KV.md` documents the `strata-poly --kv q8_0` path
+(fp16 is its default); `docs/FLINT.md:110-118` carries both the **q8_0 (1,088 B) and k8v4 (832 B)** rows side by
+side at 131K and 256K, and `docs/FLINT.md:156-160` states that keys are Q8_0 and values rotated Q4_0 under k8v4,
+"against q8_0's 1,088 and fp16's 2,048"; `docs/REAP.md:60,71` is the 256K production config that pins
+`--kv k8v4 --kv-resident 32768`; `docs/BACKENDS.md:107-109` documents the V100's `--kv q8_0` with fp16 the default.
+This page must not imply one of the three is "the" cache.
 
 ## 9. Four numbers in the first version were wrong, and the logs caught them
 
@@ -538,3 +658,20 @@ None of this loosens a conclusion: rows 2, 3, 5 and 8 still fail, rows 6 and 7 s
 §8 is unaffected. What it changes is the *margin* on rows 1 and 2 and the *reason* on row 8, and it is recorded here
 rather than quietly edited because the rule the page states in §5 — quote the median, and when a summary and its log
 disagree the log wins — is only worth anything if the page obeys it.
+
+## 10. Two framings this page had wrong, corrected after the fact
+
+Both were in the *presentation*, not in any measurement, and both would have misled a reader who took the page as a
+statement about the engine rather than about one configuration of it.
+
+**The KV cache was written as if k8v4 were the cache.** Rows 1 and 2 measure k8v4, and the surrounding prose said
+"the KV cache" — which reads as though quantized KV means k8v4. It does not. **Both engines run q8_0 and k8v4** and
+both are common; fp16 is the third. The three cost **1,088, 832 and 2,048 B a cell**. k8v4 being 18.5% slower to read
+than q8_0 is a fact about that pair at long context, and q8_0 is the faster read while k8v4 is the smaller footprint
+and the faster store — a product choice, not a defect, and not a ranking of "quantized KV". The header and §1 now say
+this, and §2.3 names the file that records each configuration's choice.
+
+**Row W1 was not on this page, and it is the row that decides whether LSA's clustering risk is real.** It was measured
+in the same session on the same card, so it belongs here rather than in a separate document that a reader of this
+table would not open. It passes at 0.63× its bar and costs 0.009% of a 256K prefill (§2.4a) — which is the opposite
+of what the feature plan's risk ranking predicted, and worth a row precisely because the prediction was wrong.
