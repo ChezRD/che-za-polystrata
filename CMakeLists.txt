@@ -506,6 +506,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(lsa_scan_bench src/kernels/lsa_scan_bench.cu)
     target_include_directories(lsa_scan_bench PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(lsa_scan_bench PRIVATE ${_strata_gpu_runtime_target})
+    # Phase 0 gate W1 (LSA-PLAN.md §3.3): Ward clustering of one 512-key LSA cluster block, one CTA a block,
+    # every merge round in shared memory; us a block, us a layer, ms of prefill, and the clustering quality
+    add_executable(lsa_ward_bench src/kernels/lsa_ward_bench.cu)
+    target_include_directories(lsa_ward_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(lsa_ward_bench PRIVATE ${_strata_gpu_runtime_target})
     # Phase 0 row 5 (docs/../OPTIMIZATION-STACK.md §0.3): the Q8_1 activation quantizers at the MoE path's shapes,
     # as GB/s of activations in plus int8 out (a benchmark, no test)
     add_executable(q8_1_quant_bench src/kernels/q8_1_quant_bench.cpp)
