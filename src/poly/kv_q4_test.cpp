@@ -8,11 +8,19 @@
 //   4. store_q4_at with a ring: two rows written from a device `at` land at (*at + r) % ring and equal what plain
 //      store_q4 writes from the same position.
 // Exit 0 prints "poly_kv_q4_test: PASS"; any failed assertion prints the offending index and values and exits 1.
+//
+// --bench: the k8v4 store timed as the engine issues it (qwen35.cpp: fwht_rows over a (token, KV head) row of the
+// values, then store_q8 for the keys and store_q4 for the values), and the q8_0 store of the same cells as the
+// comparison arm, interleaved in this one process so both see the same clock and the same allocation history.
+// 832 B a cell for k8v4 (K 512 codes + 16 fp16 scales = 544, V 256 nibble bytes + 16 fp16 scales = 288) against
+// 1,088 B for q8_0 (544 + 544).  The time is ns a cell over a write of `cells` rows, the rows cycled so the whole
+// cache is touched and a 4K run cannot stay in L2 by luck.  This measures the write path, not the cache's size.
 #include "strata/poly/kernels.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -226,9 +234,234 @@ void at_case(std::mt19937& rng, int& fails) {
     std::printf("store_q4_at: rows at (*at + r) %% ring\n");
 }
 
+// --bench: the store side of Row 1 of the optimization stack's Phase 0 (OPTIMIZATION-STACK.md §0.3 Row 1).
+// The shapes are the engine's: head_dim 256, 2 KV heads, so a cell is 512 values a side.  k8v4's K is q8_0's
+// (544 B a cell) and its V is Q4_0's (288 B), 832 B in all against q8_0's 1,088 B.
+//
+// Two shapes, because they answer two different questions:
+//   bulk    the whole cache written in chunks, as a prompt batch writes its own rows.  This is the write
+//           bandwidth the row's pass criterion is about.
+//   decode  one row a call, back to back, as a decode step appends a token.  This is the per-token cost the
+//           engine pays, launch overhead included.
+// Both arms run interleaved in this one process (median of several reps), so they see the same clock and the same
+// allocation history - the bimodality lesson from MB-ROW-6-7.md §1.
+//
+// The values come from one source buffer of `cells` rows, so both arms read the same input and the only difference
+// between them is the bytes they write.  k8v4 additionally rotates each chunk (fwht_rows) before Q4_0, exactly as
+// qwen35.cpp does; the store without the rotation is timed too, so the rotation can be charged separately.
+namespace bench {
+
+constexpr int kHeadDim = 256, kKvHeads = 2;
+constexpr int kWidth = kKvHeads * kHeadDim;   // 512 values a side of a cell
+// K: 512 int8 codes + 16 fp16 scales = 544 B; V k8v4: 256 nibble bytes + 16 fp16 scales = 288 B
+constexpr int kCellBytesK8V4 = 544 + 288;
+constexpr int kCellBytesQ8 = 544 + 544;
+// The store is a read-modify-write: to write a cell's quantized bytes it must READ the cell's floats.  Four bytes
+// a value is what the quantizer needs, so a cell's traffic is far more than the bytes it leaves in the cache -
+// which is what makes "GB/s of KV bytes written" a denominator with a ceiling well below the card's peak.
+//   read  k8v4: kWidth floats for store_q8's keys + kWidth for store_q4's values = 2 * 4 * kWidth = 4,096 B
+//   read   q8_0: the same two sides, 4,096 B
+//   write k8v4: 832 B;  q8_0: 1,088 B
+// and, for k8v4 only, the rotation's own pass: it reads the values and writes the rotated copy, which store_q4 then
+// reads.  With the rotated copy in L2 (a chunk is 8 MiB against a 32 MiB L2) that pass adds no DRAM traffic.
+constexpr int kReadK8V4 = 2 * 4 * kWidth;
+constexpr int kReadQ8 = 2 * 4 * kWidth;
+constexpr int kRotateK8V4 = 2 * 4 * kWidth;   // one read of the values + one write of the rotated copy
+// The same helpers the engine's cell is: k8v4 writes 832 B of a cell and must move at least 4,096 B to do it.
+constexpr double kKvShareK8V4 = (double) kCellBytesK8V4 / (kCellBytesK8V4 + kReadK8V4);
+// A chunk of rows: 4,096 rows of 512 values is 8 MiB, which is one prompt chunk's worth of v_ in the engine.
+// THE SOURCE IS THIS SMALL ON PURPOSE.  store_q8/store_q4 read 4 B a value to quantize it, so a source read from
+// DRAM would cost 4,096 B of traffic for a 832 B cell and cap "KV bytes written" at 17% of the peak no matter how
+// good the kernel is.  In the engine the source is the projection's fresh output: one token's k or v is 2 KB at
+// decode and a chunk's is 8 MB at prefill, both hot in this card's 32 MB L2.  So the source here is a chunk that
+// stays resident and the cache is what reaches DRAM - which is the traffic the row's criterion is about.
+constexpr int kChunk = 4096;
+
+struct Arm {
+    const char* name;
+    int cell_bytes;
+    double ns_cell;
+};
+
+// k8v4 as the engine issues it: rotate the chunk's (token, KV head) rows, then store_q8 the keys and store_q4 the
+// values.  dx is the source chunk, vt the rotated copy.
+void store_k8v4(const float* dx, float* vt, int8_t* kc, uint16_t* ks, uint8_t* vq, uint16_t* vs, int64_t first,
+                int rows) {
+    strata::poly::fwht_rows(dx, vt, rows * kKvHeads, kHeadDim, nullptr);
+    strata::poly::store_q8(dx, kc, ks, kWidth, first, rows, nullptr);
+    strata::poly::store_q4(vt, vq, vs, kWidth, first, rows, nullptr);
+}
+
+// The same stores with no rotation, to charge the ALU separately.
+void store_k8v4_norot(const float* dx, int8_t* kc, uint16_t* ks, uint8_t* vq, uint16_t* vs, int64_t first,
+                      int rows) {
+    strata::poly::store_q8(dx, kc, ks, kWidth, first, rows, nullptr);
+    strata::poly::store_q4(dx, vq, vs, kWidth, first, rows, nullptr);
+}
+
+void store_q8_pair(const float* dx, int8_t* kc, uint16_t* ks, int8_t* vc, uint16_t* vs, int64_t first, int rows) {
+    strata::poly::store_q8(dx, kc, ks, kWidth, first, rows, nullptr);
+    strata::poly::store_q8(dx, vc, vs, kWidth, first, rows, nullptr);
+}
+
+double median_ns(std::vector<double>& v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
+}  // namespace bench
+
+void bench_main() {
+    using namespace bench;
+    cudaSetDevice(0);
+    const int contexts[] = {4096, 32768, 131072, 262144};
+    // the card's own peak, for the fraction this row is judged on: 2 * clk * (bus / 8), DDR
+    int dev = 0, bus = 0, clk = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&bus, cudaDevAttrGlobalMemoryBusWidth, dev);
+    cudaDeviceGetAttribute(&clk, cudaDevAttrMemoryClockRate, dev);   // kHz, the card's max memory clock
+    const double peak = 2.0 * (double) clk * 1e3 * (bus / 8) / 1e9;
+    std::printf("k8v4 store: head_dim %d, %d KV heads, %d values a side; %d B a cell against q8_0's %d B\n", kHeadDim,
+                kKvHeads, kWidth, kCellBytesK8V4, kCellBytesQ8);
+    std::printf("peak %.1f GB/s (2 x %.0f MHz x %d bit / 8, clocks.max.memory)\n", peak, clk / 1e3, bus);
+    std::printf("the source is a %d-row chunk held in L2, as the engine's freshly projected k/v is; the cache\n"
+                "write is the DRAM traffic this row is about (%d B a cell for k8v4, %d B for q8_0)\n",
+                kChunk, kCellBytesK8V4, kCellBytesQ8);
+    const int maxc = contexts[3];
+    // the source holds one chunk, cycled for every row of the cache: L2-resident, as the engine's is
+    std::mt19937 rng(99);
+    float* dx;
+    float* vt;
+    int8_t* kc;
+    uint16_t* ks;
+    int8_t* vc;
+    uint8_t* vq;
+    uint16_t* vs;
+    ck(cudaMalloc(&dx, (size_t) kChunk * kWidth * sizeof(float)), "bench x");
+    ck(cudaMalloc(&vt, (size_t) kChunk * kWidth * sizeof(float)), "bench vt");
+    ck(cudaMalloc(&kc, (size_t) maxc * kWidth), "bench k codes");
+    ck(cudaMalloc(&ks, (size_t) maxc * (kWidth / 32) * sizeof(uint16_t)), "bench k scales");
+    ck(cudaMalloc(&vc, (size_t) maxc * kWidth), "bench v codes");
+    ck(cudaMalloc(&vq, (size_t) maxc * (kWidth / 32) * 16), "bench v q4");
+    ck(cudaMalloc(&vs, (size_t) maxc * (kWidth / 32) * sizeof(uint16_t)), "bench v scales");
+    {
+        std::vector<float> x((size_t) kChunk * kWidth);
+        for (float& v : x) v = rand_val(rng);
+        ck(cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "bench x up");
+    }
+    cudaEvent_t e0, e1;
+    ck(cudaEventCreate(&e0), "event");
+    ck(cudaEventCreate(&e1), "event");
+
+    // ---- bulk: the cache written a chunk at a time.  The pass criterion is judged here.
+    std::printf("\nbulk: the whole cache written in %d-row chunks (the arm the criterion names is k8v4)\n", kChunk);
+    std::printf("  cells   arm          ns/cell   GB/s   %% of %.0f (max clk)   %% of 280.0 (loaded)\n", peak);
+    for (int ci = 0; ci < 4; ++ci) {
+        const int c = contexts[ci];
+        std::vector<double> k8, q8, nr;
+        const int reps = c > 100000 ? 5 : 9;
+        for (int r = 0; r < reps; ++r) {
+            cudaEventRecord(e0);
+            for (int row = 0; row < c; row += kChunk)
+                store_k8v4(dx, vt, kc, ks, vq, vs, row, std::min(kChunk, c - row));
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "bulk k8v4");
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (r) k8.push_back((double) ms * 1e6 / c);   // the first touch of the pages is not the write
+            cudaEventRecord(e0);
+            for (int row = 0; row < c; row += kChunk)
+                store_q8_pair(dx, kc, ks, vc, vs, row, std::min(kChunk, c - row));
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "bulk q8");
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (r) q8.push_back((double) ms * 1e6 / c);
+            cudaEventRecord(e0);
+            for (int row = 0; row < c; row += kChunk)
+                store_k8v4_norot(dx, kc, ks, vq, vs, row, std::min(kChunk, c - row));
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "bulk k8v4 nrot");
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (r) nr.push_back((double) ms * 1e6 / c);
+        }
+        const double k8ns = median_ns(k8), q8ns = median_ns(q8), nrns = median_ns(nr);
+        const double k8g = kCellBytesK8V4 / k8ns, q8g = kCellBytesQ8 / q8ns, nrg = kCellBytesK8V4 / nrns;
+        std::printf("  %6d  k8v4         %9.2f  %6.1f  %14.1f%%  %16.1f%%\n", c, k8ns, k8g, 100.0 * k8g / peak,
+                    100.0 * k8g / 280.0);
+        std::printf("  %6d  k8v4 no-rot  %9.2f  %6.1f  %14.1f%%  %16.1f%%\n", c, nrns, nrg, 100.0 * nrg / peak,
+                    100.0 * nrg / 280.0);
+        std::printf("  %6d  q8_0         %9.2f  %6.1f  %14.1f%%  %16.1f%%\n", c, q8ns, q8g, 100.0 * q8g / peak,
+                    100.0 * q8g / 280.0);
+        std::printf("         k8v4 writes %.1f%% of q8_0's bytes and takes %.1f%% of its time (%.0f%% of the byte "
+                    "saving reaches memory as time); the rotation is %.1f%% of k8v4's time\n",
+                    100.0 * kCellBytesK8V4 / kCellBytesQ8, 100.0 * k8ns / q8ns,
+                    100.0 * (1.0 - k8ns / q8ns) / (1.0 - (double) kCellBytesK8V4 / kCellBytesQ8),
+                    100.0 * (k8ns - nrns) / k8ns);
+        // the same time read against the bytes the operation must actually move
+        const double k8traffic = kCellBytesK8V4 + kReadK8V4;
+        const double q8traffic = kCellBytesQ8 + kReadQ8;
+        std::printf("         as traffic (read %.0f B + write a cell): k8v4 %.1f GB/s, q8_0 %.1f GB/s "
+                    "--> %.0f%% and %.0f%% of the peak\n",
+                    (double) kReadK8V4, k8traffic / k8ns, q8traffic / q8ns, 100.0 * k8traffic / k8ns / peak,
+                    100.0 * q8traffic / q8ns / peak);
+    }
+
+    // ---- the control: the same bytes written by cudaMemset.  If this is also far from the peak, the measurement
+    // or the card is the limit and the kernels are not; if it is near the peak, the store kernels are.
+    std::printf("\ncontrol: the same 832 B a cell written by cudaMemset (no read, no quantize)\n");
+    std::printf("  cells   ns/cell   GB/s   %% of %.0f (max clk)   %% of 280.0 (loaded)\n", peak);
+    for (int c : contexts) {
+        std::vector<double> v;
+        for (int r = 0; r < 7; ++r) {
+            cudaEventRecord(e0);
+            ck(cudaMemset(kc, 0, (size_t) c * kWidth), "memset k");
+            ck(cudaMemset(ks, 0, (size_t) c * (kWidth / 32) * sizeof(uint16_t)), "memset ks");
+            ck(cudaMemset(vq, 0, (size_t) c * (kWidth / 32) * 16), "memset vq");
+            ck(cudaMemset(vs, 0, (size_t) c * (kWidth / 32) * sizeof(uint16_t)), "memset vs");
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "memset");
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            if (r) v.push_back((double) ms * 1e6 / c);
+        }
+        const double ns = median_ns(v);
+        const double gbs = (double) kCellBytesK8V4 / ns;
+        std::printf("  %6d  %9.2f  %6.1f  %14.1f%%  %16.1f%%\n", c, ns, gbs, 100.0 * gbs / peak,
+                    100.0 * gbs / 280.0);
+    }
+
+    // ---- decode: one row a call.  This is launch cost, so it is reported and not judged.
+    const int steps = 65536;
+    std::printf("\ndecode: one row a call, %d calls a rep, the cache's own rows cycled\n", steps);
+    std::printf("  arm          ns/cell   GB/s   %% of %.0f (max clk)   %% of 280.0 (loaded)\n", peak);
+    for (int arm = 0; arm < 2; ++arm) {
+        const bool k8 = arm == 0;
+        std::vector<double> v;
+        for (int r = 0; r < 5; ++r) {
+            cudaEventRecord(e0);
+            for (int i = 0; i < steps; ++i) {
+                const int64_t row = ((int64_t) r * 104729 + i) % maxc;
+                const float* src = dx + (size_t) (row % kChunk) * kWidth;
+                if (k8) store_k8v4(src, vt, kc, ks, vq, vs, row, 1);
+                else store_q8_pair(src, kc, ks, vc, vs, row, 1);
+            }
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "decode rows");
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            v.push_back((double) ms * 1e6 / steps);
+        }
+        const double ns = median_ns(v);
+        const int bytes = k8 ? kCellBytesK8V4 : kCellBytesQ8;
+        const double gbs = (double) bytes / ns;
+        std::printf("  %-11s  %9.2f  %6.1f  %14.1f%%  %16.1f%%\n", k8 ? "k8v4" : "q8_0", ns, gbs, 100.0 * gbs / peak,
+                    100.0 * gbs / 280.0);
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     std::mt19937 rng(1234);
     int fails = 0;
     long values = 0;
@@ -244,5 +477,8 @@ int main() {
         return 1;
     }
     std::printf("poly_kv_q4_test: PASS (%ld values)\n", values);
+    // the timing leg is separate from the pass: `--bench` runs it after the checks have passed
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--bench") == 0) bench_main();
     return 0;
 }

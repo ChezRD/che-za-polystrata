@@ -18,7 +18,14 @@
 //        poly_fattn_test [dec] gqa16   the same checks with Ornith 122B's 32 heads / 2 KV heads
 //        poly_fattn_test dec   fdec_q8() and fdec_f16() (the decode kernel) against attend() and the doubles, up
 //                              to 170,000 rows; a token alone and with others, and from a position on the card,
-//                              to the bit
+//                              to the bit; and the GB/s of cache read at 4K/32K/128K/256K
+//        poly_fattn_test sweep  one token's decode cost against the context, with nothing else in the process
+//        poly_fattn_test k8v4  fdec_k8v4() (q8_0 keys, Q4_0 values) against attend() over the same cache and
+//                              against the doubles, at the same contexts and in the same GB/s terms.  Before this
+//                              the kernel had no test at all (grep -rln fdec_k8v4 over the tests was empty).
+//                              Also the two identity claims the plan rests on: k8v4's key bytes ARE store_q8's,
+//                              and the decode kernel is bit-identical to fdec_q8() when the value cache holds the
+//                              same numbers.
 #include "fattn.hpp"
 #include "strata/poly/kernels.hpp"
 
@@ -39,6 +46,8 @@ namespace {
 using namespace strata::poly;
 
 constexpr int kDim = 256, kKvHeads = 2, kWidth = kKvHeads * kDim, kMaxRows = 131072, kBatch = 1024;
+// The contexts row 1 and row 2 of the optimization stack's Phase 0 are judged at (OPTIMIZATION-STACK.md §0.3).
+constexpr long long kContexts[] = {4096, 32768, 131072, 262144};
 int kHeads = 16;   // gqa16 selects 32; the existing group-8 geometry remains the default
 constexpr size_t kScore = size_t(16) << 20;   // Qwen35's score_ (kScoreFloats)
 constexpr float kRoomBatch = 2e-2f, kRoomDoubles = 7.5e-3f;   // the bounds, as shares of the largest result (at least 1)
@@ -181,6 +190,360 @@ std::vector<double> exact(const Cache& K, const Cache& V, const float* qh, int g
     return o;
 }
 
+// ---- k8v4: q8_0 keys, Q4_0 values -------------------------------------------------------------------------
+// Bytes a cache row takes.  k8v4's keys ARE q8_0's (store_q8, qwen35.cpp:549), so its key row is a q8_0 one.
+constexpr int kRowBytesQ8 = kWidth + (kWidth / 32) * 2;                    // 512 int8 + 16 fp16 scales = 544
+constexpr int kRowBytesV4 = (kWidth / 32) * 16 + (kWidth / 32) * 2;         // 256 nibble bytes + 16 fp16 = 288
+constexpr int kCellBytesK8V4 = kRowBytesQ8 + kRowBytesV4;                  // 832 a cell (K and V)
+constexpr int kCellBytesQ8 = kRowBytesQ8 * 2;                              // 1,088
+
+// A Q4_0 cache on the host, decoded the way Kvq4 documents it: block b at q[row * (n/32) * 16 + b * 16],
+// element j the low nibble of byte j for j < 16 and the high nibble of byte j - 16 otherwise.
+struct V4Host {
+    std::vector<uint8_t> q;
+    std::vector<uint16_t> sc;
+    float at(size_t row, int i) const {
+        const size_t nb = kWidth / 32;
+        const uint8_t byte = q[(row * nb + i / 32) * 16 + (size_t) (i % 32 < 16 ? i % 32 : i % 32 - 16)];
+        const int nib = i % 32 < 16 ? (byte & 0x0F) : (byte >> 4);
+        return (float) (nib - 8) * __half2float(__ushort_as_half(sc[row * nb + i / 32]));
+    }
+};
+
+// ggml's q4_0 rule, as kv_q4_test.cpp's host reference states it.
+void q4_host_row(const float* x, uint8_t* q, uint16_t* sc) {
+    for (int b = 0; b < kWidth / 32; ++b) {
+        const float* xb = x + b * 32;
+        float amax = 0.f, mval = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            const float a = std::fabs(xb[j]);
+            if (a > amax || (a == amax && xb[j] > mval)) {
+                amax = a;
+                mval = xb[j];
+            }
+        }
+        const float d = mval / -8.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        sc[b] = __half_as_ushort(__float2half_rn(d));
+        for (int j = 0; j < 16; ++j) {
+            const int q0 = (int) (xb[j] * id + 8.5f);
+            const int q1 = (int) (xb[j + 16] * id + 8.5f);
+            const uint8_t a = (uint8_t) (q0 < 0 ? 0 : (q0 > 15 ? 15 : q0));
+            const uint8_t c = (uint8_t) (q1 < 0 ? 0 : (q1 > 15 ? 15 : q1));
+            q[b * 16 + j] = (uint8_t) (a | (c << 4));
+        }
+    }
+}
+
+// The doubles' result of token t's head h over a q8_0 key cache and a Q4_0 value cache.
+std::vector<double> exact_v4(const Cache& K, const V4Host& V, const float* qh, int g, long long keys, float scale) {
+    std::vector<double> w(keys), o(kDim, 0.0);
+    double top = -1e300, z = 0;
+    for (long long r = 0; r < keys; ++r) {
+        double s = 0;
+        for (int i = 0; i < kDim; ++i) s += (double) qh[i] * K.at(r, g * kDim + i);
+        top = std::max(top, w[r] = s * scale);
+    }
+    for (auto& x : w) z += x = std::exp(x - top);
+    for (long long r = 0; r < keys; ++r)
+        for (int i = 0; i < kDim; ++i) o[i] += w[r] * V.at(r, g * kDim + i);
+    for (double& x : o) x /= z;
+    return o;
+}
+
+// k8v4_main: fdec_k8v4() against attend() over the same q8_0-key / Q4_0-value cache and against the doubles, at
+// the four contexts the stack's rows are judged at, with the GB/s of cache read; then the identity the plan's
+// argument rests on, on a cache both formats hold exactly.
+int k8v4_main() {
+    // The largest context this row is judged at is 262,144 positions, and a token at position 262,144 attends the
+    // rows 0..262,144 inclusive: one row more than the context.  Sizing the cache to the context reads one row
+    // past its end (it produced inf at 256K before this was fixed).
+    constexpr int kRows = 262145;
+    std::mt19937 rng(23);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int kMaxN = 2;
+    std::vector<float> q(size_t(kMaxN) * kHeads * kDim);
+    for (float& x : q) x = 2.f * nd(rng);
+
+    // K: q8_0 codes and scales, as the engine's store_q8 writes them
+    const Cache K = make(rng, kRows);
+    int8_t* kc = upload(K.codes);
+    uint16_t* ks = upload(K.scales);
+    const Kvq8 kq{kc, ks};
+
+    // V: random values quantized to Q4_0 by the host reference, row by row (the cache is 512 MB of floats if held
+    // whole, so it is made a row at a time)
+    V4Host V;
+    V.q.resize((size_t) kRows * (kWidth / 32) * 16);
+    V.sc.resize((size_t) kRows * (kWidth / 32));
+    std::vector<float> row(kWidth);
+    for (int r = 0; r < kRows; ++r) {
+        for (float& x : row) x = draw(rng);
+        q4_host_row(row.data(), V.q.data() + (size_t) r * (kWidth / 32) * 16, V.sc.data() + (size_t) r * (kWidth / 32));
+    }
+    uint8_t* vq = upload(V.q);
+    uint16_t* vs = upload(V.sc);
+    const Kvq4 v4{vq, vs};
+
+    float* dq = upload(q);
+    float *score, *out;
+    long long* at;
+    cudaMalloc(&score, kScore * sizeof(float));
+    cudaMalloc(&out, size_t(kMaxN) * kHeads * kDim * sizeof(float));
+    cudaMalloc(&at, sizeof(long long));
+    const float scale = 1.f / 16.f;
+    auto old = [&](long long pos, int n) {
+        const int chunk = std::min<size_t>(4, kScore / (size_t(kHeads) * (pos + n)));
+        attend(dq, nullptr, nullptr, pos, n, score, chunk, out, kDim, kHeads, kKvHeads, scale, nullptr, 0, 0, false,
+               nullptr, 0, 0, kq, Kvq8{}, nullptr, 0, v4);
+    };
+    auto dec = [&](long long pos, int n, bool on_card) {
+        int room = 1024;
+        while (room < pos + n) room *= 2;
+        if (on_card) cudaMemcpy(at, &pos, sizeof pos, cudaMemcpyHostToDevice);
+        return fdec_k8v4(dq, kq, v4, pos, n, on_card ? at : nullptr, std::min(room, kRows), out, kDim, kHeads,
+                         kKvHeads, scale, score, kScore, nullptr);
+    };
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    auto time = [&](auto&& run) {
+        run();
+        cudaEventRecord(e0);
+        for (int i = 0; i < 10; ++i) run();
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        return ms / 10;
+    };
+    if (!dec(kContexts[0], 1, false)) {
+        std::printf("FAIL k8v4 pos %lld: fdec_k8v4 refused\n", kContexts[0]);
+        return 1;
+    }
+    cudaDeviceSynchronize();
+    std::printf("k8v4 decode: q8_0 keys + Q4_0 values, %d B a cell against q8_0's %d B\n", kCellBytesK8V4,
+                kCellBytesQ8);
+    std::printf("%s\n", "   pos   rows   from attend()   vs doubles   GB/s read   % of 288   % of 280   "
+                        "q8_0 GB/s   ratio   ms");
+    int bad = 0;
+    double k8_gbs[4] = {0}, q8_gbs[4] = {0};
+    for (int ci = 0; ci < 4; ++ci) {
+        const long long pos = kContexts[ci];
+        const int n = 1;
+        old(pos, n);
+        const size_t cells = size_t(n) * kHeads * kDim;
+        const std::vector<float> ref = download(out, cells);
+        cudaMemset(out, 0, cells * sizeof(float));
+        if (!dec(pos, n, false)) {
+            std::printf("FAIL k8v4 pos %6lld: refused\n", pos);
+            ++bad;
+            continue;
+        }
+        const std::vector<float> fd = download(out, cells);
+        // alone at its own position, and from a position the card holds: the same bits
+        dec(pos, n, true);
+        const std::vector<float> fd_at = download(out, cells);
+        bool same = fd_at == fd;
+        cudaMemcpy(dq, q.data(), size_t(kHeads) * kDim * sizeof(float), cudaMemcpyHostToDevice);
+        dec(pos, 1, true);
+        const std::vector<float> one = download(out, size_t(kHeads) * kDim);
+        same = same && std::equal(one.begin(), one.end(), fd.begin());
+        cudaMemcpy(dq, q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice);
+        float most = 0.f, big = 0.f, most_fd = 0.f, most_ref = 0.f;
+        for (size_t i = 0; i < cells; ++i) {
+            const float d = std::fabs(fd[i] - ref[i]);
+            most = std::max(most, std::isnan(d) ? INFINITY : d);
+            big = std::max(big, std::fabs(ref[i]));
+        }
+        for (int t : {0, n - 1})
+            for (int h = 0; h < kHeads; h += pos > 50000 ? 5 : 1) {
+                const std::vector<double> o =
+                    exact_v4(K, V, q.data() + size_t(t) * kHeads * kDim + size_t(h) * kDim, h / (kHeads / kKvHeads),
+                             pos + t + 1, scale);
+                for (int i = 0; i < kDim; ++i) {
+                    const size_t a = (size_t(t) * kHeads + h) * kDim + i;
+                    most_fd = std::max(most_fd, (float) std::fabs(fd[a] - o[i]));
+                    most_ref = std::max(most_ref, (float) std::fabs(ref[a] - o[i]));
+                }
+            }
+        const float ms = time([&] { dec(pos, n, false); });
+        const double gbs = (double) kCellBytesK8V4 * (pos + n) / (ms * 1e6);
+        // the q8_0 arm of the same read at this context, for the ratio the row turns on
+        const Cache Kq = K;
+        const double msq = time([&] {
+            const int chunk = std::min<size_t>(4, kScore / (size_t(kHeads) * (pos + n)));
+            attend(dq, nullptr, nullptr, pos, n, score, chunk, out, kDim, kHeads, kKvHeads, scale, nullptr, 0, 0,
+                   false, nullptr, 0, 0, kq, kq, nullptr, 0, Kvq4{});
+        });
+        (void) Kq;
+        const double gbsq = (double) kCellBytesQ8 * (pos + n) / (msq * 1e6);
+        k8_gbs[ci] = gbs;
+        q8_gbs[ci] = gbsq;
+        const bool ok = same && most <= 1e-2f && most_fd <= 1e-2f;
+        bad += !ok;
+        std::printf("%s %6lld  %4d  %12.2e  %11.2e  %9.1f  %8.1f%%  %8.1f%%  %10.1f  %6.3f  %6.3f%s\n",
+                    ok ? "ok  " : "FAIL", pos, n, most, most_fd, gbs, 100.0 * gbs / 288.0, 100.0 * gbs / 280.0, gbsq,
+                    gbs / gbsq, ms, same ? "" : "  BITS DIFFER");
+    }
+
+    // ---- the identity: on a cache both formats hold exactly, the two decode kernels must agree to the bit.
+    // A block of 32 equal values v (|v| a power of two) is the amax of its own block, so Q8_0 gives d = |v|/127 and
+    // code +-127 -> exactly v, and Q4_0 gives d = v/-8 with code 0 -> exactly v.  Nothing is lost on either side,
+    // so any difference is the kernels' arithmetic and nothing else.
+    // A block of 32 equal values amax = 127 * 2^-k is the block's own amax, so Q8_0 gives d = amax/127 = 2^-k, an
+    // fp16 exactly, and code +-127 decodes back to amax exactly; Q4_0 gives d = amax/8 = 127*2^-(k+3), also fp16
+    // exact, and code 0 decodes to amax exactly.  Nothing is lost on either side, so any difference below is the
+    // kernels' arithmetic and nothing else.  (A power of two would NOT work: 2^-6/127 is not an fp16.)
+    constexpr int kExactRows = 32;   // <= 32 cells, as the plan asks
+    std::vector<float> xv((size_t) kExactRows * kWidth);
+    for (int r = 0; r < kExactRows; ++r)
+        for (int i = 0; i < kWidth; ++i) {
+            const int b = i / 32;
+            const float mag = std::ldexp(127.0f, -8 - ((r + b) % 4));
+            xv[(size_t) r * kWidth + i] = ((r + b) & 1) ? -mag : mag;
+        }
+    float* dxv = upload(xv);
+    int8_t* ekc;
+    uint16_t* eks;
+    int8_t* evc;
+    uint16_t* evs;
+    uint8_t* evq;
+    uint16_t* evq_s;
+    cudaMalloc(&ekc, (size_t) kExactRows * kWidth);
+    cudaMalloc(&eks, (size_t) kExactRows * (kWidth / 32) * sizeof(uint16_t));
+    cudaMalloc(&evc, (size_t) kExactRows * kWidth);
+    cudaMalloc(&evs, (size_t) kExactRows * (kWidth / 32) * sizeof(uint16_t));
+    cudaMalloc(&evq, (size_t) kExactRows * (kWidth / 32) * 16);
+    cudaMalloc(&evq_s, (size_t) kExactRows * (kWidth / 32) * sizeof(uint16_t));
+    strata::poly::store_q8(dxv, ekc, eks, kWidth, 0, kExactRows, nullptr);
+    strata::poly::store_q8(dxv, evc, evs, kWidth, 0, kExactRows, nullptr);
+    strata::poly::store_q4(dxv, evq, evq_s, kWidth, 0, kExactRows, nullptr);
+    cudaDeviceSynchronize();
+    // the two stores must have kept the same numbers: decode both on the host and compare
+    std::vector<int8_t> hc((size_t) kExactRows * kWidth);
+    std::vector<uint16_t> hs((size_t) kExactRows * (kWidth / 32));
+    std::vector<uint8_t> hq((size_t) kExactRows * (kWidth / 32) * 16);
+    std::vector<uint16_t> hqs((size_t) kExactRows * (kWidth / 32));
+    cudaMemcpy(hc.data(), evc, hc.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hs.data(), evs, hs.size() * 2, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hq.data(), evq, hq.size(), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hqs.data(), evq_s, hqs.size() * 2, cudaMemcpyDeviceToHost);
+    size_t ndiff = 0;
+    double worst = 0;
+    for (int r = 0; r < kExactRows; ++r)
+        for (int i = 0; i < kWidth; ++i) {
+            const float a = (float) hc[(size_t) r * kWidth + i] * __half2float(__ushort_as_half(hs[(size_t) r * (kWidth / 32) + i / 32]));
+            V4Host t;
+            t.q = hq;
+            t.sc = hqs;
+            const float b = t.at((size_t) r, i);
+            if (a != b) {
+                ++ndiff;
+                worst = std::max(worst, (double) std::fabs(a - b));
+            }
+        }
+    const Kvq8 ekq{ekc, eks};
+    const Kvq4 ev4{evq, evq_s};
+    float* eout;
+    cudaMalloc(&eout, size_t(kExactRows) * kHeads * kDim * sizeof(float));
+    auto run_exact = [&](bool k8v4) {
+        cudaMemset(eout, 0, size_t(kExactRows) * kHeads * kDim * sizeof(float));
+        const bool ok = k8v4 ? fdec_k8v4(dq, ekq, ev4, 0, kExactRows, nullptr, kExactRows, eout, kDim, kHeads, kKvHeads,
+                                         scale, score, kScore, nullptr)
+                             : fdec_q8(dq, ekq, ekq, 0, kExactRows, nullptr, kExactRows, eout, kDim, kHeads, kKvHeads,
+                                       scale, score, kScore, nullptr);
+        return ok ? download(eout, size_t(kExactRows) * kHeads * kDim) : std::vector<float>();
+    };
+    const std::vector<float> oq8 = run_exact(false), ov4 = run_exact(true);
+    const bool identical = !oq8.empty() && oq8 == ov4;
+    float idiff = 0.f;
+    size_t ibad = 0;
+    for (size_t i = 0; i < oq8.size() && i < ov4.size(); ++i)
+        if (oq8[i] != ov4[i]) {
+            ++ibad;
+            idiff = std::max(idiff, std::fabs(oq8[i] - ov4[i]));
+        }
+    std::printf("\nidentity (%d cells, every block an exact power of two in both formats):\n", kExactRows);
+    std::printf("  the two stores hold the same numbers: %zu of %d values differ", ndiff, kExactRows * kWidth);
+    if (ndiff) std::printf(" (a format difference, not a kernel one), worst %.3g", worst);
+    std::printf("\n");
+    std::printf("  %s: fdec_k8v4 %s fdec_q8 (%zu of %zu values differ, worst %.3g)\n", identical ? "ok  " : "FAIL",
+                identical ? "is bit-identical to" : "DIFFERS from", ibad, oq8.size(), idiff);
+    bad += !identical;
+    std::printf(bad ? "k8v4: %d failed\n" : "k8v4: all passed\n", bad);
+    return bad ? 1 : 0;
+}
+
+// sweep_main: what one decode cell costs as the context grows, with nothing else in the process.  If the time a
+// cell takes is flat across contexts the read is latency- or launch-bound (the same fixed number of CTAs doing a
+// longer serial loop); if it is flat in the TOTAL time instead, or rises with cells, the work is what costs.
+// Cells are appended in one go before the timing, so a step measures the read alone.
+int sweep_main() {
+    const int rows_max = 262145;
+    std::mt19937 rng(31);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> q(size_t(kHeads) * kDim);
+    for (float& x : q) x = 2.f * nd(rng);
+    const Cache K = make(rng, rows_max);
+    int8_t* kc = upload(K.codes);
+    uint16_t* ks = upload(K.scales);
+    const Kvq8 kq{kc, ks};
+    V4Host V;
+    V.q.resize((size_t) rows_max * (kWidth / 32) * 16);
+    V.sc.resize((size_t) rows_max * (kWidth / 32));
+    {
+        std::vector<float> row(kWidth);
+        for (int r = 0; r < rows_max; ++r) {
+            for (float& x : row) x = draw(rng);
+            q4_host_row(row.data(), V.q.data() + (size_t) r * (kWidth / 32) * 16,
+                        V.sc.data() + (size_t) r * (kWidth / 32));
+        }
+    }
+    uint8_t* vq = upload(V.q);
+    uint16_t* vs = upload(V.sc);
+    const Kvq4 v4{vq, vs};
+    float* dq = upload(q);
+    float* score;
+    float* out;
+    cudaMalloc(&score, kScore * sizeof(float));
+    cudaMalloc(&out, size_t(kHeads) * kDim * sizeof(float));
+    const float scale = 1.f / 16.f;
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0);
+    cudaEventCreate(&e1);
+    auto time = [&](auto&& run) {
+        run();
+        cudaEventRecord(e0);
+        const int reps = 20;
+        for (int i = 0; i < reps; ++i) run();
+        cudaEventRecord(e1);
+        cudaEventSynchronize(e1);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, e0, e1);
+        return (double) ms / reps;
+    };
+    std::printf("k8v4 decode sweep, one token, %d query heads, %d KV heads, split by %d keys a CTA\n", kHeads, kKvHeads,
+                1024);
+    std::printf("%s\n", "   cells   fdec_k8v4 ms   ns/cell   GB/s   CTAs   CTAs/SM   q8_0 ms   q8_0 ns/cell");
+    for (int cells : {4096, 8192, 16384, 32768, 65536, 98304, 131072, 196608, 262144}) {
+        // `room` must be the exact row count, not rounded up: a room of 131,072 for a 65,536-cell call reads
+        // twice the cache and reports twice the work (this harness measured 3.5 ms for 65,536 that way).
+        const int r = std::min(cells + 1, rows_max);
+        const double ms4 = time([&] {
+            fdec_k8v4(dq, kq, v4, cells, 1, nullptr, r, out, kDim, kHeads, kKvHeads, scale, score, kScore, nullptr);
+        });
+        const double msq = time([&] {
+            fdec_q8(dq, kq, kq, cells, 1, nullptr, r, out, kDim, kHeads, kKvHeads, scale, score, kScore, nullptr);
+        });
+        const int ctas = ((cells + 1 + 1023) / 1024) * kKvHeads;
+        std::printf("  %7d  %13.3f  %8.1f  %5.1f  %5d  %8.2f  %8.3f  %12.1f\n", cells, ms4, ms4 * 1e6 / (cells + 1),
+                    (double) kCellBytesK8V4 * (cells + 1) / (ms4 * 1e6), ctas, (double) ctas / 34.0, msq,
+                    msq * 1e6 / (cells + 1));
+    }
+    return 0;
+}
+
 int decode_main() {
     constexpr int kRows = 172032, kMaxN = 9;
     std::mt19937 rng(11);
@@ -300,13 +663,15 @@ int decode_main() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    bool decode = false;
+    bool decode = false, k8v4 = false, sweep = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "dec") decode = true;
+        else if (arg == "k8v4") k8v4 = true;
+        else if (arg == "sweep") sweep = true;
         else if (arg == "gqa16") kHeads = 32;
         else {
-            std::fprintf(stderr, "usage: poly_fattn_test [dec] [gqa16]\n");
+            std::fprintf(stderr, "usage: poly_fattn_test [dec|k8v4] [gqa16]\n");
             return 2;
         }
     }
@@ -319,6 +684,20 @@ int main(int argc, char** argv) {
         fdec_fits(kDim, kHeads, kKvHeads, 1024, 0)) {
         std::printf("FAIL: unsupported shape or insufficient scratch accepted\n");
         return 1;
+    }
+    if (sweep) {
+        if (!fdec_fits(kDim, kHeads, kKvHeads, 262145, kScore)) {
+            std::printf("no decode kernel for this card\n");
+            return 1;
+        }
+        return sweep_main();
+    }
+    if (k8v4) {
+        if (!fdec_fits(kDim, kHeads, kKvHeads, 262144, kScore)) {
+            std::printf("no decode kernel for this card\n");
+            return 1;
+        }
+        return k8v4_main();
     }
     if (decode) {
         if (!fdec_fits(kDim, kHeads, kKvHeads, 172032, kScore)) {
