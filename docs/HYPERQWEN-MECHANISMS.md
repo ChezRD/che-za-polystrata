@@ -13,7 +13,7 @@ of these survive as *mechanisms* even though their implementation does not. This
 | **B** | **swap-AB decode** (`S^T = K·Q^T`, `O^T = V^T·P''`), tokens on MMA's M, query rows on N | the *idea* yes, the code no — `fdec_kernel` would be re-indexed, not rewritten | **6.25% padding at `--window 8`, 25% at `--window 4`, 62.5% at `--no-draft`.** But the kernel is **memory-bound at 11% of the roofline**, so the padding costs nothing measurable | 0 to read, 4–6 to build | **out.** The premise was wrong: the MMA is idle either way |
 | **C** | split count from SM count | **yes, as one constant** — `kSplit` has 4 functional sites and none of them is a planner | `CTAS_PER_SM = 2` (register-bound). 1024 fills the card at **17,408** tokens; **256 fills it at 4,352**. Blocks/SM stay 2 either way; scratch 7.6 → 30.2 MiB at 61K | 0.5 | **in, as a `constexpr` experiment.** Helps only ≤17K, worth sub-1% |
 | **A** | int8-QK prefill (3-way int8 split, `m16n8k32`) | **no**, on difficulty — the arithmetic leaves it alive | `Q·Kᵀ` is **5.83%** of a 32K dense prefill and `P·V` another 5.83%; attention is **17.7%** total. Three int8 MMAs against fp16-hi/lo's two at 2× rate is **1.33×**, worth **~1.45%** of prefill at 32K, ~2.5–3% at 61K | 8–10 | **out on cost, not share.** Real but small win, large bill |
-| **D** | calibrated draft vocabulary | **yes — the flag exists and takes a prefix** (`--draft-vocab N`, `engine.hpp:233`) | head is **52%** of a guess (360 of 694.5 MiB). 131,072 → 65,536 rows is **5.88% → 4.36%** of a 43 ms token. Plus **500 MiB of VRAM** back if `output_` becomes the gathered head — ~18,500 tokens of k8v4 | 1–2 | **in, first.** Above the 2% bar on time, and the VRAM half is bigger |
+| **D** | draft vocabulary — **a code-point prefix, not a frequency list** | **yes; the flag exists, the subset is wrong** | head is **52%** of a guess. **Cyrillic: 337 of 5,744 ids inside 131,072 (5.9%)**; Latin merges 55.8%, Kana 3.7%. 131,072 → 65,536 rows is **1.52 points** of a 43 ms token. The 502 MiB does **not** come back: `output_` must keep 248,320 rows for sampling | 1–2 | **in, first — for coverage, not VRAM.** English works; Russian is nearly inert |
 | **E** | GDN interior checkpoints | yes, onto `save_state`/`load_state` | 149.6 MiB a state; a checkpoint every 4,096 tokens at 61K is **15 × 149.6 = 2.2 GiB** | — | **out, one paragraph below** |
 | **F** | prefix caching, as a test | already there | `--conversation-cache-mib` parks a whole conversation; theirs caches a prefix at block granularity | 0.5 | **in, as an experiment** |
 | **G** | `cudagraph-memory-from-allocator` | our accounting is **already correct** | we add the graphs to `reserve_mib_`, the same class of fix | 0 | **out — already done** |
@@ -265,7 +265,60 @@ below the draft head (D), which is 1–2 days for a comparable slice of decode.
 
 ---
 
-## D. Draft vocabulary — the mechanism is bytes, not hit rate
+## D. Draft vocabulary — a code-point prefix, and a false comment at three sites
+
+### D.0 The finding: the comment is wrong, and the prefix is not language-neutral
+
+Three sites read `output_` as a truncated matrix with the same comment (`engine.cpp:5279`, `:5805`, `:5830`):
+
+```cpp
+Dev head = output_;   // the matrix's first rows are the common tokens'
+```
+
+**For this file that is false.** The token table is **byte-level BPE in byte order, not frequency order**: id 0 is
+`!`, ids 0–255 are the byte alphabet, and the merges follow. Read from the GGUF with `tools/gguf_reader.py`:
+
+| id | token |
+| ---: | --- |
+| 0–19 | `!` `"` `#` `$` `%` `&` `'` `(` `)` `*` `+` `,` `-` `.` `/` `0` `1` `2` `3` `4` |
+| 100 | `§` |
+| 1,000 | `Ġwould` |
+| 20,000 | `ĠBuilder` |
+| 131,071 | `æĸĩæĳĺ` (a CJK merge) |
+| 248,310–248,319 | `[PAD248310]` … `[PAD248319]` |
+
+So "the first 131,072 rows" is **the first 52.8% of a byte-ordered table** — a slice of the *merge* list, not a
+frequency ranking. What that slice contains, counted per leading character over all 248,320 tokens:
+
+| script | inside 131,072 | outside | total | % inside |
+| --- | ---: | ---: | ---: | ---: |
+| Latin + ASCII | 94,123 | 74,607 | 168,730 | **55.8%** |
+| CJK (Han) | 35,024 | 19,651 | 54,675 | 64.1% |
+| other script | 447 | 7,191 | 7,638 | 5.9% |
+| **Cyrillic** | **337** | **5,407** | **5,744** | **5.9%** |
+| Kana | 145 | 3,740 | 3,885 | 3.7% |
+| Arabic | 68 | 2,769 | 2,837 | 2.4% |
+| Hangul | 145 | 2,582 | 2,727 | 5.3% |
+| non-UTF-8 byte token | 730 | 214 | 944 | 77.3% |
+| Greek | 29 | 794 | 823 | 3.5% |
+| Hebrew | 14 | 279 | 293 | 4.8% |
+| Emoji/symbol | 10 | 14 | 24 | 41.7% |
+
+**All 95 printable ASCII single-byte tokens are inside the prefix** — verified: none is missing or at or past
+131,072. So English is coverable character by character and 55.8% of its *merges* are inside.
+
+**Cyrillic is not.** 337 of 5,744 ids — **5.9%** — and those 337 are the single characters (`о`, `а`, `е`, `т`, …).
+Every Russian *merge* is outside. Encoding a Russian paragraph with the full table gives 38 ids; only **13 of them
+(34.2%)** are inside 131,072, and the 25 that are outside carry **90.8% of the paragraph's bytes**. Re-encoding that
+paragraph with the prefix allowed falls back to **57 ids** (character-level BPE), so a Russian answer can be drafted
+only one character at a time, and any merge the target actually writes can never be proposed.
+
+**That is a correctness problem in the sense that matters: the default is not uniformly mediocre, it is
+language-dependent, and for Russian it is nearly inert.** Kana, Hangul, Arabic, Greek and Hebrew are the same
+(2–5% inside). `--draft-vocab N` therefore is not "a smaller vocabulary" — it is "the first N rows of a byte-ordered
+table", and what it covers depends on where a script's code points fall in the merge list.
+
+### D.1 What the machinery is
 
 ### D.1 The finding: the machinery exists and takes a prefix
 
@@ -293,6 +346,24 @@ nobody wrote down.
 
 `native_mmvq` reads its weight block **contiguously** (`native_mmvq.cu:3908` takes `const void* weights` and
 `n_out`; the launch walks rows from the base). A prefix therefore works for free and an arbitrary id set does not.
+
+### D.1a Is the 682 MiB resident, or is it traffic?
+
+**Resident.** `output_` is uploaded in full at load (`engine.cpp:2765`,
+`upload(…, n_embd_, n_vocab_, kAnyMat)`), and `upload_as` **requires the shape to match and copies the whole
+tensor** (`:1744-1750`: `if (t->shape[0] != n_in || rest != n_out) throw`). Nothing slices. So 682 MiB sits in
+VRAM whether `draft_rows()` is 131,072 or 40,960, and **the 360 MiB a guess reads is traffic *plus* footprint, not
+traffic alone** — the rest of the matrix is resident and unread.
+
+That is the opposite of the "free truncation" reading: a prefix *already* costs the full 682 MiB. A gathered
+65,536-row head would let `output_` itself be the gathered tensor, and the 502 MiB is real — but only if the head
+can be gathered, which `upload_as` cannot do (see D.3).
+
+**And there is a second, unplanned cost.** `n_vocab_` sizes five buffers: `logits_` (`:3038`), `wlogits_`
+(`:3077`), `h_wlogits_` (`:3078`), `h_logits_` (`:3136`), and it is the width of every logits copy
+(`:5146`, `:5378`, `:5676`). Sampling reads `engine.n_vocab()` (`main.cpp:484` → `Sampler::pick(logits, n_vocab, …)`),
+so **the target's own sampling needs all 248,320 logits** — a gathered head cannot shrink those. It shrinks the
+*draft* head only, which is what `head.n_out` already does for the read.
 
 ### D.2 Where the draft's time actually goes
 
@@ -338,9 +409,22 @@ Q4_K row of 2,880 B:
 a new kernel path for one caller — and saves the VRAM. **Not worth it**: at 65,536 ids the gathered copy is 180 MiB,
 and the engine already holds 682 MiB of `output_` it could reuse.
 
-**So (a).** And note the accounting: today the engine uploads the **full** `output_` (682 MiB) and then truncates
-`n_out` per call, so a gathered 180 MiB head would be **added** to the 682 unless `output_` stops being uploaded
-whole. That is a second, separate 500 MiB win — quantified in D.5.
+**So (a), and it needs a new loader path, not a flag.** `upload_as` cannot do it: it rejects a shape that is not
+the tensor's (`:1744-1750`) and copies the whole payload. A gather needs a sibling that takes an id list, walks the
+source rows, and either copies them in their GGUF type (Q4_K rows are self-contained — 5,120 values is exactly 20
+superblocks of 256, so a row is a byte range that can be cut) or goes through `to_float`/`ggml_quantize_chunk` per
+row, which is the path `kGuessMat` already uses (`:1762-1790`). **~60 lines**, and the `dense_at_` arena arithmetic
+works unchanged because it is a running byte offset.
+
+**What a gathered head does to `output_`.** Two options, and only one is honest:
+
+- **Keep `output_` whole and add the gathered head**: 682 + 180 = 862 MiB. Worse.
+- **Make `output_` the gathered head**: needs the full logits for sampling (`main.cpp:484` passes `n_vocab_`), so
+  the *target's* head cannot shrink. **Only the draft path can.** That is what `head.n_out` already does — so a
+  gathered draft head must be a **second, smaller `Dev`** and the 502 MiB does **not** come back, because
+  `output_` still has to hold all 248,320 rows for the target's own sampling.
+
+**So the VRAM half of this item is not real as I stated it.** Corrected in D.5.
 
 ### D.4 Producing the list without training
 
@@ -365,31 +449,51 @@ Three sources, ranked by feasibility for us:
 
 **Not viable: the MTP block's weights.** They say which tokens the block can score, not which the target writes.
 
-### D.5 The honest bound — above the 2% bar, and the VRAM half is bigger
+### D.5 The honest bound, split into its two halves
 
 A decode token at 61K is ~43 ms measured (23 tok/s), and one model step reads ~10,020 MiB of weights, which at
-288 GB/s is 36.5 ms — so the engine is at **85% of peak bandwidth** and the step is weight-read dominated, as
-expected.
+288 GB/s is 36.5 ms — so the engine is at **85% of peak bandwidth** and a step is weight-read dominated.
+
+**The decode half, correctly framed.** The table below compares *a prefix* against *a larger prefix*; a calibrated
+list is a third thing, and it is the one that could go below 40,960 rows at better coverage.
 
 | one guess | MiB | of a 43 ms token |
 | --- | ---: | ---: |
-| block + head at 131,072 (today) | 694.5 | **5.88%** |
-| block + head at 65,536 | 514.5 | 4.36% |
-| block + head at 40,960 | 447.0 | 3.79% |
+| block + head at 131,072 (today, a prefix) | 694.5 | **5.88%** |
+| block + head at 65,536 (a prefix) | 514.5 | 4.36% |
+| block + head at 40,960 (a prefix) | 447.0 | 3.79% |
 | block + head at the full vocabulary | 1,016.5 | 8.61% |
 
-**So a cut from 131,072 to 65,536 saves 1.52 percentage points of a decode token — 5.88% → 4.36%.** That is *not*
-cosmetic: it is above the 2% bar, and it is per guess, so with a window of 8 it compounds across the drafts a step
-proposes. Their "+10% speed" is consistent with that magnitude once a speculating server's accept rate is folded in.
+**The trustworthy number is the difference between the rows of that table, not the absolute one.** 131,072 → 65,536
+is **1.52 points of a decode token** whatever the list contains, because the head's cost is bytes and a row is a
+row. What a *calibrated* list adds on top is **coverage at a smaller row count** — and the current prefix's coverage
+is **unknown and language-dependent**: 55.8% of Latin merges, 5.9% of Cyrillic, 3.7% of Kana. So the honest statement
+is "a calibrated 40,960-row list should hold what today's 131,072-row prefix holds for English and far more for
+Russian", not "5.88% → 3.79%" — the second needs a coverage measurement we do not have.
 
-**The larger prize is the double upload.** `output_` is uploaded whole (682 MiB) and `head.n_out` truncates the
-*read* per call, so the full head sits in VRAM whether it is used or not. A 65,536-row gathered head would let
-`output_` be the gathered matrix instead of the whole thing — **682 → 180 MiB of VRAM, 500 MiB back**, which on a
-card where the context ceiling is the binding constraint is worth ~18,500 tokens of k8v4.
+**The context half is not real, and I overstated it.** `output_` must keep all 248,320 rows because the target's own
+sampling reads every logit (`main.cpp:484` → `Sampler::pick(logits, n_vocab_, …)`, and `n_vocab_` sizes `logits_`,
+`wlogits_`, `h_wlogits_`, `h_logits_`). A gathered draft head is therefore a **second** `Dev` **added** to the 682
+MiB, not a replacement — 682 + 180 MiB, i.e. **worse**, unless the draft path is changed to read a gathered copy
+while the target keeps `output_`. **So the 502 MiB / 18,600 tokens does not exist as stated.** What is real is the
+opposite: today's prefix already pays the full 682 MiB and reads only 360 of it.
 
-**Verdict: in, 1–2 days, and the VRAM half is the bigger half.** The list itself is a Python histogram; the wiring is
-a gathered `Dev` in `load_drafter` plus `draft_rows()` returning the list's length. Ranked first because it is the
-only item whose win is measured in both decode time *and* the context that fits.
+### D.6 Revised verdict
+
+**Two separable items, ranked by what is actually measured:**
+
+1. **The code-point prefix is a language defect, and it is the part worth fixing.** For English it is usable
+   (all ASCII inside, 55.8% of merges); for Russian, Kana, Hangul, Arabic, Greek and Hebrew it is nearly inert
+   (2–6% of ids), and a Russian answer can only be drafted character by character — 57 character ids where the
+   model would write 38 merged ones. **1–2 days**, no card: a frequency count into a gathered head, or — cheaper and
+   worth doing first — *raise or remove the prefix for the affected scripts* by making `guess_vocab()` return
+   `n_vocab_` when the tokenizer's script mix warrants it. The second is a one-line experiment with a real
+   measurement behind it.
+2. **The decode win from a calibrated list is bounded but unquantified**, 1.52 points per 131,072 → 65,536 step, and
+   it needs a coverage measurement before the smaller rows are worth taking.
+
+**What this changes about the earlier verdict:** the item stays **first**, but for the *coverage* reason, not the
+VRAM reason. The 502 MiB claim is withdrawn.
 
 ---
 
@@ -438,9 +542,11 @@ statement of why measuring a driver delta is the wrong instrument.
 
 ## What I would do, in order
 
-1. **D, the draft vocabulary (1–2 days).** The flag exists (`--draft-vocab N`) and takes a **prefix**, which is the
-   wrong subset; the fix is a gathered matrix and a list. It is worth **5.88% → 4.36%** of a decode token and
-   **up to 500 MiB of VRAM** — and on this card the VRAM is the scarcer of the two.
+1. **D, the draft vocabulary (1–2 days).** `--draft-vocab N` takes the **first N rows of a byte-ordered table**,
+   which for Cyrillic and CJK-adjacent scripts is 2–6% of the ids and makes the draft nearly inert. Fix the
+   **coverage** first (a counted list, or `guess_vocab()` returning the whole vocabulary for a mixed-script
+   tokenizer); the decode win from a smaller list is 1.52 points per halving and comes second. The 502 MiB of VRAM
+   is withdrawn — `output_` keeps all 248,320 rows for the target's sampling.
 2. **F, the prefix-caching test (0.5 days, two runs, no code).** Design in F above; the metric is the second
    request's prompt tok/s across the two arms.
 3. **C's `kSplit` 1024 → 256 (hours).** One `constexpr` at `fattn.cu:261`, four recomputed sites, no register or
@@ -448,12 +554,16 @@ statement of why measuring a driver delta is the wrong instrument.
 
 **Out, with the reason:** **B** because the kernel is DRAM-bound at 11% of the roofline and the padding is 6% on the
 launch that matters — swapping M and N cannot buy what the memory system is not offering; **A** because 8–10 days
-for ~1.5% of prefill at 32K (and ~2.5–3% at 61K) is a bad trade against a draft head that is 1–2 days for 1.5 points
-of *decode* plus 500 MiB; **E** because 15 checkpoints cost 2.2 GiB of a card that has none to spare; **G** because
-we already budget for the graphs instead of measuring a driver delta.
+for ~1.5% of prefill at 32K (and ~2.5–3% at 61K) is a bad trade against a draft head that is 1–2 days for a language
+defect plus 1.5 points of *decode*; **E** because 15 checkpoints cost 2.2 GiB of a card that has none to spare;
+**G** because we already budget for the graphs instead of measuring a driver delta.
 
 ## Corrections to what was quoted
 
+- **The 502 MiB of VRAM from a gathered draft head: withdrawn.** `output_` is uploaded whole and the target's own
+  sampling reads every one of the 248,320 logits (`main.cpp:484`), and `n_vocab_` sizes four logits buffers. A
+  gathered draft head is a **second** `Dev` added to the 682 MiB, not a replacement. Whatever the item is worth, it
+  is not 18,600 tokens of context. `upload_as` also cannot gather — it rejects a shape that is not the tensor's.
 - **`Q·Kᵀ` as a share of prefill: 5.83%, not 0.41%.** My 0.41% was one attention layer over the whole prefill; there
   are 16 layers. Attention is 17.7% of a dense prefill, so **A is out on difficulty (8–10 days for a group-6
   kernel), not on arithmetic** — the fix is to say that, and to stop calling it negligible.
