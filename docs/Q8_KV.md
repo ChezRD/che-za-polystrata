@@ -335,6 +335,34 @@ is nothing for the saved bytes to buy.
 
 The eight-value-group geometry (16 heads on 2 KV) measured **0.978 and 0.929** at 256K, the same conclusion.
 
+**What it buys on the dense model, measured.** The context ceiling of Qwen3.8-27B UD-IQ3_XXS on this 16 GB RTX
+4060 Ti, bisected at 256 tokens with `--kv-whole` (so a context that does not fit fails at load), one run at a
+time, `timeout 180`:
+
+| `--prompt-batch` | `--window` | k8v4 | k6v4 | k6v4's gain |
+| ---: | ---: | ---: | ---: | ---: |
+| 512 | 1 | 96,512 | 111,872 | **+15.9%** |
+| 512 | 8 | 98,304 | 111,872 | **+13.8%** |
+| 128 | 1 | 104,448 | 122,112 | **+16.9%** |
+| 128 | 8 | 104,448 | 122,880 | **+17.6%** |
+
+Mean **+16.1%**, which is the 15.4% of bytes a cell plus the granularity of the bisection. The mechanism is exact:
+at 122,880 k6v4 holds **2.74 GiB** of KV and at 104,448 k8v4 holds **2.74 GiB** — the same bytes reach the same
+ceiling, which is what the arithmetic predicted (`122,880 ≈ 109,400 / 0.8462 = 129,300` was ~5% optimistic; the
+card's own wall is what the measurement found, at the `--prompt-batch 128` scratch that line was taken with).
+
+Two caveats on those numbers, stated rather than smoothed: a repeat of the batch-512 window-1 k8v4 measurement gave
+94,208 where this table's says 96,512, so **the ceiling carries about ±2% of run-to-run variance** — the desktop's
+own VRAM use moves between runs. And `--window 1` is how these were taken because this tree has no `opt_.draft`
+guard on the `snap_` buffer; `--window 8 --prompt-batch 512` (which does allocate it) measures 98,304 at k8v4, so the
+snapshot buffer costs about 1,800 tokens here.
+
+**The answers do not move at short range.** On four short prompts (a chat turn, two arithmetic ones, prose and code),
+16 greedy tokens at temperature 0: **k6v4 and k8v4 produce the identical 16 tokens on 4 of 4.** The caches hold
+different numbers — a six-bit key is not an eight-bit one — but the picks agree, which is the same finding
+`docs/DETAILS.md` records for k8v4 against fp16 below 4,096 positions. The window's draft block also runs: 12 of 13
+guesses right at `--window 8`, which exercises `store_q6_at` and the per-sequence `attn_rows` path.
+
 **What it is not.** The keys' 63 levels cost accuracy where q8_0's 255 did not: on 4,096 rows of Gaussian keys the
 quantizer's own error is **max 8.1e-2, rms 2.2e-2, against q8_0's 2.0e-2 and 5.3e-3 — 3.98× and 4.09×**, which is the
 step of six bits against eight. On the per-cell id payload of the parity test (a cell's id in every key and value,
@@ -343,10 +371,12 @@ one-hot queries, so a wrong gather is a cell-id-sized error) the same payload gi
 
 **`--kv k6v4` is reachable.** It is qwen35moe's and the dense qwen35's, like k8v4: `KvFmt::kK6V4`, the `--kv`
 parser, `Qwen35::alloc_caches`, `attn_store` (with `store_q6_at`, so a recorded launch works), and the three
-attention dispatches. A six-bit key cache is read by the decode kernel and by `attend_batch`, which dequantizes its
-blocks into the fp16 workspace with `dequant_q6_to_f16`; `attend()` has no six-bit reader and refuses one rather
-than read the codes as halves, so under k6v4 the decode kernel takes every position (`fdec_from_ = 0`). Flint is
-refused: its layers keep caches of their own and this branch adds no reader for them.
+attention dispatches. A six-bit key cache is read by the decode kernel and by `attend_batch`, whose dequantizer
+(`dequant_q6_kernel`) turns each 24-byte block into fp16 in the workspace the products already use for a q8 cache.
+`attend()` has no six-bit reader and refuses one rather than read the codes as halves, so under k6v4 the decode
+kernel takes every position (`fdec_from_ = 0`), and the two paths that would reach `attend()` — the block of guesses
+and a run with `STRATA_FDEC=0` — are refused at load with that reason. Flint is refused for the same kind of reason:
+its layers keep caches of their own and this branch adds no reader for them.
 
 One gate was blind and is not now. `cuda_spill_guard` listed the `strata_*` libraries and not `strata_poly_mmq`, so
 it had never seen `fdec_kernel`; adding the library brought 21 of its instantiations into the report, all with an
