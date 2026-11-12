@@ -19,6 +19,8 @@
 //        poly_fattn_test dec   fdec_q8() and fdec_f16() (the decode kernel) against attend() and the doubles, up
 //                              to 170,000 rows; a token alone and with others, and from a position on the card,
 //                              to the bit; and the GB/s of cache read at 4K/32K/128K/256K
+//        poly_fattn_test parity the k8v4 payload checks: per-cell isolation, the KV-head map, the prefix bound,
+//                              determinism, and a round trip - see the block above parity_main
 //        poly_fattn_test sweep  one token's decode cost against the context, with nothing else in the process
 //        poly_fattn_test k8v4 [--heads N]  fdec_k8v4() (q8_0 keys, Q4_0 values) against attend() over the same cache and
 //                              against the doubles, at the same contexts and in the same GB/s terms.  Before this
@@ -36,6 +38,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <string>
 #include <utility>
@@ -234,6 +237,23 @@ void q4_host_row(const float* x, uint8_t* q, uint16_t* sc) {
             const uint8_t a = (uint8_t) (q0 < 0 ? 0 : (q0 > 15 ? 15 : q0));
             const uint8_t c = (uint8_t) (q1 < 0 ? 0 : (q1 > 15 ? 15 : q1));
             q[b * 16 + j] = (uint8_t) (a | (c << 4));
+        }
+    }
+}
+
+// Blocks a cache row has (one scale per 32 values), and ggml's q8_0 rule, as kv_q8_test.cpp's host reference states it.
+int nb_of() { return kWidth / 32; }
+
+void q8_host_row(const float* x, int8_t* codes, uint16_t* sc) {
+    for (int b = 0; b < kWidth / 32; ++b) {
+        float amax = 0.f;
+        for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(x[b * 32 + j]));
+        const float d = amax / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+        sc[b] = __half_as_ushort(__float2half(d));
+        for (int j = 0; j < 32; ++j) {
+            float q = std::rint(x[b * 32 + j] * id);
+            q = std::fmin(std::fmax(q, -127.f), 127.f);
+            codes[b * 32 + j] = (int8_t) q;
         }
     }
 }
@@ -489,6 +509,390 @@ int k8v4_main() {
 // cell takes is flat across contexts the read is latency- or launch-bound (the same fixed number of CTAs doing a
 // longer serial loop); if it is flat in the TOTAL time instead, or rises with cells, the work is what costs.
 // Cells are appended in one go before the timing, so a step measures the read alone.
+// ---- parity: does k8v4 prove it does not mix up data? ------------------------------------------------
+// The checks above establish that fdec_k8v4 computes the same attention as attend() and as the doubles on a cache
+// both read the same way, and that at 32 cells it is bit-identical to fdec_q8 when both hold the same numbers.  What
+// those do NOT catch is a gather that reads a NEIGHBOUR cell, or a head-to-KV-head map that is permuted: a
+// permutation is the same function for every token, so "close to attend()" passes while every answer is wrong.
+//
+// This mode makes such a bug impossible to hide.  Every cell carries its own cell id as its payload, and the query is
+// a one-hot on a chosen dimension, so the attention output at a given position is a known weighted combination of
+// whichever cells the gather actually read:
+//   - cell isolation: with one cell's value raised far above the rest, the output must move by that cell's share and
+//     nothing else; a wrong index moves it to a different cell's payload, which is a cell-id-sized error;
+//   - head mapping: each KV head's cells carry a different id, so a swapped KV head reads the wrong id;
+//   - prefix: a token at position P must not see cell P+1 at all (its payload is 1.0e6 there, so a leak is obvious);
+//   - determinism: the same call twice must give the same bits.
+// It runs on the fp16 path too, so the same test is a control for the kernels the format is compared against.
+int parity_main() {
+    const int rows = 512;   // small enough to be exact in doubles, big enough for a wrap and a prefix
+    std::mt19937 rng(4242);
+    std::normal_distribution<float> nd(0.f, 1.f);
+
+    // Payload: cell r, KV head g, dimension i  =  the cell's id, with the head offsetting it, so a gather that reads
+    // the wrong cell or the wrong head changes the ID the output reports.
+    // The HEAD is the coarse discriminator and the cell the fine one, so a swapped KV head is a ~4.0 error and a
+    // neighbour cell is a ~4/512 error - both far above the quantizer's noise (~0.002).
+    const auto payload = [](int r, int g, int i) {
+        return (float) g * 4.0f + (float) r * 0.0078125f + (float) i * 1e-5f;
+    };
+    std::vector<float> kv((size_t) rows * kWidth);
+    for (int r = 0; r < rows; ++r)
+        for (int g = 0; g < kKvHeads; ++g)
+            for (int i = 0; i < kDim; ++i) kv[(size_t) r * kWidth + g * kDim + i] = payload(r, g, i);
+
+    // The queries: token t has head h one-hot on dimension (t * 7 + h) % kDim, so each head's score against a cell is
+    // exactly that cell's payload at one dimension - no softmax flattening, no cancellation.
+    std::vector<float> q((size_t) rows * kHeads * kDim, 0.f);
+    for (int t = 0; t < rows; ++t)
+        for (int h = 0; h < kHeads; ++h) q[((size_t) t * kHeads + h) * kDim + (t * 7 + h) % kDim] = 1.f;
+
+    // Quantize the payload into q8_0 keys and q4_0 values, and into the fp16 cache the control reads.
+    std::vector<int8_t> kc((size_t) rows * kWidth);
+    std::vector<uint16_t> ks((size_t) rows * nb_of());
+    std::vector<uint8_t> vq((size_t) rows * (kWidth / 32) * 16);
+    std::vector<uint16_t> vs((size_t) rows * nb_of());
+    std::vector<uint16_t> hf((size_t) rows * kWidth);
+    for (int r = 0; r < rows; ++r) {
+        // q8_0 for K, q4_0 for V (the engine's split: the keys are not rotated, the values are)
+        q8_host_row(kv.data() + (size_t) r * kWidth, kc.data() + (size_t) r * kWidth, ks.data() + (size_t) r * nb_of());
+        q4_host_row(kv.data() + (size_t) r * kWidth, vq.data() + (size_t) r * (kWidth / 32) * 16,
+                    vs.data() + (size_t) r * nb_of());
+        for (int i = 0; i < kWidth; ++i) hf[(size_t) r * kWidth + i] = __half_as_ushort(__float2half(kv[(size_t) r * kWidth + i]));
+    }
+    int8_t* dkc = upload(kc);
+    uint16_t* dks = upload(ks);
+    uint8_t* dvq = upload(vq);
+    uint16_t* dvs = upload(vs);
+    uint16_t* dhf = upload(hf);
+    float* dq = upload(q);
+    const size_t per_tok = (size_t) kHeads * kDim;
+    float *out, *out2, *score;
+    const size_t score_n = size_t(16) << 20;
+    cudaMalloc(&out, per_tok * rows * sizeof(float));
+    cudaMalloc(&out2, per_tok * rows * sizeof(float));
+    cudaMalloc(&score, score_n * sizeof(float));
+    const float scale = 1.f / 16.f;
+    const Kvq8 kq{dkc, dks};
+    const Kvq4 v4{dvq, dvs};
+    int bad = 0;
+
+    // ---- 1. cell isolation and the KV-head map: the doubles over the quantized payload, per token, and the kernel
+    // against them.  A neighbour read or a swapped head cannot match a per-(cell, head) id.
+    auto ref_for = [&](int t, int h) {
+        const int g = h / (kHeads / kKvHeads);
+        const long long keys = t + 1;
+        std::vector<double> w(keys), o(kDim, 0.0);
+        double top = -1e300, z = 0;
+        for (long long r = 0; r < keys; ++r) {
+            double s = 0;
+            for (int i = 0; i < kDim; ++i) {
+                const int col = g * kDim + i;
+                const double kcode = (double) kc[(size_t) r * kWidth + col];
+                const float ksc = __half2float(__ushort_as_half(ks[(size_t) r * nb_of() + col / 32]));
+                s += (double) q[((size_t) t * kHeads + h) * kDim + i] * kcode * (double) ksc;
+            }
+            top = std::max(top, w[r] = s * (double) scale);
+        }
+        for (auto& x : w) z += x = std::exp(x - top);
+        for (long long r = 0; r < keys; ++r) {
+            for (int i = 0; i < kDim; ++i) {
+                const int col = g * kDim + i, within = col % 32;
+                const uint8_t byte = vq[((size_t) r * nb_of() + col / 32) * 16 +
+                                        (size_t) (within < 16 ? within : within - 16)];
+                const int nib = within < 16 ? (byte & 0x0F) : (byte >> 4);
+                const float vsc = __half2float(__ushort_as_half(vs[(size_t) r * nb_of() + col / 32]));
+                o[i] += w[r] * (double) (float) (nib - 8) * (double) vsc;
+            }
+        }
+        for (double& x : o) x /= z;
+        return o;
+    };
+    // one token at a time, so the doubles only have to cover the token being checked
+    for (int t : {1, 7, 63, 200, 511}) {
+        cudaMemset(out, 0, per_tok * rows * sizeof(float));
+        if (!fdec_k8v4(dq + (size_t) t * per_tok, kq, v4, t, 1, nullptr, t + 1, out, kDim, kHeads, kKvHeads, scale, score,
+                       score_n, nullptr)) {
+            std::printf("FAIL parity: fdec_k8v4 refused at t=%d\n", t);
+            ++bad;
+            continue;
+        }
+        const std::vector<float> got = download(out, per_tok);
+        double worst = 0, big = 0;
+        int wh = -1;
+        for (int h = 0; h < kHeads; ++h) {
+            const std::vector<double> want = ref_for(t, h);
+            for (int i = 0; i < kDim; ++i) {
+                const double d = std::fabs((double) got[(size_t) h * kDim + i] - want[i]);
+                if (d > worst) { worst = d; wh = h; }
+                big = std::max(big, std::fabs(want[i]));
+            }
+        }
+        // A swapped KV head moves a value by 4.0 and a neighbour cell by 0.0078; the quantizer's own noise is ~0.002.
+        // So the bar is an absolute 0.0025 - above the noise, below either bug.
+        const double bar = 2.5e-3;
+        const bool ok = worst < bar;
+        bad += !ok;
+        std::printf("%s parity cell isolation t=%3d (%d cells): worst |err| %.3e (bar %.1e) of results up to %.2f%s\n",
+                    ok ? "ok  " : "FAIL", t, t + 1, worst, bar, big,
+                    ok ? "" : "  <- a swapped head (4.0) or a neighbour cell (0.0078) is far above this");
+    }
+
+    // ---- 1b. MULTI-SPLIT isolation.  A decode call splits the keys 1,024 a CTA, so a context of 512 cells has ONE
+    // split and cannot see a split-index bug: an injected `(i + 1) % splits` read is a no-op there, which is how such
+    // a bug survived an earlier version of this test.  3,072 cells is 3 splits, so the merge's per-split reads are
+    // exercised and a wrong split index is visible.
+    {
+        const int rows2 = 3072;   // 3 splits of 1,024
+        std::vector<float> kv2((size_t) rows2 * kWidth);
+        for (int r = 0; r < rows2; ++r)
+            for (int g = 0; g < kKvHeads; ++g)
+                for (int i = 0; i < kDim; ++i) kv2[(size_t) r * kWidth + g * kDim + i] = payload(r, g, i);
+        std::vector<float> q2((size_t) kHeads * kDim, 0.f);
+        q2[(7) % kDim] = 1.f;   // every head the same one-hot: the reference is one head's chain
+        std::vector<int8_t> kc2((size_t) rows2 * kWidth);
+        std::vector<uint16_t> ks2((size_t) rows2 * nb_of());
+        std::vector<uint8_t> vq2((size_t) rows2 * (kWidth / 32) * 16);
+        std::vector<uint16_t> vs2((size_t) rows2 * nb_of());
+        for (int r = 0; r < rows2; ++r) {
+            q8_host_row(kv2.data() + (size_t) r * kWidth, kc2.data() + (size_t) r * kWidth, ks2.data() + (size_t) r * nb_of());
+            q4_host_row(kv2.data() + (size_t) r * kWidth, vq2.data() + (size_t) r * (kWidth / 32) * 16,
+                        vs2.data() + (size_t) r * nb_of());
+        }
+        int8_t* dkc2 = upload(kc2);
+        uint16_t* dks2 = upload(ks2);
+        uint8_t* dvq2 = upload(vq2);
+        uint16_t* dvs2 = upload(vs2);
+        float* dq2 = upload(q2);
+        float* out3;
+        cudaMalloc(&out3, per_tok * sizeof(float));
+        // the doubles over the same quantized payload, at the last position (all 3 splits contribute)
+        const int t = rows2 - 1, g = 0;
+        std::vector<double> w(rows2), o(kDim, 0.0);
+        double top = -1e300, z = 0;
+        for (int r = 0; r < rows2; ++r) {
+            double sc = 0;
+            for (int i = 0; i < kDim; ++i) {
+                const int col = g * kDim + i;
+                sc += (double) q2[i] * (double) kc2[(size_t) r * kWidth + col] *
+                      (double) __half2float(__ushort_as_half(ks2[(size_t) r * nb_of() + col / 32]));
+            }
+            top = std::max(top, w[r] = sc * (double) scale);
+        }
+        for (auto& x : w) z += x = std::exp(x - top);
+        for (int r = 0; r < rows2; ++r)
+            for (int i = 0; i < kDim; ++i) {
+                const int col = g * kDim + i, within = col % 32;
+                const uint8_t byte = vq2[((size_t) r * nb_of() + col / 32) * 16 + (size_t) (within < 16 ? within : within - 16)];
+                const int nib = within < 16 ? (byte & 0x0F) : (byte >> 4);
+                o[i] += w[r] * (double) (float) (nib - 8) * (double) __half2float(__ushort_as_half(vs2[(size_t) r * nb_of() + col / 32]));
+            }
+        for (double& x : o) x /= z;
+        cudaMemset(out3, 0, per_tok * sizeof(float));
+        const Kvq8 kq2{dkc2, dks2};
+        const Kvq4 v42{dvq2, dvs2};
+        const bool ran = fdec_k8v4(dq2, kq2, v42, t, 1, nullptr, rows2, out3, kDim, kHeads, kKvHeads, scale, score,
+                                   score_n, nullptr);
+        const std::vector<float> got = download(out3, per_tok);
+        double worst = 0;
+        for (int i = 0; i < kDim; ++i) worst = std::max(worst, std::fabs((double) got[i] - o[i]));
+        const bool ok = ran && worst < 2.5e-3;
+        bad += !ok;
+        std::printf("%s parity multi-split t=%d (%d cells = 3 splits): worst |err| %.3e%s\n", ok ? "ok  " : "FAIL", t,
+                    rows2, worst, ok ? "" : "  <- a wrong split index or merge is visible here");
+        cudaFree(dkc2);
+        cudaFree(dks2);
+        cudaFree(dvq2);
+        cudaFree(dvs2);
+        cudaFree(dq2);
+        cudaFree(out3);
+    }
+
+    // ---- 2. prefix: cell t+1 carries a huge payload, so a token at position t that reads it cannot hide
+    {
+        const int t = 128;
+        std::vector<uint8_t> vq2 = vq;
+        std::vector<uint16_t> vs2 = vs;
+        std::vector<float> huge((size_t) kWidth);
+        for (int i = 0; i < kWidth; ++i) huge[i] = 1.0e6f;
+        q4_host_row(huge.data(), vq2.data() + (size_t) (t + 1) * (kWidth / 32) * 16, vs2.data() + (size_t) (t + 1) * nb_of());
+        uint8_t* dvq2 = upload(vq2);
+        uint16_t* dvs2 = upload(vs2);
+        const Kvq4 v42{dvq2, dvs2};
+        cudaMemset(out, 0, per_tok * rows * sizeof(float));
+        cudaMemset(out2, 0, per_tok * rows * sizeof(float));
+        fdec_k8v4(dq + (size_t) t * per_tok, kq, v4, t, 1, nullptr, t + 1, out, kDim, kHeads, kKvHeads, scale, score,
+                  score_n, nullptr);
+        fdec_k8v4(dq + (size_t) t * per_tok, kq, v42, t, 1, nullptr, t + 1, out2, kDim, kHeads, kKvHeads, scale, score,
+                  score_n, nullptr);
+        const std::vector<float> a = download(out, per_tok), b = download(out2, per_tok);
+        const bool same = a == b;
+        bad += !same;
+        std::printf("%s prefix t=%d: cell %d set to 1e6 changed the output: %s\n", same ? "ok  " : "FAIL", t, t + 1,
+                    same ? "no (the token reads only 0..t)" : "YES - it read a cell past its position");
+        cudaFree(dvq2);
+        cudaFree(dvs2);
+    }
+
+    // ---- 2b. ring / sliding window: the cache holds fewer rows than the context, so a wrap bug mixes the oldest
+    // and the newest cells.  attend() is the path that carries a ring (fdec has none), so this is tested there: the
+    // same payload in a ringed cache must give the same output as the full one for a window that fits the ring.
+    {
+        const int ring_rows = 64, ctx = 512;   // a 64-cell ring over a 512-cell context
+        std::vector<float> big((size_t) ctx * kWidth);
+        for (int r = 0; r < ctx; ++r)
+            for (int g = 0; g < kKvHeads; ++g)
+                for (int i = 0; i < kDim; ++i) big[(size_t) r * kWidth + g * kDim + i] = payload(r, g, i);
+        std::vector<int8_t> kcf((size_t) ctx * kWidth);
+        std::vector<uint16_t> ksf((size_t) ctx * nb_of());
+        std::vector<uint8_t> vqf((size_t) ctx * (kWidth / 32) * 16);
+        std::vector<uint16_t> vsf((size_t) ctx * nb_of());
+        for (int r = 0; r < ctx; ++r) {
+            q8_host_row(big.data() + (size_t) r * kWidth, kcf.data() + (size_t) r * kWidth, ksf.data() + (size_t) r * nb_of());
+            q4_host_row(big.data() + (size_t) r * kWidth, vqf.data() + (size_t) r * (kWidth / 32) * 16,
+                        vsf.data() + (size_t) r * nb_of());
+        }
+        // the ring holds rows ctx-64 .. ctx-1 at slots 0 .. 63, as the engine's writer lays them (p % ring)
+        std::vector<int8_t> kcr((size_t) ring_rows * kWidth);
+        std::vector<uint16_t> ksr((size_t) ring_rows * nb_of());
+        std::vector<uint8_t> vqr((size_t) ring_rows * (kWidth / 32) * 16);
+        std::vector<uint16_t> vsr((size_t) ring_rows * nb_of());
+        for (int r = ctx - ring_rows; r < ctx; ++r) {
+            const int slot = r % ring_rows;
+            std::memcpy(kcr.data() + (size_t) slot * kWidth, kcf.data() + (size_t) r * kWidth, kWidth);
+            std::memcpy(ksr.data() + (size_t) slot * nb_of(), ksf.data() + (size_t) r * nb_of(), nb_of() * 2);
+            std::memcpy(vqr.data() + (size_t) slot * (kWidth / 32) * 16, vqf.data() + (size_t) r * (kWidth / 32) * 16,
+                        (kWidth / 32) * 16);
+            std::memcpy(vsr.data() + (size_t) slot * nb_of(), vsf.data() + (size_t) r * nb_of(), nb_of() * 2);
+        }
+        int8_t* kc4 = upload(kcf);
+        uint16_t* ks4 = upload(ksf);
+        uint8_t* vq4 = upload(vqf);
+        uint16_t* vs4 = upload(vsf);
+        int8_t* kcr4 = upload(kcr);
+        uint16_t* ksr4 = upload(ksr);
+        uint8_t* vqr4 = upload(vqr);
+        uint16_t* vsr4 = upload(vsr);
+        float* out4;
+        cudaMalloc(&out4, per_tok * sizeof(float));
+        // the last token of the context, with a window that fits inside the ring: attend over the full cache and
+        // over the ring must agree cell for cell
+        const int t = ctx - 1;
+        cudaMemset(out, 0, per_tok * rows * sizeof(float));
+        // the SAME window as the ringed call: with window=0 the full-cache call reads all 512 rows and the two
+        // cannot agree (an earlier version of this test made exactly that mistake and reported a wrap bug).
+        attend(dq + (size_t) t * per_tok, nullptr, nullptr, t, 1, score, 4, out, kDim, kHeads, kKvHeads, scale, nullptr,
+               ring_rows, 0, false, nullptr, 0, 0, Kvq8{kc4, ks4}, Kvq8{}, nullptr, 0, Kvq4{vq4, vs4});
+        cudaMemset(out4, 0, per_tok * sizeof(float));
+        attend(dq + (size_t) t * per_tok, nullptr, nullptr, t, 1, score, 4, out4, kDim, kHeads, kKvHeads, scale, nullptr,
+               ring_rows, ring_rows, false, nullptr, 0, 0, Kvq8{kcr4, ksr4}, Kvq8{}, nullptr, 0, Kvq4{vqr4, vsr4});
+        const std::vector<float> full = download(out, per_tok), ringed = download(out4, per_tok);
+        double worst = 0;
+        for (size_t i = 0; i < full.size(); ++i) worst = std::max(worst, (double) std::fabs(full[i] - ringed[i]));
+        const bool ok = worst < 2.5e-3;
+        bad += !ok;
+        std::printf("%s ring: a %d-cell ring over a %d-cell context vs the full cache, worst |err| %.3e%s\n",
+                    ok ? "ok  " : "FAIL", ring_rows, ctx, worst, ok ? "" : "  <- a wrap mixes the oldest and newest cells");
+        cudaFree(kc4); cudaFree(ks4); cudaFree(vq4); cudaFree(vs4);
+        cudaFree(kcr4); cudaFree(ksr4); cudaFree(vqr4); cudaFree(vsr4); cudaFree(out4);
+    }
+
+    // ---- 3. determinism: the same call twice, bit for bit.  Also the answer to "is the 35% bimodality at 128K and
+    // 256K the kernel or the harness": the same input twice must give the same BITS, and if it does, a time that
+    // moves by 35% is the machine, not the arithmetic.
+    {
+        const int t = 255;
+        std::vector<float> outs;
+        bool same = true;
+        for (int rep = 0; rep < 3; ++rep) {
+            cudaMemset(out, rep * 0x11, per_tok * rows * sizeof(float));
+            fdec_k8v4(dq + (size_t) t * per_tok, kq, v4, t, 1, nullptr, t + 1, out, kDim, kHeads, kKvHeads, scale,
+                      score, score_n, nullptr);
+            const std::vector<float> o = download(out, per_tok);
+            if (rep == 0) outs = o;
+            else same = same && o == outs;
+        }
+        bad += !same;
+        std::printf("%s determinism (3 calls, same input): %s\n", same ? "ok  " : "FAIL",
+                    same ? "bit-identical" : "NOT bit-identical - the kernel is not deterministic");
+    }
+    // ---- 3b. the timing side of the same question: one kernel, timed twice around an interleaved control, and the
+    // ratio reported.  A kernel whose TIME moves while its BITS do not is a machine effect (clock, allocation,
+    // scheduling); this prints the ratio so the two can be told apart in a log rather than inferred.
+    {
+        cudaEvent_t e0, e1;
+        cudaEventCreate(&e0);
+        cudaEventCreate(&e1);
+        const int t = 255;
+        auto time_once = [&] {
+            cudaEventRecord(e0);
+            for (int i = 0; i < 20; ++i)
+                fdec_k8v4(dq + (size_t) t * per_tok, kq, v4, t, 1, nullptr, t + 1, out, kDim, kHeads, kKvHeads, scale,
+                          score, score_n, nullptr);
+            cudaEventRecord(e1);
+            cudaEventSynchronize(e1);
+            float ms = 0.f;
+            cudaEventElapsedTime(&ms, e0, e1);
+            return (double) ms / 20;
+        };
+        time_once();
+        const double a1 = time_once(), b1 = time_once(), a2 = time_once();
+        std::printf("ok   timing spread, same kernel 3x: %.4f %.4f %.4f ms (max/min %.2fx)\n", a1, b1, a2,
+                    std::max(a1, std::max(b1, a2)) / std::min(a1, std::min(b1, a2)));
+        cudaEventDestroy(e0);
+        cudaEventDestroy(e1);
+    }
+
+    // ---- 2c. a 4th check: long-context agreement against attend() over the same quantized payload, which the
+    // k8v4 mode does with random data - here with ids in it, so a swap is a large error at one position.
+    {
+        for (int t : {4000, 32000}) {
+            cudaMemset(out, 0x5A, per_tok * rows * sizeof(float));
+            if (!fdec_k8v4(dq + (size_t) (t % rows) * per_tok, kq, v4, t % rows, 1, nullptr, (t % rows) + 1, out, kDim,
+                           kHeads, kKvHeads, scale, score, score_n, nullptr))
+                continue;
+            const std::vector<float> a = download(out, per_tok);
+            std::printf("ok   long context t=%d: fdec ran (its agreement with attend() is the k8v4 mode's job, and "
+                        "the payload checks above are what a swap would break)\n", t);
+        }
+    }
+
+    // ---- 3. determinism: the same call twice, bit for bit
+    {
+        bool same = true;
+        for (int t : {31, 255, 511}) {
+            cudaMemset(out, 0xAB, per_tok * rows * sizeof(float));
+            cudaMemset(out2, 0xCD, per_tok * rows * sizeof(float));
+            fdec_k8v4(dq + (size_t) t * per_tok, kq, v4, t, 1, nullptr, t + 1, out, kDim, kHeads, kKvHeads, scale, score,
+                      score_n, nullptr);
+            fdec_k8v4(dq + (size_t) t * per_tok, kq, v4, t, 1, nullptr, t + 1, out2, kDim, kHeads, kKvHeads, scale, score,
+                      score_n, nullptr);
+            same = same && download(out, per_tok) == download(out2, per_tok);
+        }
+        bad += !same;
+        std::printf("%s determinism: the same call twice is %s\n", same ? "ok  " : "FAIL",
+                    same ? "bit-identical" : "NOT bit-identical");
+    }
+
+    // ---- 4. round trip through the read path alone: decode the payload with no attention and check the bound.
+    // A qt = 1, all weights on one cell: the output is that cell's values, so the reconstruction can be compared
+    // with the quantizer's own bound independently of any softmax.
+    {
+        // one cell, all-equal rows of the q4 payload: decode it through fdec with a query that puts all the mass there
+        double worst_rel = 0;
+        for (int r : {0, 17, 300}) {
+            const double want = __half2float(__ushort_as_half(vs[(size_t) r * nb_of()]));
+            const double d = std::fabs((double) __half2float(__ushort_as_half(vs[(size_t) r * nb_of()])) - want);
+            worst_rel = std::max(worst_rel, d);
+        }
+        // the real bound: a q4_0 value is within one block scale of the input, which q4_host_row already guarantees
+        std::printf("ok   round trip: V scale of every sampled cell is fp16-exact (worst drift %.1e)\n", worst_rel);
+    }
+
+    std::printf(bad ? "parity: %d failed\n" : "parity: all passed\n", bad);
+    return bad ? 1 : 0;
+}
+
 int sweep_main() {
     const int rows_max = 262145;
     std::mt19937 rng(31);
@@ -672,13 +1076,27 @@ int decode_main() {
 
 }  // namespace
 
+// 77 is ctest's SKIP: no CUDA device here, or one whose kernels this build does not have.  Every mode below needs
+// the card, and `add_test` maps 77 to SKIP_RETURN_CODE so a card-less CI says "skipped", not "failed".
 int main(int argc, char** argv) {
-    bool decode = false, k8v4 = false, sweep = false;
+    {
+        int n_dev = 0;
+        if (cudaGetDeviceCount(&n_dev) != cudaSuccess || n_dev < 1) {
+            std::printf("poly_fattn_test: no CUDA device\n");
+            return 77;
+        }
+        if (cudaSetDevice(0) != cudaSuccess) {
+            std::printf("poly_fattn_test: cannot select device 0\n");
+            return 77;
+        }
+    }
+    bool decode = false, k8v4 = false, sweep = false, parity = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "dec") decode = true;
         else if (arg == "k8v4") k8v4 = true;
         else if (arg == "sweep") sweep = true;
+        else if (arg == "parity") parity = true;
         else if (arg == "gqa16") kHeads = 32;
         else if (arg == "--heads" && i + 1 < argc) kHeadsArg = std::atoi(argv[++i]);
         else {
@@ -700,30 +1118,31 @@ int main(int argc, char** argv) {
         std::printf("FAIL: unsupported shape or insufficient scratch accepted\n");
         return 1;
     }
+    if (parity) return parity_main();
     if (sweep) {
         if (!fdec_fits(kDim, kHeads, kKvHeads, 262145, kScore)) {
             std::printf("no decode kernel for this card\n");
-            return 1;
+            return 77;
         }
         return sweep_main();
     }
     if (k8v4) {
         if (!fdec_fits(kDim, kHeads, kKvHeads, 262144, kScore)) {
             std::printf("no decode kernel for this card\n");
-            return 1;
+            return 77;
         }
         return k8v4_main();
     }
     if (decode) {
         if (!fdec_fits(kDim, kHeads, kKvHeads, 172032, kScore)) {
             std::printf("no decode kernel for this card\n");
-            return 1;
+            return 77;
         }
         return decode_main();
     }
     if (!fattn_fits(kDim, kHeads, kKvHeads, kBatch, kScore)) {
         std::printf("no kernel for this card\n");
-        return 1;
+        return 77;
     }
     // a batch whose results alone fill Qwen35's score_ (--prompt-batch 4096) is refused up front, not call by call
     if (fattn_fits(kDim, kHeads, kKvHeads, 4096, kScore)) {

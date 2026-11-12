@@ -245,11 +245,27 @@ macro(strata_poly_targets)
     add_test(NAME poly_hip_prefill_fp32_test COMMAND poly_hip_prefill_fp32_test)
     set_tests_properties(poly_hip_prefill_fp32_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     # fattn_q8() and fattn_f16() (llama.cpp's flash-attention kernel) against attend_batch(), and with `dec` fdec_q8()
-    # against attend(); needs a card, run by hand
+    # against attend(); needs a card (a machine without one returns 77 and the test is SKIPped, not failed)
     add_executable(poly_fattn_test ${_strata_poly_root}/src/poly/fattn_test.cu ${_strata_poly_root}/src/poly/kernels.cu)
     target_include_directories(poly_fattn_test PRIVATE ${_strata_poly_root}/include ${_strata_poly_root}/src/poly
                                                       ${_strata_gpu_include_directories})
     target_link_libraries(poly_fattn_test PRIVATE strata_poly_mmq ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
+    if(STRATA_BUILD_TESTS)
+      # the batch path (fattn_q8 / fattn_f16 against attend_batch, and the fitters' refusals)
+      add_test(NAME poly_fattn_test COMMAND poly_fattn_test)
+      set_tests_properties(poly_fattn_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      # the decode path (fdec_q8 / fdec_f16 against attend and the doubles, up to 170,000 rows, bit for bit)
+      add_test(NAME poly_fattn_test_dec COMMAND poly_fattn_test dec)
+      set_tests_properties(poly_fattn_test_dec PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      # k8v4: fdec_k8v4 against attend and the doubles at 4K/32K/128K/256K, the <=32-cell bit identity against
+      # fdec_q8, and one run per supported group (6 = Qwen3.8-27B, 8 = Qwen3.6/Flint, 12 = Qwen3.8-Flash)
+      add_test(NAME poly_fattn_test_k8v4 COMMAND poly_fattn_test k8v4)
+      set_tests_properties(poly_fattn_test_k8v4 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      foreach(_g 12 24)
+        add_test(NAME poly_fattn_test_k8v4_g${_g} COMMAND poly_fattn_test k8v4 --heads ${_g})
+        set_tests_properties(poly_fattn_test_k8v4_g${_g} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      endforeach()
+    endif()
     # STRATA_POLY_STAGED_TILES: the staged experts in size classes, each a launch of its own tile width, against one
     # launch, bit for bit; needs a card
     add_executable(poly_mmq_tiles_test ${_strata_poly_root}/src/poly/mmq_tiles_test.cu)

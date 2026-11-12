@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
     std::vector<int> cells_list = {4096, 32768, 131072, 262144};
     int iters = 10;
     bool only_fdec = false;
+    int rows_max_override = 0;
     for (int i = 4; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--cells" && i + 1 < argc) {
@@ -97,6 +98,8 @@ int main(int argc, char** argv) {
             iters = std::atoi(argv[++i]);
         } else if (a == "--only-fdec") {
             only_fdec = true;
+        } else if (a == "--rows-max" && i + 1 < argc) {
+            rows_max_override = std::atoi(argv[++i]);
         }
     }
     ck(cudaSetDevice(0), "cudaSetDevice");
@@ -130,7 +133,11 @@ int main(int argc, char** argv) {
                 "split/chunk path)",
                 "");
 
-    const int rows_max = *std::max_element(cells_list.begin(), cells_list.end()) + 1;
+    // The caches are allocated for the largest context of the RUN, so the same measured point can land in a
+    // differently sized allocation.  --rows-max pins that, which is how the 128K anomaly was traced: the same call
+    // costs 5.5 ns/cell inside a 256K allocation and 8.1 inside a 128K one.
+    const int rows_max = rows_max_override > 0 ? rows_max_override
+                                               : *std::max_element(cells_list.begin(), cells_list.end()) + 1;
     std::mt19937 rng(20261012u);
     std::normal_distribution<float> nd(0.f, 1.f);
 
@@ -170,6 +177,18 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // the fp16 control: the same values as halves, so q8_0 / k8v4 / fp16 are three readings of one payload
+    std::vector<uint16_t> hf((size_t) rows_max * width);
+    {
+        std::vector<float> x((size_t) width);
+        for (int r = 0; r < rows_max; ++r) {
+            for (float& v : x) v = 2.f * nd(rng);
+            for (int i = 0; i < width; ++i) hf[(size_t) r * width + i] = __half_as_ushort(__float2half(x[i]));
+        }
+    }
+    uint16_t* dhf = upload(hf);
+    hf.clear();
+    hf.shrink_to_fit();
     int8_t* dkc = upload(kc);
     uint16_t* dks = upload(ks);
     uint8_t* dvq = upload(vq);
@@ -209,7 +228,8 @@ int main(int argc, char** argv) {
         return median(v);
     };
 
-    std::printf("\n%s\n", "   cells   arm          ms        ns/cell   GB/s   % of 288   % of 280   ms q8_0   k8v4/q8_0");
+    std::printf("\n   cells   arm          ms        ns/cell   GB/s   %% of 288   %% of 280  | q8_0: ms  ns/cell  GB/s"
+                " || fp16: ms  ns/cell  GB/s\n");
     double k8[8] = {0}, q8[8] = {0};
     for (size_t ci = 0; ci < cells_list.size() && ci < 8; ++ci) {
         const long long pos = cells_list[ci];
@@ -225,13 +245,25 @@ int main(int argc, char** argv) {
             const double mq = time_ms([&] {
                 fdec_q8(q, kq, kq, pos, 1, nullptr, r, out2, dim, n_head, kv_heads, scale, score, score_n, nullptr);
             });
+            // fp16: the same values as halves, read where they lie
+            const double mh = time_ms([&] {
+                fdec_f16(q, dhf, dhf, pos, 1, nullptr, r, out2, dim, n_head, kv_heads, scale, score, score_n, nullptr);
+            });
+            (void) mh;
             k8[ci] = m4;
             q8[ci] = mq;
             const double ns = m4 * 1e6 / (double) rows;
             const double gbs = (double) cell_bytes * (double) rows / (m4 * 1e6);
             const int ctas = (int) ((rows + 1023) / 1024 * kv_heads);
-            std::printf("  %7lld  fdec_k8v4  %9.4f  %9.2f  %6.1f  %8.1f%%  %8.1f%%  %8.4f  %8.3f\n", pos, m4, ns, gbs,
-                        100.0 * gbs / peak, 100.0 * gbs / 280.0, mq, m4 / mq);
+            const int cell16 = width * 2 * 2;   // fp16: two sides of `width` halves
+            const int cell8 = width + nb * 2;   // q8_0: one side's codes and scales, counted once below
+            (void) cell8;
+            const double nsq = mq * 1e6 / (double) rows, nsh = mh * 1e6 / (double) rows;
+            const double gbsq = (double) cell_bytes * (double) rows / (mq * 1e6);
+            const double gbsh = (double) cell16 * (double) rows / (mh * 1e6);
+            std::printf("  %7lld  fdec_k8v4  %9.4f  %9.2f  %6.1f  %8.1f%%  %8.1f%%  | q8_0 %9.4f %8.2f %6.1f || "
+                        "f16 %9.4f %8.2f %6.1f\n",
+                        pos, m4, ns, gbs, 100.0 * gbs / peak, 100.0 * gbs / 280.0, mq, nsq, gbsq, mh, nsh, gbsh);
         }
         // ---- attend with the same k8v4 caches: the engine's generic path (also what a geometry fdec refuses takes)
         // --only fdec: skip it.  Two kernels share one 67 MB score buffer and the card's 32 MB L2, so a context's
