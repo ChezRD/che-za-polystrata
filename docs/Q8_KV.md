@@ -336,26 +336,51 @@ is nothing for the saved bytes to buy.
 The eight-value-group geometry (16 heads on 2 KV) measured **0.978 and 0.929** at 256K, the same conclusion.
 
 **What it buys on the dense model, measured.** The context ceiling of Qwen3.8-27B UD-IQ3_XXS on this 16 GB RTX
-4060 Ti, bisected at 256 tokens with `--kv-whole` (so a context that does not fit fails at load), one run at a
-time, `timeout 180`:
+4060 Ti, with `--kv-whole` so a context that does not fit fails at load. The desktop on this box holds about 3.1 GiB
+of the card and its use drifts between runs, so a single bisection is a sample of a moving quantity: each number
+below was then **re-probed at the boundary three to five times** and is the largest context that loaded every time
+(the next 1 KiB up failed every time).
 
-| `--prompt-batch` | `--window` | k8v4 | k6v4 | k6v4's gain |
-| ---: | ---: | ---: | ---: | ---: |
-| 512 | 1 | 96,512 | 111,872 | **+15.9%** |
-| 512 | 8 | 98,304 | 111,872 | **+13.8%** |
-| 128 | 1 | 104,448 | 122,112 | **+16.9%** |
-| 128 | 8 | 104,448 | 122,880 | **+17.6%** |
+| `--prompt-batch` | k8v4 | loads | k6v4 | loads | k6v4's gain |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 92,160 | 3/3 | 106,496 | 4/5 | **+15.6%** |
+| 128 | 102,400 | 3/3 | 122,880 | 3/3 | **+20.0%** |
 
-Mean **+16.1%**, which is the 15.4% of bytes a cell plus the granularity of the bisection. The mechanism is exact:
-at 122,880 k6v4 holds **2.74 GiB** of KV and at 104,448 k8v4 holds **2.74 GiB** — the same bytes reach the same
-ceiling, which is what the arithmetic predicted (`122,880 ≈ 109,400 / 0.8462 = 129,300` was ~5% optimistic; the
-card's own wall is what the measurement found, at the `--prompt-batch 128` scratch that line was taken with).
+Both at `--window 1` (see below), against `docs/QWEN38.md`'s ~109,400 for k8v4 at the batch-128 scratch — measured
+there as 102,400, within the ~7% that doc's tilde covers. The gain is the 15.4% of bytes a cell with the rest from
+where the scratch and the wall happen to round. `122,880 ≈ 109,400 / 0.8462 = 129,300` was ~5% optimistic, and the
+reason is the second scratch, not the format.
 
-Two caveats on those numbers, stated rather than smoothed: a repeat of the batch-512 window-1 k8v4 measurement gave
-94,208 where this table's says 96,512, so **the ceiling carries about ±2% of run-to-run variance** — the desktop's
-own VRAM use moves between runs. And `--window 1` is how these were taken because this tree has no `opt_.draft`
-guard on the `snap_` buffer; `--window 8 --prompt-batch 512` (which does allocate it) measures 98,304 at k8v4, so the
-snapshot buffer costs about 1,800 tokens here.
+Two caveats, stated rather than smoothed. The k8v4 batch-128 number moved by 2% between two clean bisections
+(104,448 then 102,400) and one boundary probe flipped on a re-run, so **treat these ceilings as ±2%**. And
+`--window 1` is how they were taken, because this tree has no `opt_.draft` guard on the `snap_` buffer;
+`--window 8 --prompt-batch 512` does allocate it and would not load 92,160 at all — that buffer plus the draft
+block's own is worth more context than the format buys back, which is the cost `docs/QWEN38.md` already documents
+and a reason to land the `snap_` guard before quoting a k6v4 ceiling at the default window.
+
+**Teacher-forced top-1, the method of `docs/FLINT.md:173`.** Same shape of measurement: N prompts of 8,192 random
+token ids, 48 greedy tokens each, every arm replaying the same prefix, agreement counted over every position. On the
+dense model, one binary, one card, temperature 0:
+
+| arm | top-1 against fp16 | of 144 positions | per prompt |
+| --- | ---: | ---: | --- |
+| q8_0 | **99.3%** | 143/144 | 47, 48, 48 |
+| k8v4 | **97.9%** | 141/144 | 45, 48, 48 |
+| **k6v4** | **97.2%** | **140/144** | **44, 48, 48** |
+
+**The prediction was "between k8v4 and q8_0". The measurement puts k6v4 one position below k8v4 and two below
+q8_0** — but the per-position record says that ordering is not the key format's. Of k6v4's four misses, **two are the
+same wrong token k8v4 picks** (position 9, both give 8442; position 13, both give 16 where the reference says 17), so
+those are the 4-bit values' and the split kernel's, not the keys'. One is k6v4's own (position 10: 257 against 198).
+The fourth is the end-of-turn token at position 24, where a 6-bit key tips an EOS/number near-tie. And at position 26
+**k6v4 is the only arm that gets it right**, where both q8_0 and k8v4 pick 248044 against the reference's 248045.
+
+So: **144 positions cannot separate k6v4 from k8v4.** One position is 0.7 of a point, the whole k8v4-to-q8_0 gap here
+is 1.4 points, and k6v4 both loses and wins single positions against both. What the run does establish is that a
+six-bit key is not a collapse — it is within one position of the format it would replace, on the same binary, the
+same prompts and the same prefixes — and it points the way to settle the ranking: more prompts, not more analysis.
+`docs/FLINT.md`'s 83.3 / 90.4 are **not** a comparison for these numbers: they are Flint on a different card, where
+the split kernel's long-range loss dominates, and this model at 8K does not show that loss at all.
 
 **The answers do not move at short range.** On four short prompts (a chat turn, two arithmetic ones, prose and code),
 16 greedy tokens at temperature 0: **k6v4 and k8v4 produce the identical 16 tokens on 4 of 4.** The caches hold
@@ -379,10 +404,12 @@ and a run with `STRATA_FDEC=0` — are refused at load with that reason. Flint i
 its layers keep caches of their own and this branch adds no reader for them.
 
 One gate was blind and is not now. `cuda_spill_guard` listed the `strata_*` libraries and not `strata_poly_mmq`, so
-it had never seen `fdec_kernel`; adding the library brought 21 of its instantiations into the report, all with an
-8-to-48-byte stack frame at 255 of 255 registers and no local array. **That is not this format's doing** — `main`'s
-own `fattn.cu` measures the same 16 frames, k8v4 is 8–40 bytes and k6v4 24–32 — so it is recorded as the measured
-allowance in `ALLOWED` and left to a fix that belongs in the tile loop, not here.
+it had never seen `fdec_kernel`. Adding the library makes the guard report **95 kernels on sm_89, 21 of them using a
+stack frame, all 21 allowlisted at their measured maximum (48 bytes, LOCAL 0)** and **0 violations** — the guard now
+passes while actually seeing the poly decode kernels for the first time. The frames are 8 to 48 bytes at 255 of 255
+registers with no local array, and they are **not this format's doing**: `main`'s own `fattn.cu` measures the same 16
+frames, k8v4 is 8–40 bytes and k6v4 24–32, so the six-bit key side adds no frame of its own. Recorded, not fixed —
+the fix is fewer live registers in the tile loop of the hottest kernel in the engine, which is its own change.
 
 ## The comparison with another implementation
 
