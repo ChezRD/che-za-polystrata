@@ -265,6 +265,13 @@ macro(strata_poly_targets)
         add_test(NAME poly_fattn_test_k8v4_g${_g} COMMAND poly_fattn_test k8v4 --heads ${_g})
         set_tests_properties(poly_fattn_test_k8v4_g${_g} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
       endforeach()
+      # k6v4: fdec_k6v4's six-bit keys against the doubles on the id payload (the 2.5e-3 bar, beside k8v4's own
+      # number on the same payload), at the 64-key tile and 1,024-key split boundaries with 1/2/4/8 tokens, at group
+      # 6 both ways a launch is shaped, and at the dense model's 24 Q / 4 KV geometry
+      add_test(NAME poly_fattn_test_k6v4 COMMAND poly_fattn_test k6v4)
+      set_tests_properties(poly_fattn_test_k6v4 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      add_test(NAME poly_fattn_test_k6v4_g12 COMMAND poly_fattn_test k6v4 --heads 12)
+      set_tests_properties(poly_fattn_test_k6v4_g12 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
       # fdec_k8v4 against attend() over ALL heads at one long context, one test a context so each stays bounded
       # (a single run that compares both was 27 minutes and had to be killed; see MB-ROW-1-5.md §29)
       foreach(_pos 131072 262144)

@@ -573,6 +573,519 @@ int k8v4_main() {
     return bad ? 1 : 0;
 }
 
+// ---- k6v4: six-bit keys, Q4_0 values ------------------------------------------------------------------------
+// A cell is 384 + 32 bytes of keys against k8v4's 544, plus the same 288 of values: 704 against 832.
+constexpr int kCellBytesK6V4 = (kWidth / 32) * 24 + (kWidth / 32) * 2 + kRowBytesV4;
+
+// Q6_0 on the host, exactly as store_q6() writes it: d = amax/31, code = clamp(rint(x/d), -31, 31) + 32, the 32
+// codes little-endian at six bits each.
+void q6_host_row(const float* x, uint8_t* q6, uint16_t* sc) {
+    for (int b = 0; b < kWidth / 32; ++b) {
+        const float* xb = x + b * 32;
+        float amax = 0.f;
+        for (int j = 0; j < 32; ++j) amax = std::fmax(amax, std::fabs(xb[j]));
+        const float d = amax / 31.f, id = d > 0.f ? 1.f / d : 0.f;
+        sc[b] = __half_as_ushort(__float2half(d));
+        uint32_t w[6] = {0, 0, 0, 0, 0, 0};
+        for (int j = 0; j < 32; ++j) {
+            float q = std::rint(xb[j] * id);
+            q = std::fmin(std::fmax(q, -31.f), 31.f);
+            const uint32_t v = (uint32_t) ((int) q + 32);
+            const int bit = 6 * j, wi = bit >> 5, sh = bit & 31;
+            w[wi] |= v << sh;
+            if (sh > 26) w[wi + 1] |= v >> (32 - sh);
+        }
+        std::memcpy(q6 + b * 24, w, 24);
+    }
+}
+
+// The same cache decoded, for the doubles: code j of a block at bits 6j of its 24 bytes, (code - 32) * scale.
+struct Q6Host {
+    std::vector<uint8_t> q;
+    std::vector<uint16_t> sc;
+    float at(size_t row, int i) const {
+        const size_t nb = kWidth / 32, b = i / 32;
+        const uint8_t* blk = q.data() + (row * nb + b) * 24;
+        uint32_t w[6];
+        std::memcpy(w, blk, 24);
+        const int j = i % 32, bit = 6 * j, wi = bit >> 5, sh = bit & 31;
+        uint32_t v = w[wi] >> sh;
+        if (sh > 26) v |= w[wi + 1] << (32 - sh);
+        return (float) ((int) (v & 0x3Fu) - 32) * __half2float(__ushort_as_half(sc[row * nb + b]));
+    }
+};
+
+// Token t's head h (of group g = h / (kHeads / kKvHeads)) over dequantized caches in doubles: a load and an fma.
+std::vector<double> exact_wide(const std::vector<float>& K, const std::vector<float>& V, int width, int g,
+                               const float* qh, long long keys, float scale) {
+    std::vector<double> w(keys), o(kDim, 0.0);
+    double top = -1e300, z = 0;
+    for (long long r = 0; r < keys; ++r) {
+        const float* kr = K.data() + (size_t) r * width + (size_t) g * kDim;
+        double s = 0;
+        for (int i = 0; i < kDim; ++i) s += (double) qh[i] * (double) kr[i];
+        top = std::max(top, w[r] = s * (double) scale);
+    }
+    for (auto& x : w) z += x = std::exp(x - top);
+    for (long long r = 0; r < keys; ++r) {
+        const float* vr = V.data() + (size_t) r * width + (size_t) g * kDim;
+        const double wr = w[r];
+        for (int i = 0; i < kDim; ++i) o[i] += wr * (double) vr[i];
+    }
+    for (double& x : o) x /= z;
+    return o;
+}
+
+// k6v4_main: the six-bit reader checked against the doubles on an id payload (the parity bar), at the tile and split
+// boundaries with 2, 4 and 8 tokens, at group 6 both ways a launch is shaped, and at the dense model's 24 Q / 4 KV
+// geometry.  Then the quantizer's own error, against q8_0's on the same rows.
+int k6v4_main() {
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    const float scale = 1.f / 16.f;
+    float* score;
+    cudaMalloc(&score, kScore * sizeof(float));
+    int bad = 0;
+    std::printf("k6v4 decode: %d B a cell against k8v4's %d and q8_0's %d\n", kCellBytesK6V4, kCellBytesK8V4,
+                kCellBytesQ8);
+
+    // ---- 1. the id payload of parity_main, through the six-bit keys: a neighbour cell reads 0.0078 and a swapped KV
+    // head 4.0, so 2.5e-3 is the bar and the quantizer's own noise has to stay under it.  The same payload goes
+    // through k8v4 beside it, so the two formats' numbers are one line apart rather than one report apart.
+    {
+        const int rows = 512;
+        const auto payload = [](int r, int g, int i) {
+            return (float) g * 4.0f + (float) r * 0.0078125f + (float) i * 1e-5f;
+        };
+        std::vector<float> kv((size_t) rows * kWidth), q((size_t) rows * kHeads * kDim, 0.f);
+        for (int r = 0; r < rows; ++r)
+            for (int g = 0; g < kKvHeads; ++g)
+                for (int i = 0; i < kDim; ++i) kv[(size_t) r * kWidth + g * kDim + i] = payload(r, g, i);
+        for (int t = 0; t < rows; ++t)
+            for (int h = 0; h < kHeads; ++h) q[((size_t) t * kHeads + h) * kDim + (t * 7 + h) % kDim] = 1.f;
+        Q6Host K6;
+        K6.q.resize((size_t) rows * (kWidth / 32) * 24);
+        K6.sc.resize((size_t) rows * (kWidth / 32));
+        V4Host V4;
+        V4.q.resize((size_t) rows * (kWidth / 32) * 16);
+        V4.sc.resize((size_t) rows * (kWidth / 32));
+        std::vector<int8_t> k8((size_t) rows * kWidth);
+        std::vector<uint16_t> k8s((size_t) rows * (kWidth / 32));
+        for (int r = 0; r < rows; ++r) {
+            q6_host_row(kv.data() + (size_t) r * kWidth, K6.q.data() + (size_t) r * (kWidth / 32) * 24,
+                        K6.sc.data() + (size_t) r * (kWidth / 32));
+            q4_host_row(kv.data() + (size_t) r * kWidth, V4.q.data() + (size_t) r * (kWidth / 32) * 16,
+                        V4.sc.data() + (size_t) r * (kWidth / 32));
+            q8_host_row(kv.data() + (size_t) r * kWidth, k8.data() + (size_t) r * kWidth,
+                        k8s.data() + (size_t) r * (kWidth / 32));
+        }
+        uint8_t* dq6 = upload(K6.q);
+        uint16_t* dq6s = upload(K6.sc);
+        int8_t* dk8 = upload(k8);
+        uint16_t* dk8s = upload(k8s);
+        uint8_t* dvq = upload(V4.q);
+        uint16_t* dvs = upload(V4.sc);
+        float* dq = upload(q);
+        float* out;
+        cudaMalloc(&out, size_t(kHeads) * kDim * sizeof(float));
+        const size_t per_tok = (size_t) kHeads * kDim;
+        double worst6 = 0, worst8 = 0;
+        for (int t : {1, 7, 63, 200, 511}) {
+            const std::vector<double>* want = nullptr;
+            std::vector<double> w[kHeads];
+            for (int h = 0; h < kHeads; ++h) {
+                std::vector<float> Kf((size_t) (t + 1) * kWidth), Vf((size_t) (t + 1) * kWidth);
+                for (int r = 0; r <= t; ++r)
+                    for (int i = 0; i < kWidth; ++i) {
+                        Kf[(size_t) r * kWidth + i] = K6.at((size_t) r, i);
+                        Vf[(size_t) r * kWidth + i] = V4.at((size_t) r, i);
+                    }
+                w[h] = exact_wide(Kf, Vf, kWidth, h / (kHeads / kKvHeads), q.data() + (size_t) t * per_tok + (size_t) h * kDim,
+                                  t + 1, scale);
+            }
+            (void) want;
+            cudaMemset(out, 0, per_tok * sizeof(float));
+            const bool ran = fdec_k6v4(dq + (size_t) t * per_tok, Kvq6{dq6, dq6s}, Kvq4{dvq, dvs}, t, 1, nullptr, t + 1,
+                                       out, kDim, kHeads, kKvHeads, scale, score, kScore, nullptr);
+            if (!ran) {
+                std::printf("FAIL k6v4 refused at t=%d\n", t);
+                ++bad;
+                continue;
+            }
+            const std::vector<float> got = download(out, per_tok);
+            cudaMemset(out, 0, per_tok * sizeof(float));
+            fdec_k8v4(dq + (size_t) t * per_tok, Kvq8{dk8, dk8s}, Kvq4{dvq, dvs}, t, 1, nullptr, t + 1, out, kDim,
+                      kHeads, kKvHeads, scale, score, kScore, nullptr);
+            const std::vector<float> got8 = download(out, per_tok);
+            double e6 = 0, e8 = 0;
+            for (int h = 0; h < kHeads; ++h)
+                for (int i = 0; i < kDim; ++i) {
+                    e6 = std::max(e6, std::fabs((double) got[(size_t) h * kDim + i] - w[h][i]));
+                    e8 = std::max(e8, std::fabs((double) got8[(size_t) h * kDim + i] - w[h][i]));
+                }
+            worst6 = std::max(worst6, e6);
+            worst8 = std::max(worst8, e8);
+            const double bar = 2.5e-3;
+            const bool ok = e6 < bar;
+            bad += !ok;
+            std::printf("%s parity t=%3d (%d cells): k6v4 worst |err| %.3e   k8v4 %.3e   (bar %.1e)%s\n",
+                        ok ? "ok  " : "FAIL", t, t + 1, e6, e8, bar,
+                        ok ? "" : "  <- a swapped head (4.0) or a neighbour cell (0.0078) is far above this");
+        }
+        // The hex payload is coarser than q8_0's by design: 63 levels against 255.  A six-bit quantizer's error is
+        // therefore about four times a q8_0 one's on the same bytes, and the test is that it is of that size and not
+        // of a neighbour-cell's: 0.0078 a cell away, and this is 1e-5.
+        std::printf("     the payload through both: k6v4 %.3e against k8v4 %.3e, a ratio of %.2f (a 6-bit step is 4.1x\n"
+                    "     an 8-bit one's, so anything near 4 is the format and anything near 500 is a wrong gather)\n",
+                    worst6, worst8, worst8 > 0 ? worst6 / worst8 : 0.0);
+        cudaFree(dq6), cudaFree(dq6s), cudaFree(dk8), cudaFree(dk8s), cudaFree(dvq), cudaFree(dvs), cudaFree(dq),
+            cudaFree(out);
+    }
+
+    // ---- 2. the tile and split boundaries with 1, 2, 4 and 8 tokens: kTile is 64 keys and kSplit 1,024, so a
+    // position at 62..65 ends a tile just before, on and after a token, and 1,022..1,025 crosses a split.  A launch
+    // carries kDecRows / Group tokens, so 8 tokens is two launches at group 6 and one at group 8.  The reference is
+    // the doubles over the same quantized caches, which is what the kernel's own arithmetic has to match.
+    {
+        const long long rows = kContexts[0] + 8;   // 4,104 rows: past the first split, a few tiles deep
+        const int n_max = 8;
+        std::mt19937 rng(99);
+        std::vector<float> q((size_t) n_max * kHeads * kDim);
+        for (float& x : q) x = 2.f * draw(rng);
+        std::vector<float> row(kWidth);
+        Q6Host K6;
+        K6.q.resize((size_t) rows * (kWidth / 32) * 24);
+        K6.sc.resize((size_t) rows * (kWidth / 32));
+        V4Host V4;
+        V4.q.resize((size_t) rows * (kWidth / 32) * 16);
+        V4.sc.resize((size_t) rows * (kWidth / 32));
+        for (long long r = 0; r < rows; ++r) {
+            for (float& x : row) x = draw(rng);
+            q6_host_row(row.data(), K6.q.data() + (size_t) r * (kWidth / 32) * 24,
+                        K6.sc.data() + (size_t) r * (kWidth / 32));
+            q4_host_row(row.data(), V4.q.data() + (size_t) r * (kWidth / 32) * 16,
+                        V4.sc.data() + (size_t) r * (kWidth / 32));
+        }
+        uint8_t* dq6 = upload(K6.q);
+        uint16_t* dq6s = upload(K6.sc);
+        uint8_t* dvq = upload(V4.q);
+        uint16_t* dvs = upload(V4.sc);
+        float* dq = upload(q);
+        float* out;
+        cudaMalloc(&out, size_t(n_max) * kHeads * kDim * sizeof(float));
+        const size_t per_tok = (size_t) kHeads * kDim;
+        int checked = 0;
+        double most = 0;
+        for (long long pos : {0LL, 62LL, 63LL, 64LL, 65LL, 1022LL, 1023LL, 1024LL, 1025LL}) {
+            for (int n : {1, 2, 4, 8}) {
+                if (pos + n > rows) continue;
+                cudaMemset(out, 0, (size_t) n * per_tok * sizeof(float));
+                if (!fdec_k6v4(dq, Kvq6{dq6, dq6s}, Kvq4{dvq, dvs}, pos, n, nullptr, (int) (pos + n), out, kDim, kHeads,
+                               kKvHeads, scale, score, kScore, nullptr)) {
+                    std::printf("FAIL k6v4 refused at pos %lld n %d\n", pos, n);
+                    ++bad;
+                    continue;
+                }
+                const std::vector<float> got = download(out, (size_t) n * per_tok);
+                double worst = 0;
+                for (int t = 0; t < n; ++t)
+                    for (int h : {0, kHeads / 2}) {
+                        std::vector<float> Kf((size_t) (pos + t + 1) * kWidth), Vf((size_t) (pos + t + 1) * kWidth);
+                        for (long long r = 0; r <= pos + t; ++r)
+                            for (int i = 0; i < kWidth; ++i) {
+                                Kf[(size_t) r * kWidth + i] = K6.at((size_t) r, i);
+                                Vf[(size_t) r * kWidth + i] = V4.at((size_t) r, i);
+                            }
+                        const std::vector<double> want = exact_wide(Kf, Vf, kWidth, h / (kHeads / kKvHeads),
+                                                                    q.data() + (size_t) t * per_tok + (size_t) h * kDim,
+                                                                    pos + t + 1, scale);
+                        for (int i = 0; i < kDim; ++i)
+                            worst = std::max(worst, std::fabs((double) got[((size_t) t * kHeads + h) * kDim + i] - want[i]));
+                    }
+                most = std::max(most, worst);
+                ++checked;
+                if (worst > 1e-2) {
+                    std::printf("FAIL partial tile pos %lld n %d: worst |err| %.3e\n", pos, n, worst);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("ok   partial tiles and splits: %d calls (pos 0/62/63/64/65/1022/1023/1024/1025 x n 1/2/4/8), worst\n"
+                    "     |err| %.3e of the doubles\n", checked, most);
+        cudaFree(dq6), cudaFree(dq6s), cudaFree(dvq), cudaFree(dvs), cudaFree(dq), cudaFree(out);
+    }
+
+    // ---- 3. group 6 both ways: 12 heads on this file's 2 KV heads is the dense model's shape (24 on 4), 5 tokens
+    // is the longest launch its kDecRows / Group allows, and 2 is short of it, so one launch covers MT=1 and MT=2.
+    if (kHeads / kKvHeads == 6) {
+        const long long rows = 600;
+        const int n_max = 8;
+        std::mt19937 rng(1234);
+        std::vector<float> q((size_t) n_max * kHeads * kDim);
+        for (float& x : q) x = 2.f * draw(rng);
+        std::vector<float> row(kWidth);
+        Q6Host K6;
+        K6.q.resize((size_t) rows * (kWidth / 32) * 24);
+        K6.sc.resize((size_t) rows * (kWidth / 32));
+        V4Host V4;
+        V4.q.resize((size_t) rows * (kWidth / 32) * 16);
+        V4.sc.resize((size_t) rows * (kWidth / 32));
+        for (long long r = 0; r < rows; ++r) {
+            for (float& x : row) x = draw(rng);
+            q6_host_row(row.data(), K6.q.data() + (size_t) r * (kWidth / 32) * 24,
+                        K6.sc.data() + (size_t) r * (kWidth / 32));
+            q4_host_row(row.data(), V4.q.data() + (size_t) r * (kWidth / 32) * 16,
+                        V4.sc.data() + (size_t) r * (kWidth / 32));
+        }
+        uint8_t* dq6 = upload(K6.q);
+        uint16_t* dq6s = upload(K6.sc);
+        uint8_t* dvq = upload(V4.q);
+        uint16_t* dvs = upload(V4.sc);
+        float* dq = upload(q);
+        float* out;
+        cudaMalloc(&out, size_t(n_max) * kHeads * kDim * sizeof(float));
+        const size_t per_tok = (size_t) kHeads * kDim;
+        double most = 0;
+        int calls = 0;
+        for (long long pos : {63LL, 64LL, 510LL, 511LL}) {
+            for (int n : {1, 2, 5, 6, 8}) {
+                if (pos + n > rows) continue;
+                cudaMemset(out, 0, (size_t) n * per_tok * sizeof(float));
+                if (!fdec_k6v4(dq, Kvq6{dq6, dq6s}, Kvq4{dvq, dvs}, pos, n, nullptr, (int) (pos + n), out, kDim, kHeads,
+                               kKvHeads, scale, score, kScore, nullptr)) {
+                    std::printf("FAIL k6v4 group 6 refused at pos %lld n %d\n", pos, n);
+                    ++bad;
+                    continue;
+                }
+                const std::vector<float> got = download(out, (size_t) n * per_tok);
+                double worst = 0;
+                for (int t = 0; t < n; ++t)
+                    for (int h : {0, kHeads / 2}) {
+                        std::vector<float> Kf((size_t) (pos + t + 1) * kWidth), Vf((size_t) (pos + t + 1) * kWidth);
+                        for (long long r = 0; r <= pos + t; ++r)
+                            for (int i = 0; i < kWidth; ++i) {
+                                Kf[(size_t) r * kWidth + i] = K6.at((size_t) r, i);
+                                Vf[(size_t) r * kWidth + i] = V4.at((size_t) r, i);
+                            }
+                        const std::vector<double> want = exact_wide(Kf, Vf, kWidth, h / (kHeads / kKvHeads),
+                                                                    q.data() + (size_t) t * per_tok + (size_t) h * kDim,
+                                                                    pos + t + 1, scale);
+                        for (int i = 0; i < kDim; ++i)
+                            worst = std::max(worst, std::fabs((double) got[((size_t) t * kHeads + h) * kDim + i] - want[i]));
+                    }
+                most = std::max(most, worst);
+                ++calls;
+                if (worst > 1e-2) {
+                    std::printf("FAIL group 6 pos %lld n %d: worst |err| %.3e\n", pos, n, worst);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("ok   group 6: %d calls (pos 63/64/510/511 x n 1/2/5/6/8), worst |err| %.3e of the doubles\n", calls,
+                    most);
+        cudaFree(dq6), cudaFree(dq6s), cudaFree(dvq), cudaFree(dvs), cudaFree(dq), cudaFree(out);
+    }
+
+    // ---- 4. the dense model's geometry: 24 query heads on 4 KV heads of 256 values, group 6, which is a 1,024-value
+    // row and twice this file's cache.  A token at 255 attends 256 rows, so the whole cache is read in one split.
+    {
+        const int kHeadsD = 24, kKvD = 4, width = kKvD * kDim;
+        const long long rows = 320;   // 255 + 8: a token at position 255 with 8 beside it attends row 262
+        const int n_max = 8;
+        std::mt19937 rng(7);
+        std::vector<float> q((size_t) n_max * kHeadsD * kDim);
+        for (float& x : q) x = 2.f * draw(rng);
+        std::vector<float> kv((size_t) rows * width);
+        for (float& x : kv) x = draw(rng);
+        const int nb = width / 32;
+        std::vector<uint8_t> k6((size_t) rows * nb * 24);
+        std::vector<uint16_t> k6s((size_t) rows * nb);
+        std::vector<uint8_t> vq4((size_t) rows * nb * 16);
+        std::vector<uint16_t> vq4s((size_t) rows * nb);
+        for (long long r = 0; r < rows; ++r) {
+            // the same rules, on a row of this width
+            const float* xr = kv.data() + (size_t) r * width;
+            for (int b = 0; b < nb; ++b) {
+                const float* xb = xr + b * 32;
+                float amax = 0.f, mval = 0.f;
+                for (int j = 0; j < 32; ++j) {
+                    const float a = std::fabs(xb[j]);
+                    if (a > amax || (a == amax && xb[j] > mval)) { amax = a; mval = xb[j]; }
+                }
+                const float d = amax / 31.f, id = d > 0.f ? 1.f / d : 0.f;
+                k6s[(size_t) r * nb + b] = __half_as_ushort(__float2half(d));
+                uint32_t w[6] = {0, 0, 0, 0, 0, 0};
+                for (int j = 0; j < 32; ++j) {
+                    float qq = std::rint(xb[j] * id);
+                    qq = std::fmin(std::fmax(qq, -31.f), 31.f);
+                    const uint32_t v = (uint32_t) ((int) qq + 32);
+                    const int bit = 6 * j, wi = bit >> 5, sh = bit & 31;
+                    w[wi] |= v << sh;
+                    if (sh > 26) w[wi + 1] |= v >> (32 - sh);
+                }
+                std::memcpy(k6.data() + ((size_t) r * nb + b) * 24, w, 24);
+                const float dq4 = mval / -8.f, iq = dq4 != 0.f ? 1.f / dq4 : 0.f;
+                vq4s[(size_t) r * nb + b] = __half_as_ushort(__float2half_rn(dq4));
+                for (int j = 0; j < 16; ++j) {
+                    const int q0 = (int) (xb[j] * iq + 8.5f);
+                    const int q1 = (int) (xb[j + 16] * iq + 8.5f);
+                    const uint8_t a = (uint8_t) (q0 < 0 ? 0 : (q0 > 15 ? 15 : q0));
+                    const uint8_t c = (uint8_t) (q1 < 0 ? 0 : (q1 > 15 ? 15 : q1));
+                    vq4[((size_t) r * nb + b) * 16 + j] = (uint8_t) (a | (c << 4));
+                }
+            }
+        }
+        uint8_t* dk6 = upload(k6);
+        uint16_t* dk6s = upload(k6s);
+        uint8_t* dvq4 = upload(vq4);
+        uint16_t* dvq4s = upload(vq4s);
+        float* dq = upload(q);
+        float* out;
+        cudaMalloc(&out, size_t(n_max) * kHeadsD * kDim * sizeof(float));
+        const size_t per_tok = (size_t) kHeadsD * kDim;
+        std::vector<float> Kf((size_t) rows * width), Vf((size_t) rows * width);
+        for (long long r = 0; r < rows; ++r)
+            for (int i = 0; i < width; ++i) {
+                const int b = i / 32, within = i % 32;
+                uint32_t w[6];
+                std::memcpy(w, k6.data() + ((size_t) r * nb + b) * 24, 24);
+                const int bit = 6 * within, wi = bit >> 5, sh = bit & 31;
+                uint32_t v = w[wi] >> sh;
+                if (sh > 26) v |= w[wi + 1] << (32 - sh);
+                Kf[(size_t) r * width + i] =
+                    (float) ((int) (v & 0x3Fu) - 32) * __half2float(__ushort_as_half(k6s[(size_t) r * nb + b]));
+                const uint8_t byte = vq4[((size_t) r * nb + b) * 16 + (within < 16 ? within : within - 16)];
+                const int nib = within < 16 ? (byte & 0x0F) : (byte >> 4);
+                Vf[(size_t) r * width + i] =
+                    (float) (nib - 8) * __half2float(__ushort_as_half(vq4s[(size_t) r * nb + b]));
+            }
+        double most = 0;
+        int calls = 0;
+        for (long long pos : {250LL, 255LL}) {
+            for (int n : {1, 2, 5, 8}) {
+                cudaMemset(out, 0, (size_t) n * per_tok * sizeof(float));
+                if (!fdec_k6v4(dq, Kvq6{dk6, dk6s}, Kvq4{dvq4, dvq4s}, pos, n, nullptr, (int) (pos + n), out, kDim,
+                               kHeadsD, kKvD, scale, score, kScore, nullptr)) {
+                    std::printf("FAIL k6v4 dense refused at pos %lld n %d\n", pos, n);
+                    ++bad;
+                    continue;
+                }
+                const std::vector<float> got = download(out, (size_t) n * per_tok);
+                // two heads a token against the doubles, the same sample k8v4's mode takes
+                double worst = 0;
+                for (int t = 0; t < n; ++t)
+                    for (int h : {0, 12}) {
+                        const std::vector<double> want = exact_wide(Kf, Vf, width, h / 6,
+                                                                    q.data() + (size_t) t * per_tok + (size_t) h * kDim,
+                                                                    pos + t + 1, scale);
+                        for (int i = 0; i < kDim; ++i)
+                            worst = std::max(worst, std::fabs((double) got[((size_t) t * kHeadsD + h) * kDim + i] - want[i]));
+                    }
+                most = std::max(most, worst);
+                ++calls;
+                if (worst > 1e-2) {
+                    std::printf("FAIL dense pos %lld n %d: worst |err| %.3e\n", pos, n, worst);
+                    ++bad;
+                }
+            }
+        }
+        std::printf("ok   dense geometry (24 Q / 4 KV, %d values a row, group 6): %d calls, worst |err| %.3e\n", width,
+                    calls, most);
+        cudaFree(dk6), cudaFree(dk6s), cudaFree(dvq4), cudaFree(dvq4s), cudaFree(dq), cudaFree(out);
+    }
+
+    // ---- 5. the quantizer alone, against q8_0's on the same rows: the step is what a bit costs, and it is the number
+    // an accuracy run would be explained by.
+    {
+        std::mt19937 rng(555);
+        const int rows = 4096;
+        double e6 = 0, e8 = 0, s6 = 0, s8 = 0;
+        std::vector<float> row(kWidth);
+        Q6Host K6;
+        K6.q.resize((size_t) rows * (kWidth / 32) * 24);
+        K6.sc.resize((size_t) rows * (kWidth / 32));
+        std::vector<int8_t> k8((size_t) rows * kWidth);
+        std::vector<uint16_t> k8s((size_t) rows * (kWidth / 32));
+        for (int r = 0; r < rows; ++r) {
+            for (float& x : row) x = draw(rng);
+            q6_host_row(row.data(), K6.q.data() + (size_t) r * (kWidth / 32) * 24,
+                        K6.sc.data() + (size_t) r * (kWidth / 32));
+            q8_host_row(row.data(), k8.data() + (size_t) r * kWidth, k8s.data() + (size_t) r * (kWidth / 32));
+            for (int i = 0; i < kWidth; ++i) {
+                const double a = std::fabs((double) K6.at((size_t) r, i) - (double) row[i]);
+                const double b = std::fabs((double) k8[(size_t) r * kWidth + i] *
+                                               __half2float(__ushort_as_half(k8s[(size_t) r * (kWidth / 32) + i / 32])) -
+                                           (double) row[i]);
+                e6 = std::max(e6, a);
+                e8 = std::max(e8, b);
+                s6 += a * a;
+                s8 += b * b;
+            }
+        }
+        const double n = (double) rows * kWidth;
+        std::printf("quantizer: k6v4 max |err| %.3e rms %.3e;  q8_0 max %.3e rms %.3e  (%.2fx and %.2fx of q8_0's)\n",
+                    e6, std::sqrt(s6 / n), e8, std::sqrt(s8 / n), e6 / e8, std::sqrt(s6 / s8));
+    }
+
+    // ---- 5. store_q6() itself, byte for byte against the host reference: the packing is what the reader trusts, so
+    // the kernel that writes it is checked against q6_host_row() on rows the reader then decodes.  Every code 1..63
+    // appears, and a row of equal magnitudes must come back exactly (d = amax/31 is fp16-exact for a power of two).
+    {
+        const int rows = 64;
+        std::mt19937 rng(31337);
+        std::vector<float> x((size_t) rows * kWidth);
+        for (int r = 0; r < rows; ++r)
+            for (int i = 0; i < kWidth; ++i) {
+                const int b = i / 32;
+                // a spread that covers all 63 codes and lands on the extremes: the block's amax at +-31 and 0 near it
+                x[(size_t) r * kWidth + i] = (i % 32 == 0) ? std::ldexp(1.0f, (r % 5) - 2) * ((r & 2) ? -1.f : 1.f)
+                                                            : (float) (((r * 7 + i * 29) % 63) - 31) / 31.f *
+                                                                  std::ldexp(1.0f, (r % 5) - 2);
+                (void) b;
+            }
+        std::vector<uint8_t> hq6((size_t) rows * (kWidth / 32) * 24), gq6(hq6.size());
+        std::vector<uint16_t> hs((size_t) rows * (kWidth / 32)), gs(hs.size());
+        for (int r = 0; r < rows; ++r)
+            q6_host_row(x.data() + (size_t) r * kWidth, hq6.data() + (size_t) r * (kWidth / 32) * 24,
+                        hs.data() + (size_t) r * (kWidth / 32));
+        float* dx = upload(x);
+        uint8_t* dq6 = nullptr;
+        uint16_t* ds = nullptr;
+        cudaMalloc(&dq6, hq6.size());
+        cudaMalloc(&ds, hs.size() * 2);
+        cudaMemset(dq6, 0xAA, hq6.size());
+        store_q6(dx, dq6, ds, kWidth, 0, rows, nullptr);
+        cudaDeviceSynchronize();
+        cudaMemcpy(gq6.data(), dq6, hq6.size(), cudaMemcpyDeviceToHost);
+        cudaMemcpy(gs.data(), ds, hs.size() * 2, cudaMemcpyDeviceToHost);
+        size_t ndiff = 0, sdiff = 0;
+        for (size_t i = 0; i < hq6.size(); ++i) ndiff += gq6[i] != hq6[i];
+        for (size_t i = 0; i < hs.size(); ++i) sdiff += gs[i] != hs[i];
+        // the round trip on the equal-magnitude rows: code 32 is zero and the amax decodes back to itself
+        double worst_rt = 0;
+        for (int r = 0; r < rows; ++r)
+            for (int i = 0; i < kWidth; ++i) {
+                const int b = i / 32, within = i % 32, bit = 6 * within, wi = bit >> 5, sh = bit & 31;
+                uint32_t wv[6];
+                std::memcpy(wv, gq6.data() + ((size_t) r * (kWidth / 32) + b) * 24, 24);
+                uint32_t v = wv[wi] >> sh;
+                if (sh > 26) v |= wv[wi + 1] << (32 - sh);
+                const float got = (float) ((int) (v & 0x3Fu) - 32) *
+                                  __half2float(__ushort_as_half(gs[(size_t) r * (kWidth / 32) + b]));
+                worst_rt = std::max(worst_rt, (double) std::fabs(got - x[(size_t) r * kWidth + i]));
+            }
+        const bool ok = ndiff == 0 && sdiff == 0;
+        bad += !ok;
+        std::printf("%s store_q6: %zu of %zu code bytes and %zu of %zu scales differ from the host reference; worst\n"
+                    "     round-trip error %.3e\n", ok ? "ok  " : "FAIL", ndiff, hq6.size(), sdiff, hs.size(),
+                    worst_rt);
+        cudaFree(dx), cudaFree(dq6), cudaFree(ds);
+    }
+
+    std::printf(bad ? "k6v4: %d failed\n" : "k6v4: all passed\n", bad);
+    cudaFree(score);
+    return bad ? 1 : 0;
+}
+
 // sweep_main: what one decode cell costs as the context grows, with nothing else in the process.  If the time a
 // cell takes is flat across contexts the read is latency- or launch-bound (the same fixed number of CTAs doing a
 // longer serial loop); if it is flat in the TOTAL time instead, or rises with cells, the work is what costs.
@@ -1283,12 +1796,13 @@ int main(int argc, char** argv) {
             return 77;
         }
     }
-    bool decode = false, k8v4 = false, sweep = false, parity = false, deep = false;
+    bool decode = false, k8v4 = false, k6v4 = false, sweep = false, parity = false, deep = false;
     long long deep_pos = 262144;
     for (int i = 1; i < argc; ++i) {
         const std::string arg(argv[i]);
         if (arg == "dec") decode = true;
         else if (arg == "k8v4") k8v4 = true;
+        else if (arg == "k6v4") k6v4 = true;
         else if (arg == "sweep") sweep = true;
         else if (arg == "parity") parity = true;
         else if (arg == "deep") {
@@ -1299,7 +1813,7 @@ int main(int argc, char** argv) {
         else if (arg == "gqa16") kHeads = 32;
         else if (arg == "--heads" && i + 1 < argc) kHeadsArg = std::atoi(argv[++i]);
         else {
-            std::fprintf(stderr, "usage: poly_fattn_test [dec|k8v4|sweep|parity|deep [pos]] [gqa16] [--heads N]\n");
+            std::fprintf(stderr, "usage: poly_fattn_test [dec|k8v4|k6v4|sweep|parity|deep [pos]] [gqa16] [--heads N]\n");
             return 2;
         }
     }
@@ -1339,6 +1853,13 @@ int main(int argc, char** argv) {
             return 77;
         }
         return k8v4_main();
+    }
+    if (k6v4) {
+        if (!fdec_fits(kDim, kHeads, kKvHeads, 262144, kScore)) {
+            std::printf("no decode kernel for this card\n");
+            return 77;
+        }
+        return k6v4_main();
     }
     if (decode) {
         if (!fdec_fits(kDim, kHeads, kKvHeads, 172032, kScore)) {

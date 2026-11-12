@@ -138,6 +138,14 @@ void store_q4(const float* x, uint8_t* q4, uint16_t* scales, int n, int64_t pos,
 void store_q4_at(const float* x, uint8_t* q4, uint16_t* scales, int n, const long long* at, int rows, int ring,
                  void* stream);
 
+/// Stores the tokens' rows as 6-bit codes (Kvq6): d = amax/31, code = clamp(rint(x/d), -31, 31) + 32 in six bits,
+/// the 32 codes of a block packed little-endian at six bits each (24 bytes) and the scales in an array of their own
+/// as Q4_0's are: `q6` is 24 bytes a 32-value block a row, `scales` 2 bytes a block a row, n a multiple of 32.
+/// The two spare codes of the six bits are not used, so the format is symmetric about zero and a block of equal
+/// magnitudes decodes back to them exactly, which is what the tests rest on.  The values are quantized as they are
+/// - a rotated cache rotates them first (fwht_rows()).
+void store_q6(const float* x, uint8_t* q6, uint16_t* scales, int n, int64_t pos, int rows, void* stream);
+
 /// x and y are `rows` rows of `dim` values; each row is multiplied by the orthonormal Sylvester-Hadamard matrix
 /// of its size (H = H^T = H^-1, scaled by 1/sqrt(dim)).  dim is a power of two, 32 to 1,024.  In place (x == y)
 /// is allowed.  A rotated Q4_0 cache applies it to a token's values before storing them and to the attention's
@@ -265,6 +273,17 @@ struct Kvq8 {
 /// and a warp reads eight of them in one load.  A q4 read is active wherever `q` is not null.
 struct Kvq4 {
     const uint8_t* q = nullptr;
+    const uint16_t* scales = nullptr;
+};
+
+/// An attention cache of 6-bit codes with one fp16 scale a 32-value block: the keys of --kv k6v4.  A row is
+/// `n / 32` blocks of 24 code bytes and `n / 32` fp16 scales, two arrays as Q4_0's are (`n = kv_heads * dim`).
+/// Code j of a block is bits `6j .. 6j + 5` of the block's 24 little-endian bytes, so it may straddle two of them;
+/// the value is `(code - 32) * scales[row * (n / 32) + b]`.  32 values of 6 bits is 24 bytes and 24 is a multiple
+/// of 8, so every block starts 8-byte aligned and a read is three aligned `uint2` (one an 8-value group's 6 bytes
+/// plus 2 bytes of the next group, masked off).  A q6 read is active wherever `q6` is not null.
+struct Kvq6 {
+    const uint8_t* q6 = nullptr;
     const uint16_t* scales = nullptr;
 };
 

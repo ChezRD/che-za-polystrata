@@ -721,6 +721,44 @@ __global__ void store_q4_at_kernel(const float* __restrict__ x, uint8_t* __restr
     if (lane < 16) q4[((size_t) row * nb + blk) * 16 + lane] = byte;
 }
 
+// Q6_0: d = amax/31, code = clamp(rint(x/d), -31, 31) stored as code + 32 in six bits, 32 codes little-endian at
+// six bits each (24 bytes, four values in three bytes) and one fp16 scale a block, the scales in an array of their
+// own as Q8_0's and Q4_0's are.  The codes are offset-binary about zero so that a block of 32 equal magnitudes
+// decodes back to them exactly (d = amax/31 is the fp16 it is stored as for a power-of-two amax).
+__device__ __forceinline__ uint32_t q6_code(float x, float id) {
+    float q = rintf(x * id);
+    q = fminf(fmaxf(q, -31.0f), 31.0f);
+    return (uint32_t) ((int) q + 32);
+}
+
+// One thread a 32-value block.  The six bytes of a 4-value group go out as bytes, the 24 of a block as three
+// aligned uint2, so nothing here is a partial store.
+__global__ void store_q6_kernel(const float* __restrict__ x, uint8_t* __restrict__ q6, half* __restrict__ scales,
+                                int n, int rows, int nb) {
+    const int gb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gb >= nb * rows) return;
+    const int row = gb / nb, blk = gb % nb;
+    const float* xr = x + (size_t) row * n + blk * 32;
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(xr[j]));
+    const float d = amax / 31.0f;
+    const float id = d > 0.f ? 1.0f / d : 0.0f;
+    scales[(size_t) row * nb + blk] = __float2half(d);
+    uint32_t w[6] = {0u, 0u, 0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {   // value j at bit 6j of the block's 24 little-endian bytes
+        const uint32_t v = q6_code(xr[j], id);
+        const int bit = 6 * j, wi = bit >> 5, sh = bit & 31;
+        w[wi] |= v << sh;
+        if (sh > 26) w[wi + 1] |= v >> (32 - sh);
+    }
+    uint2* qr = reinterpret_cast<uint2*>(q6 + ((size_t) row * nb + blk) * 24);
+    qr[0] = make_uint2(w[0], w[1]);
+    qr[1] = make_uint2(w[2], w[3]);
+    qr[2] = make_uint2(w[4], w[5]);
+}
+
 // The orthonormal Sylvester-Hadamard transform of one row: element i * 32 + lane of N.  The low five index bits
 // live across the warp's lanes, the rest across each lane's registers.  H is symmetric, so the same launch
 // rotates a row and rotates it back.
@@ -3031,6 +3069,15 @@ void store_q4_at(const float* x, uint8_t* q4, uint16_t* scales, int n, const lon
     const size_t warps = (size_t) nb * rows;
     if (!warps) return;
     store_q4_at_kernel<<<grid(warps, 8), 256, 0, cs(stream)>>>(x, q4, scales, n, rows, nb, at, ring);
+}
+
+void store_q6(const float* x, uint8_t* q6, uint16_t* scales, int n, int64_t pos, int rows, void* stream) {
+    if ((n & 31) != 0) throw std::invalid_argument("store_q6: n is not a multiple of 32");
+    const int nb = n >> 5;
+    const size_t all = (size_t) nb * rows;
+    if (!all) return;
+    store_q6_kernel<<<grid(all, 256), 256, 0, cs(stream)>>>(x, q6 + (size_t) pos * nb * 24,
+                                                            (half*) scales + (size_t) pos * nb, n, rows, nb);
 }
 
 void fwht_rows(const float* x, float* y, int rows, int dim, void* stream) {

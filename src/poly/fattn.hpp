@@ -58,6 +58,13 @@ bool fdec_k8v4(const float* q, Kvq8 kq8, Kvq4 vq4, int64_t pos, int n, const lon
                int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream,
                const float* sinks = nullptr);
 
+/// fdec_q8() over K6V4: six-bit keys (Kvq6, decoded in registers as q8's codes are) and Q4_0 values, so a cell is
+/// 26 + 18 = 44 bytes a 32 values against k8v4's 34 + 18 = 52.  The values are read exactly as fdec_k8v4() reads
+/// them, so the rotation and every test of it are unchanged; only the keys' decode is new.
+bool fdec_k6v4(const float* q, Kvq6 kq6, Kvq4 vq4, int64_t pos, int n, const long long* at, int room, float* out,
+               int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream,
+               const float* sinks = nullptr);
+
 /// fdec_q8() over an fp16 cache (keys and vals, kv_heads * dim halves a row), read where it lies.
 bool fdec_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64_t pos, int n, const long long* at,
               int room, float* out, int dim, int n_head, int kv_heads, float scale, float* scratch,

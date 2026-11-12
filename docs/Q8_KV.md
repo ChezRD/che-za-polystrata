@@ -272,6 +272,78 @@ interleaved runs, pinned clock: **q8_0 4.96 ns a cell, k8v4 5.88, fp16 8.32**. S
 three at long context, for 31% more bytes than k8v4 and 47% fewer than fp16. The full eight-row table, the card's
 documented peaks and the measurement protocol are in [QUANT_MICROBENCH.md](QUANT_MICROBENCH.md).
 
+## A six-bit key side (`k6v4`, kernels only)
+
+`k6v4` keeps this format's values — rotated Q4_0, so nothing about them or their tests moves — and stores the *keys*
+at six bits instead, 24 bytes a 32-value block plus a 2-byte fp16 scale. A cell is **704 B against k8v4's 832**
+(−15.4%) and q8_0's 1,088 (−35%), which at the dense Qwen3.8-27B geometry (4 KV heads of 256 values, 17 stacks) is
+**1,408 B against 1,664**.
+
+**The packing.** 32 values of 6 bits is 192 bits, so a block's codes are **24 bytes: value j at bits 6j**, four values
+in three bytes, little-endian. 24 is a multiple of 8, so every block starts 8-byte aligned and its codes are three
+aligned `uint2`. The scales stay in an array of their own, as Q8_0's and Q4_0's do — a 26-byte block with the scale
+inside it would lose that alignment for one byte a value's worth of nothing.
+
+Codes are **offset binary about zero**: `d = amax/31`, `code = clamp(rint(x/d), -31, 31) + 32`, value
+`(code - 32) * d`. That is 63 levels, and a block of equal magnitudes decodes back to them exactly.
+
+**The read is five instructions a pair of codes**, and the arithmetic is this format's own trick one bit narrower:
+byte `0x00..0x3F` in `0x64XX` is `1024 + code`, so one `HADD2` of −1056 is `code − 32`. A lane's 8 codes are the 6
+bytes at offset `6t` of the block, which is 4-byte aligned but not 8, so they are read as **two `uint32`** and one
+`SHF` (a funnel shift by 0 or 16 bits) lines them up:
+
+| step | instruction | what |
+| --- | --- | --- |
+| the 6 bytes | `LDG.E` ×2 | two 4-byte words at `24b + (6t & ~3)`, 4-byte aligned |
+| bits 0..31 / 24..55 | `SHF` ×3 | `__funnelshift_r`, so `.x` is codes 0..3 and `.y` codes 4..7 |
+| a pair to bytes | `SHF` + `PRMT` | `__byte_perm(f, f >> 6, 0x4040)` puts the two codes in bytes 0 and 1 |
+| the mask | `LOP3` | `& 0x3F3F3F3F` clears the two bits each 6-bit code leaves over |
+| the halves | `PRMT` + `HADD2` | `__byte_perm(p, 0x64646464, 0x4140)` is `[c0, 0x64, c1, 0x64]`, one subtract is codes−32 |
+
+Every one of those mnemonics is in the Ada ISA list (`sm89_inst.txt`); there is no 6-bit datatype instruction on
+sm_89, so a 6-bit format is bit surgery plus fp16 arithmetic and nothing else. The instruction mix says the surgery
+stayed surgery: below, the group-6, two-token-group kernel against k8v4's, from `cuobjdump --dump-sass`.
+
+| | k8v4 | k6v4 | |
+| --- | ---: | ---: | --- |
+| total | 2,688 | 2,928 | +8.9% |
+| `HMMA.16816.F32` | 128 | **128** | unchanged: the tensor-core work is the same |
+| `FFMA` | 132 | **132** | unchanged: no arithmetic moved onto the ALU |
+| `HADD2` / `HMUL2` | 192 / 64 | **192 / 64** | unchanged: the values' path is untouched |
+| `SHF` | 66 | **205** | +139: the bit splits |
+| `PRMT` | 226 | **288** | +62: the gathers and the halves |
+| `LOP3` | 99 | **134** | +35: the masks |
+| `LDG` | 82 | **98** | +16: two 4-byte reads a block instead of one 8-byte one |
+| REG / STACK / LOCAL | 255 / 40 / 0 | **255 / 24 / 0** | no register or spill cost |
+
+**What it costs.** One call, one token, everything in one process, five runs of each arm alternating rather than one
+arm's median against another's (the reason is measured in
+[QUANT_MICROBENCH.md](QUANT_MICROBENCH.md) §32.3: a single run of k8v4 against q8_0 said 1.11 where five interleaved
+runs said 1.185). Pinned at 2,820 MHz, RTX 4060 Ti.
+
+| cells | k8v4 ns a cell | k6v4 ns a cell | k6v4 / k8v4 | |
+| --- | ---: | ---: | ---: | --- |
+| 4,096 | 15.85 | 16.80 | **1.060** | launch-bound: more ALU, no bytes to save |
+| 32,768 | 9.88 | 9.05 | **0.915** | |
+| 131,072 | 11.28 | 10.46 | **0.928** | |
+| 262,144 | 11.42 | 11.06 | **0.968** | 0.921 and 0.934 on two runs of the alternated ratio |
+
+So at the contexts the format exists for it is **7% faster than k8v4 on the alternated ratio (0.921, 0.934), never
+slower than 1.05**, and 15% smaller: the kernel at 256K is at 44% of the card's DRAM peak rather than 51%, so the
+bytes it stops reading more than pay for the unpack. The one point it loses is 4K, where a call is 0.07 ms and there
+is nothing for the saved bytes to buy.
+
+The eight-value-group geometry (16 heads on 2 KV) measured **0.978 and 0.929** at 256K, the same conclusion.
+
+**What it is not.** The keys' 63 levels cost accuracy where q8_0's 255 did not: on 4,096 rows of Gaussian keys the
+quantizer's own error is **max 8.1e-2, rms 2.2e-2, against q8_0's 2.0e-2 and 5.3e-3 — 3.98× and 4.09×**, which is the
+step of six bits against eight. On the per-cell id payload of the parity test (a cell's id in every key and value,
+one-hot queries, so a wrong gather is a cell-id-sized error) the same payload gives **k6v4 2.4e-5 against k8v4
+3.3e-5**, both far under the 2.5e-3 bar and both dominated by the 4-bit values, not the keys. This is a kernels-only
+format: `--kv k6v4` is not plumbed through `Engine::open`, `qwen35.cpp` or `flint.cpp`, so no model has been run on
+it and no teacher-forced top-1 exists. In this tree it is `store_q6()` + `fdec_k6v4()` + `Kvq6`, tested by
+`poly_fattn_test k6v4`.
+
 ## The comparison with another implementation
 
 `llama.cpp` (the in-tree build `runners/llama.cpp/build/bin/llama-cli`) reads the same `qwen35moe` files and
