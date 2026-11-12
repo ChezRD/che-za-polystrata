@@ -265,6 +265,13 @@ The three run configs (`strata-tiel.json`, `strata-ornith.json` and `strata-occa
 - ROCm/HIP: the same kernels, measured below on an AMD card (it was rejected on HIP until that was done).
 - The default path stays byte-identical to the last release.
 
+## What it costs a decode token, measured
+
+The read paths were measured against each other at 256K on an RTX 4060 Ti, each arm on its own buffers, five
+interleaved runs, pinned clock: **q8_0 4.96 ns a cell, k8v4 5.88, fp16 8.64**. So this format is the fastest of the
+three at long context, for 31% more bytes than k8v4 and 47% fewer than fp16. The full eight-row table, the card's
+documented peaks and the measurement protocol are in [QUANT_MICROBENCH.md](QUANT_MICROBENCH.md).
+
 ## The comparison with another implementation
 
 `llama.cpp` (the in-tree build `runners/llama.cpp/build/bin/llama-cli`) reads the same `qwen35moe` files and
