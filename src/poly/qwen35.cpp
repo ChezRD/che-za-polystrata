@@ -61,9 +61,10 @@ void Qwen35::load_geometry() {
                                  "has " + std::to_string(n_kv_ * head_dim_));
     // K8V4's values go through the Hadamard rotation of a whole head row before Q4_0, so the head's size is the
     // rotation's: a power of two the kernel has.
-    if (opt_.kv_format == KvFmt::kK8V4 &&
+    if ((opt_.kv_format == KvFmt::kK8V4 || opt_.kv_format == KvFmt::kK6V4) &&
         (head_dim_ < 32 || head_dim_ > 1024 || (head_dim_ & (head_dim_ - 1)) != 0))
-        throw std::runtime_error("--kv k8v4 needs head_dim a power of two from 32 to 1024 (the values' Hadamard "
+        throw std::runtime_error(std::string("--kv ") + (opt_.kv_format == KvFmt::kK6V4 ? "k6v4" : "k8v4") +
+                                 " needs head_dim a power of two from 32 to 1024 (the values' Hadamard "
                                  "rotation); this model has " + std::to_string(head_dim_));
     const MetaValue* rot = find("rope.dimension_count");
     n_rot_ = rot ? (int) rot->u : head_dim_;
@@ -392,32 +393,25 @@ void Qwen35::save_layer(int il, int64_t, uint8_t* dst) {
 
 size_t Qwen35::kv_row_bytes() const { return kv_cell_of(opt_.kv_format, n_kv_, head_dim_).total(); }
 
-size_t Qwen35::card_row_bytes() const {
-    if (opt_.kv_format == KvFmt::kQ8_0)
-        return (size_t) n_attn_ * 2 *
-               ((size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t));
-    if (opt_.kv_format == KvFmt::kK8V4)
-        return (size_t) n_attn_ * ((size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t) +
-                                   (size_t) n_kv_ * (head_dim_ / 32) * 18);
-    return (size_t) n_attn_ * 2 * n_kv_ * head_dim_ * sizeof(uint16_t);
-}
+size_t Qwen35::card_row_bytes() const { return (size_t) n_attn_ * kv_row_bytes(); }
 
 void Qwen35::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     if (first < 0 || n < 0 || first + n > opt_.max_context)
         throw std::logic_error("save_rows: the rows are outside the context");
     ck(cudaStreamSynchronize(cs(st_)), "save rows");
-    if (opt_.kv_format == KvFmt::kK8V4) {
-        // k8v4: each attention block writes k_codes, k_scales, v_q4 (its nibbles), v_q4_scales, in that order, so
-        // that a load can walk the same runs back.  Same layout as card_row_bytes() sums to
-        // (n * card_row_bytes() / n_attn_).
-        const size_t crow = (size_t) n_kv_ * head_dim_,
-                     srow = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t),
-                     q4row = (size_t) n_kv_ * (head_dim_ / 32) * 16;
+    if (opt_.kv_format == KvFmt::kK8V4 || opt_.kv_format == KvFmt::kK6V4) {
+        // k8v4 and k6v4: each attention block writes its key codes, key scales, value nibbles and value scales, in
+        // that order, so that a load can walk the same runs back.  Same layout as card_row_bytes() sums to
+        // (n * card_row_bytes() / n_attn_).  The two formats differ in the key codes alone - head_dim bytes a row of
+        // int8 for k8v4, 24 bytes a 32-value block for k6v4 - so the run width is the format's, read from KvCell.
+        const KvCell cell = kv_cell_of(opt_.kv_format, n_kv_, head_dim_);
+        const size_t crow = cell.k, srow = cell.k_scales, q4row = cell.v;
         const size_t at_c = (size_t) first * crow, at_s = (size_t) first * srow, at_q = (size_t) first * q4row;
         const size_t n_c = (size_t) n * crow, n_s = (size_t) n * srow, n_q = (size_t) n * q4row;
         for (const Block& B : blocks_) {
-            if (!B.k_codes || n == 0) continue;
-            ck(cudaMemcpy(dst, (const uint8_t*) B.k_codes + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
+            const void* bc = opt_.kv_format == KvFmt::kK6V4 ? (const void*) B.k_q6 : (const void*) B.k_codes;
+            if (bc == nullptr || n == 0) continue;
+            ck(cudaMemcpy(dst, (const uint8_t*) bc + at_c, n_c, cudaMemcpyDeviceToHost), "save rows");
             dst += n_c;
             ck(cudaMemcpy(dst, (const uint8_t*) B.k_scales + at_s, n_s, cudaMemcpyDeviceToHost), "save rows");
             dst += n_s;
@@ -463,20 +457,21 @@ void Qwen35::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int
         throw std::logic_error("load_rows: the rows are outside what was saved");
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load rows");
-    if (opt_.kv_format == KvFmt::kK8V4) {
-        // k8v4: mirror save_card_rows run for run, advancing by each run's own saved size (count * row) so
-        // multi-layer blobs line up; the rows wanted start `first - from` rows into the run.
-        const size_t crow = (size_t) n_kv_ * head_dim_,
-                     srow = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t),
-                     q4row = (size_t) n_kv_ * (head_dim_ / 32) * 16;
+    if (opt_.kv_format == KvFmt::kK8V4 || opt_.kv_format == KvFmt::kK6V4) {
+        // k8v4 and k6v4: mirror save_card_rows run for run, advancing by each run's own saved size (count * row) so
+        // multi-layer blobs line up; the rows wanted start `first - from` rows into the run.  The key codes' run is
+        // the format's (KvCell.k): head_dim bytes a row for k8v4, 24 a block for k6v4.
+        const KvCell cell = kv_cell_of(opt_.kv_format, n_kv_, head_dim_);
+        const size_t crow = cell.k, srow = cell.k_scales, q4row = cell.v;
         const size_t at_c = (size_t) first * crow, at_s = (size_t) first * srow, at_q = (size_t) first * q4row;
         const size_t n_c = (size_t) n * crow, n_s = (size_t) n * srow, n_q = (size_t) n * q4row;
         const size_t sk_c = (size_t) (first - from) * crow, sk_s = (size_t) (first - from) * srow,
                      sk_q = (size_t) (first - from) * q4row;
         const size_t all_c = (size_t) count * crow, all_s = (size_t) count * srow, all_q = (size_t) count * q4row;
         for (const Block& B : blocks_) {
-            if (!B.k_codes || n == 0) continue;
-            ck(cudaMemcpy((uint8_t*) B.k_codes + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
+            uint8_t* bc = opt_.kv_format == KvFmt::kK6V4 ? (uint8_t*) B.k_q6 : (uint8_t*) B.k_codes;
+            if (bc == nullptr || n == 0) continue;
+            ck(cudaMemcpy(bc + at_c, src + sk_c, n_c, cudaMemcpyHostToDevice), "load rows");
             src += all_c;
             ck(cudaMemcpy((uint8_t*) B.k_scales + at_s, src + sk_s, n_s, cudaMemcpyHostToDevice), "load rows");
             src += all_s;
