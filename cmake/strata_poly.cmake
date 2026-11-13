@@ -45,6 +45,11 @@ macro(strata_poly_targets)
     add_test(NAME poly_gdn_mma_control_test COMMAND poly_gdn_mma_control_test)
     add_executable(poly_stream_stage_test ${_strata_poly_root}/src/poly/stage_copy_test.cpp)
     add_test(NAME poly_stream_stage_test COMMAND poly_stream_stage_test)
+    # The MoE prompt path's MMQ row-id table: allocated with the margin llama.cpp's kernels read past its last
+    # row, and filled over the whole table.  Host only - the reads are enumerated from the layout (mmq.cuh).
+    add_executable(poly_mmq_ids_test ${_strata_poly_root}/src/poly/poly_mmq_ids_test.cpp)
+    target_include_directories(poly_mmq_ids_test PRIVATE ${_strata_poly_root}/include)
+    add_test(NAME poly_mmq_ids_test COMMAND poly_mmq_ids_test)
   endif()
 
   # Fork-only: the hooks in upstream files (IQ1_S type 19, IQ4_NL gate/up) that a merge must keep.

@@ -20,6 +20,7 @@
 #endif
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 
 #include "ggml.h"
 
@@ -3175,13 +3176,24 @@ void Engine::alloc() {
         d_slots_ = (void**) dmalloc((size_t) n_layer_ * n_expert_ * sizeof(void*), "scratch");
         tab_ = (int32_t*) dmalloc(tab, "scratch");
         h_tab_ = (int32_t*) hmalloc(tab, "pinned memory");
-        iota_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
+        // `iota_` is MMQ's row-id table: row i of a launch's quantized rows is row iota_[i] of its output.  It is
+        // read past its end by llama.cpp's kernels - mul_mat_q copies a whole J-column tile from an expert's first
+        // row (mmq.cuh:1037, :1131, J up to 128) before comparing it with that expert's rows, and the stream-k fixup
+        // does the same from a first row that can be the table's last (mmq.cuh:1353).  So it takes the margin
+        // upstream sizes its own three tables with (mmq_ids_margin.hpp; Strata d7f7d9677 / 14dd746f6 / 697b6d67a):
+        // src/poly/ is the fork's own and the sync did not reach it.  max_rows = rr: one expert takes at most one
+        // row per token, so no launch has more rows in one expert than the table has (the three call sites pass
+        // most / r.most / top, all <= rr - sizing for the wider bound only ever allocates more, never less).
+        const int64_t ids_rows = (int64_t) strata::prefill::mmq::mmq_ids_table_rows((uint64_t) rr, (uint64_t) rr);
+        if (ids_rows <= 0) throw std::runtime_error("no VRAM for the MMQ row table (the margin overflows)");
+        iota_ = (int32_t*) dmalloc((size_t) ids_rows * sizeof(int32_t), "scratch");
         d_ex_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         h_ex_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
-        std::vector<int32_t> ramp(rr);
+        // The identity over the WHOLE table, the margin included: an entry past `rr` that holds nothing is an
+        // arbitrary row index, and the fixup would write rows to wherever it said.
+        std::vector<int32_t> ramp((size_t) ids_rows);
         std::iota(ramp.begin(), ramp.end(), 0);
-        ck(cudaMemcpy(iota_, ramp.data(), rr * sizeof(int32_t), cudaMemcpyHostToDevice), "scratch");
-
+        ck(cudaMemcpy(iota_, ramp.data(), (size_t) ids_rows * sizeof(int32_t), cudaMemcpyHostToDevice), "scratch");
         // One layer's experts pass through it at a time, so it never holds more than a layer has.  A model of
         // small experts has a few hundred MiB a layer, and the rest of the default would be VRAM that the
         // expert cache of a small card does without.
