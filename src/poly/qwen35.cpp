@@ -201,26 +201,40 @@ size_t Qwen35::recurrent_floats() const {
 
 int Qwen35::widest() const { return std::max(d_inner_, n_head_ * head_dim_); }
 
+// The halves of a cell: the keys' codes and their scales, the values' codes and theirs.  One arithmetic for the
+// allocation and for kv_row_bytes(), so a branch cannot size a buffer one way and report it another.
+struct KvCell {
+    size_t k = 0, k_scales = 0, v = 0, v_scales = 0;
+    size_t total() const { return k + k_scales + v + v_scales; }
+};
+
+namespace {
+KvCell kv_cell_of(KvFmt fmt, int n_kv, int head_dim) {
+    const size_t nb = (size_t) n_kv * (head_dim / 32), w = (size_t) n_kv * head_dim;
+    switch (fmt) {
+        case KvFmt::kQ8_0: return {w, nb * sizeof(uint16_t), w, nb * sizeof(uint16_t)};
+        case KvFmt::kK8V4: return {w, nb * sizeof(uint16_t), nb * 16, nb * sizeof(uint16_t)};
+        case KvFmt::kK6V4:
+            // k8v4's values, and the keys as 24 packed code bytes a 32-value block: 24 + 2 + 16 + 2 = 44 B a block,
+            // 1408 B a cell at four KV heads of 256
+            return {nb * 24, nb * sizeof(uint16_t), nb * 16, nb * sizeof(uint16_t)};
+        default: return {w * sizeof(uint16_t), 0, w * sizeof(uint16_t), 0};
+    }
+}
+}  // namespace
+
 // The attention layers' caches, and each recurrent layer's convolution and delta-rule state in state_.
 void Qwen35::alloc_caches() {
-    if (opt_.kv_format == KvFmt::kQ8_0 && !axes_) {
-        const size_t row_bytes = (size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
-        std::fprintf(stderr, "strata-poly: q8_0 KV cache: %zu bytes a row\n", row_bytes);
-    }
-    if (opt_.kv_format == KvFmt::kK8V4 && !axes_) {
-        const size_t k_row = (size_t) n_kv_ * head_dim_ + (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
-        const size_t v_row = (size_t) n_kv_ * (head_dim_ / 32) * 18;
-        std::fprintf(stderr, "strata-poly: k8v4 KV cache: %zu bytes a row (K %zu, V %zu)\n", k_row + v_row, k_row,
-                     v_row);
-    }
-    if (opt_.kv_format == KvFmt::kK6V4 && !axes_) {
-        const size_t k_row = (size_t) n_kv_ * (head_dim_ / 32) * 26;   // 24 code bytes + 2 of scale
-        const size_t v_row = (size_t) n_kv_ * (head_dim_ / 32) * 18;
-        std::fprintf(stderr, "strata-poly: k6v4 KV cache: %zu bytes a row (K %zu, V %zu)\n", k_row + v_row, k_row,
-                     v_row);
+    const KvCell cell = kv_cell_of(opt_.kv_format, n_kv_, head_dim_);
+    if (!axes_) {   // the allocation, not each bind(): say it once
+        const char* name = opt_.kv_format == KvFmt::kQ8_0 ? "q8_0"
+                           : opt_.kv_format == KvFmt::kK8V4 ? "k8v4"
+                           : opt_.kv_format == KvFmt::kK6V4 ? "k6v4" : nullptr;
+        if (name != nullptr)
+            std::fprintf(stderr, "strata-poly: %s KV cache: %zu bytes a row (K %zu, V %zu)\n", name, cell.total(),
+                         cell.k + cell.k_scales, cell.v + cell.v_scales);
     }
     const size_t past_n = size_t(3) * conv_dim_, s_n = size_t(v_heads_) * s_dim_ * s_dim_;
-    const size_t row = (size_t) n_kv_ * head_dim_ * sizeof(uint16_t);
     float* st = state_;
     for (int il = 0; il < (int) blocks_.size(); ++il) {
         Block& B = blocks_[(size_t) il];
@@ -230,35 +244,28 @@ void Qwen35::alloc_caches() {
             st += past_n;
             B.s = st;
             st += s_n;
-        } else if (opt_.kv_format == KvFmt::kQ8_0) {
-            const size_t codes_row = (size_t) n_kv_ * head_dim_;                            // int8
-            const size_t scales_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);  // fp16
-            B.k_codes = (int8_t*) kv_alloc(codes_row, 1);
-            B.k_scales = (uint16_t*) kv_alloc(scales_row, 1);
-            B.v_codes = (int8_t*) kv_alloc(codes_row, 1);
-            B.v_scales = (uint16_t*) kv_alloc(scales_row, 1);
-        } else if (opt_.kv_format == KvFmt::kK8V4) {
-            // the keys exactly as q8_0's; the values are Q4_0's 16 nibble bytes a block, and its scales in an
-            // array of their own, as q8_0's codes and scales are
-            const size_t codes_row = (size_t) n_kv_ * head_dim_;                            // int8
-            const size_t scales_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);  // fp16
-            const size_t q4_row = (size_t) n_kv_ * (head_dim_ / 32) * 16;
-            B.k_codes = (int8_t*) kv_alloc(codes_row, 1);
-            B.k_scales = (uint16_t*) kv_alloc(scales_row, 1);
-            B.v_q4 = (uint8_t*) kv_alloc(q4_row, 1);
-            B.v_q4_scales = (uint16_t*) kv_alloc(scales_row, 1);
-        } else if (opt_.kv_format == KvFmt::kK6V4) {
-            // k8v4's values, and the keys as 24 packed code bytes a 32-value block with their scales beside them
-            const size_t scales_row = (size_t) n_kv_ * (head_dim_ / 32) * sizeof(uint16_t);
-            const size_t q6_row = (size_t) n_kv_ * (head_dim_ / 32) * 24;
-            const size_t q4_row = (size_t) n_kv_ * (head_dim_ / 32) * 16;
-            B.k_q6 = (uint8_t*) kv_alloc(q6_row, 1);
-            B.k_scales = (uint16_t*) kv_alloc(scales_row, 1);
-            B.v_q4 = (uint8_t*) kv_alloc(q4_row, 1);
-            B.v_q4_scales = (uint16_t*) kv_alloc(scales_row, 1);
         } else {
-            B.keys = (uint16_t*) kv_alloc(row, 1);
-            B.vals = (uint16_t*) kv_alloc(row, 1);
+            // a buffer a field, each sized from the same KvCell that kv_row_bytes() reports
+            auto alloc = [&](size_t bytes) { return bytes ? kv_alloc(bytes, 1) : (void*) nullptr; };
+            if (opt_.kv_format == KvFmt::kQ8_0) {
+                B.k_codes = (int8_t*) alloc(cell.k);
+                B.k_scales = (uint16_t*) alloc(cell.k_scales);
+                B.v_codes = (int8_t*) alloc(cell.v);
+                B.v_scales = (uint16_t*) alloc(cell.v_scales);
+            } else if (opt_.kv_format == KvFmt::kK8V4) {
+                B.k_codes = (int8_t*) alloc(cell.k);
+                B.k_scales = (uint16_t*) alloc(cell.k_scales);
+                B.v_q4 = (uint8_t*) alloc(cell.v);
+                B.v_q4_scales = (uint16_t*) alloc(cell.v_scales);
+            } else if (opt_.kv_format == KvFmt::kK6V4) {
+                B.k_q6 = (uint8_t*) alloc(cell.k);
+                B.k_scales = (uint16_t*) alloc(cell.k_scales);
+                B.v_q4 = (uint8_t*) alloc(cell.v);
+                B.v_q4_scales = (uint16_t*) alloc(cell.v_scales);
+            } else {
+                B.keys = (uint16_t*) alloc(cell.k);
+                B.vals = (uint16_t*) alloc(cell.v);
+            }
         }
     }
     // a block of guesses attends in one launch (attn_block_pass())
@@ -382,6 +389,8 @@ void Qwen35::save_layer(int il, int64_t, uint8_t* dst) {
                   cudaMemcpyDeviceToHost),
        "save state");
 }
+
+size_t Qwen35::kv_row_bytes() const { return kv_cell_of(opt_.kv_format, n_kv_, head_dim_).total(); }
 
 size_t Qwen35::card_row_bytes() const {
     if (opt_.kv_format == KvFmt::kQ8_0)

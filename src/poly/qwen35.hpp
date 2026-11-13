@@ -16,6 +16,9 @@ namespace strata::poly {
 class Qwen35 final : public Engine {
 public:
     size_t card_row_bytes() const override;
+    /// The bytes a token takes in the attention caches, every KV head's key and value: what alloc_caches() allocates
+    /// and what card_row_bytes() reports a stack of.  One arithmetic, so the two cannot disagree.
+    size_t kv_row_bytes() const;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
     bool sees() const override { return !clover_; }
