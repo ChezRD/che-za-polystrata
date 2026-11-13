@@ -3118,7 +3118,28 @@ void Engine::alloc() {
         mixed_tiles = mixed_tiles || (L.mmq && L.mixed());
         one_expert = std::max(one_expert, L.gu_step + L.d_bytes);
     }
-    if (tiles) mmq_ = std::make_unique<Mmq>();
+    // **A DENSE MODEL'S OWN MATRICES ARE CANDIDATES TOO.**  The loop above is over MoE layers, because MMQ was written
+    // for routed experts - so a dense model's `mmq_` stayed null and every FFN and GDN matrix took `native_mmvq` eight
+    // tokens at a launch.  Measured on a real [4096 x 12288] IQ3_XXS matrix that is 4.9-6.1 TFLOP/s against MMQ's 69.4,
+    // a 12.6x gap at batch 128 (`docs/PREFILL-GAP.md`), and `nsys` puts 94.8% of an Ornith prefill's kernel time in
+    // that fallback.  So the architecture is asked for the matrices it multiplies outside the experts' path, and any
+    // of them the card has a tile for turns the prompt path on.
+    //
+    // **THE MOE PATH IS UNTOUCHED**: a MoE model answers nothing here (the default is none), so `tiles` is decided by
+    // the loop above alone and its behaviour is byte for byte what it was.  `STRATA_MMQ_DENSE=0` reaches the old path
+    // for an A/B, and it can only ever REMOVE the enabling below - never change how a MoE layer multiplies.
+    bool dense_tiles = false;
+    if (const char* off = std::getenv("STRATA_MMQ_DENSE"); !(off != nullptr && std::atoi(off) == 0)) {
+        std::vector<const Dev*> dense;
+        dense_products(dense);
+        for (const Dev* d : dense) {
+            if (Mmq::fits((int) d->type, d->n_out, d->n_in)) {
+                dense_tiles = true;
+                break;
+            }
+        }
+    }
+    if (tiles || dense_tiles) mmq_ = std::make_unique<Mmq>();
 
     shared_scratch();   // the first pass only counts
     assign_scratch();

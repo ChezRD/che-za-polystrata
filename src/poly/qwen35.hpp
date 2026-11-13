@@ -45,6 +45,12 @@ protected:
     int guess_vocab() const override;
     void save_layer(int il, int64_t pos, uint8_t* dst) override;
     void alloc_caches() override;
+    /// **THE MATRICES A DENSE PREFILL SPENDS ITS TIME IN.**  `nsys` on a 16,384-token Ornith prefill puts 94.8% of
+    /// 61.5 s of kernel time in `native_mmvq_multi_kernel` - the eight-tokens-a-launch fallback `lin_raw` takes when
+    /// `mmq_` is null - against 0.8% in attention.  These are that 94.8%: each layer's FFN and, on a recurrent layer,
+    /// its four GDN projections, plus the attention projections.  `Engine::load` asks `Mmq::fits` about each and
+    /// enables the prompt path if any answer is yes; a matrix without a tile is simply skipped.
+    void dense_products(std::vector<const Dev*>& out) const override;
     void assign_scratch() override;
     int widest() const override;
     int streams() const override { return 1; }
