@@ -85,7 +85,19 @@ void Qwen35::load_geometry() {
     // pairs turn by which.  A token of text has its position on the first three and none on the spare one, so
     // the kernel turns every pair by the position: that is wrong for a pair the sections leave to the spare axis.
     // Clover reads no pictures and its file has no sections: every pair turns by the position, as a text token's do.
-    clover_ = gg_->get("general.architecture")->s == "clover_moe";
+    const std::string arch = gg_->get("general.architecture")->s;
+    clover_ = arch == "clover_moe";
+    // A dense qwen35 file (Qwen3.8-27B): the same GDN, attention, M-RoPE and MTP, but one dense SwiGLU an FFN where
+    // a qwen35moe layer has a router, a shared expert and routed experts.  load_shape() has already put the file's
+    // `feed_forward_length` in n_ff_, which dense_ffn() reads.
+    dense_ = arch == "qwen35";
+    if (dense_)
+        // the assertion the rest of this file depends on: dense_ffn() writes n*n_ff_ floats into g_, u_ and h_,
+        // and shared_scratch() sizes all three from n_ff_.  A zero here is a SwiGLU into nothing, not an error
+        // that surfaces later.
+        if (n_ff_ <= 0 || n_expert_ != 0 || n_used_ != 0 || n_ff_exp_ != 0 || n_ff_shexp_ != 0)
+            throw std::runtime_error("a dense qwen35 model must have feed_forward_length set and no experts (n_ff " +
+                                     std::to_string(n_ff_) + ", experts " + std::to_string(n_expert_) + ")");
     if (clover_) {
         // the token its block of guesses is filled with, and the share of the block's routing its experts are
         // chosen from
@@ -153,13 +165,42 @@ void Qwen35::load_layer(int il) {
         B.wo = mat("attn_output.weight", (int64_t) n_head_ * head_dim_, n_embd_);
         ++n_attn_;
     }
+    // The layer type is the file's, not a table's: a GDN layer has attn_qkv, an attention layer has attn_q.
+    if (dense_) {
+        B.ffn_gate = mat("ffn_gate.weight", n_embd_, n_ff_);
+        B.ffn_up = mat("ffn_up.weight", n_embd_, n_ff_);
+        B.ffn_down = mat("ffn_down.weight", n_ff_, n_embd_);
+        return;
+    }
     load_moe(il);
     B.sh_gate_inp = f32("ffn_gate_inp_shexp.weight", n_embd_);
+}
+
+// A dense layer's FFN: gate and up, the SwiGLU, down.  The same three launches (and the same buffers) as the shared
+// expert's moe_shared(), which is why the scratch that function is sized for fits this one too.
+void Qwen35::dense_ffn(Block& B, int il, int n) {
+    lin(B.ffn_gate, xn_, g_, n, xq_);
+    lin(B.ffn_up, xn_, u_, n, xq_);
+    swiglu_clamp(g_, u_, h_, n * n_ff_, clamp_shexp_[(size_t) il], st_);
+    lin(B.ffn_down, h_, fo_, n);
+}
+
+// The draft block's FFN, for a dense model: its own three matrices, the same launches.  `x` is the block's FFN input
+// (already normed and quantized into xq_ by the caller).
+void Qwen35::dense_draft_ffn(const float* x, int n) {
+    Block& B = blocks_[(size_t) n_layer_];
+    lin(B.ffn_gate, x, g_, n, xq_);
+    lin(B.ffn_up, x, u_, n, xq_);
+    swiglu_clamp(g_, u_, h_, n * n_ff_, clamp_shexp_[(size_t) n_layer_], st_);
+    lin(B.ffn_down, h_, fo_, n);
 }
 
 size_t Qwen35::recurrent_floats() const {
     return size_t(n_gdn_) * (size_t(3) * conv_dim_ + size_t(v_heads_) * s_dim_ * s_dim_);
 }
+
+// A dense model guesses from the whole table; the MoE family keeps its prefix.  qwen35.hpp has the census.
+int Qwen35::guess_vocab() const { return dense_ ? 0 : 131072; }
 
 int Qwen35::widest() const { return std::max(d_inner_, n_head_ * head_dim_); }
 
@@ -728,7 +769,13 @@ void Qwen35::layer_head(Layer& L, int il, int n) {
     rms_norm(r_, fp(L.ffn_norm), xn_, n_embd_, n, rms_eps_, st_);
     kernels::native_quantize_q8_1(xn_, xq_, n_embd_ * n, 1, st_);
     dbg("ffn_in", il, xn_, n_embd_);
-    if (!batched(L, n)) moe_router(L, n);
+    if (dense_) {
+        dense_ffn(B, il, n);
+        dbg("ffn", il, fo_, n_embd_);
+        axpy(fo_, 1.f, r_, n * n_embd_, true, st_);
+    } else if (!batched(L, n)) {
+        moe_router(L, n);
+    }
 }
 
 void Qwen35::layer_tail(Layer&, int, int n) { axpy(fo_, 1.f, r_, n * n_embd_, true, st_); }
@@ -740,6 +787,10 @@ void Qwen35::output_rows(int first, int rows, float* h) {
 // What ggml's MoE graph does for this model: a softmax over every expert's score, the n_used most likely, and
 // their weights made to sum to one.
 void Qwen35::route(int, const float* logits, int32_t, int* ids, float* w, float* probs) const {
+    // A dense layer has no experts: nothing routes, and a caller that reaches here is a bug in the layer, not a
+    // model that answers differently.  Throw rather than return whatever n_expert_ (0) left in the arrays.
+    if (dense_)
+        throw std::logic_error("Qwen35: a dense qwen35 model has no experts to route");
     float mx = logits[0];
     for (int e = 1; e < n_expert_; ++e) mx = std::max(mx, logits[e]);
     double all = 0.0;
@@ -763,6 +814,7 @@ void Qwen35::route(int, const float* logits, int32_t, int* ids, float* w, float*
 // up over the block, and the experts with the most of that sum, in order, while the ones before them hold less than
 // coreset_ of it.  The others' scores become -inf for every token of the block.  Ties go to the lower expert.
 void Qwen35::route_block(int, float* scores, int n) {
+    if (dense_) throw std::logic_error("Qwen35: a dense qwen35 model has no experts to route");
     if (coreset_ <= 0.f) return;
     std::vector<float> mass((size_t) n_expert_, 0.f), p((size_t) n_expert_);
     std::vector<int> order((size_t) n_expert_);
@@ -795,6 +847,7 @@ void Qwen35::route_block(int, float* scores, int n) {
 }
 
 bool Qwen35::route_card(int, int n, int32_t* ids, float* w) {
+    if (dense_) throw std::logic_error("Qwen35: a dense qwen35 model has no experts to route");
     if (block_pass_ && coreset_ > 0.f) coreset_mask(rl_, n_expert_, n_used_, n, coreset_, st_);   // route_block()'s
     route_rows(rl_, n_expert_, n_used_, n, 0, 1.f, nullptr, nullptr, true, 0.f, ids, w, st_);
     return true;
@@ -802,6 +855,7 @@ bool Qwen35::route_card(int, int n, int32_t* ids, float* w) {
 
 // The shared expert, times the sigmoid of its own gate.  It runs on the GPU while the host routes.
 void Qwen35::moe_shared(const Layer& L, int il, int n) {
+    if (dense_) throw std::logic_error("Qwen35: a dense qwen35 model has no shared expert");
     lin(L.sh_gate, xn_, g_, n, xq_);
     lin(L.sh_up, xn_, u_, n, xq_);
     swiglu_clamp(g_, u_, h_, n * n_ff_shexp_, clamp_shexp_[(size_t) il], st_);

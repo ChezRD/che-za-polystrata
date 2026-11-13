@@ -1,10 +1,11 @@
-// src/poly/qwen35.hpp - Qwen3.5 and Qwen3.6 with routed experts (llama.cpp architecture "qwen35moe"), and the models
-// trained from them.
+// src/poly/qwen35.hpp - Qwen3.5 and Qwen3.6 with routed experts (llama.cpp architecture "qwen35moe"), Qwen3.8-27B
+// (architecture "qwen35", dense), and the models trained from them.
 //
 // One residual stream.  Three layers in four have a recurrent attention, the gated delta net; the fourth has
 // attention over the keys and values of every token so far, with a rotary embedding and a gate on its output.
-// Every layer's FFN is routed experts with a gated shared one.  One more block after the model's, with the plain
-// attention, guesses a token ahead.
+// A qwen35moe layer's FFN is routed experts with a gated shared one; a qwen35 layer's is one dense SwiGLU, which is
+// the only thing the two families do differently.  One more block after the model's, with the plain attention,
+// guesses a token ahead.
 #pragma once
 
 #include "engine.hpp"
@@ -18,17 +19,27 @@ public:
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
     bool sees() const override { return !clover_; }
+    bool routes_experts() const override { return !dense_; }
 
 protected:
     void load_geometry() override;
     void load_layer(int il) override;
     void begin_pass() override;
     void check_draft_block() override;
+    void dense_draft_ffn(const float* x, int n) override;
     size_t recurrent_floats() const override;
     bool snaps_spread() const override { return true; }
-    // English answers write no token past 77,000, Chinese prose one in twenty past 131,072, and guesses from the
-    // first 131,072 still write a Chinese answer faster than from all 248,320
-    int guess_vocab() const override { return 131072; }
+    // The token table is in code-point order, not frequency order: id 0 is `!`, ids 0-255 are the byte alphabet,
+    // then characters by Unicode code point, then 10 `[PAD...]` ids.  A prefix of it is therefore a prefix of the
+    // code-point range and not of the common tokens, and the first 131,072 hold 2.8% of the Cyrillic ids (516 of
+    // 18,580) and 0.9% of the Cyrillic merges of four characters or more (146 of 15,541).  A draft limited to that
+    // prefix can propose Russian a letter or a pair at a time and almost never the longer merges the model writes.
+    // A dense model therefore guesses from the whole table: draft_rows() reads 0 as n_vocab_, 248,320 rows, 682 MiB
+    // a guess against the first 131,072's 360.  docs/QWEN38.md has the census and the measurement.
+    //
+    // The MoE qwen35 family keeps the prefix: the same table argues the same way there, but this port is the dense
+    // model's and changing Qwen3.6/Clover's guesses is not something this branch measured.
+    int guess_vocab() const override;
     void save_layer(int il, int64_t pos, uint8_t* dst) override;
     void alloc_caches() override;
     void assign_scratch() override;
@@ -77,6 +88,10 @@ private:
         uint8_t*  v_q4        = nullptr;
         uint16_t* v_q4_scales = nullptr;
         Dev sh_gate_inp;   ///< the shared expert's gate
+        // The dense FFN (a qwen35 file: ffn_gate/ffn_up/ffn_down where a qwen35moe layer has the three MoE groups).
+        // Fields of their own and not Layer::sh_gate/sh_up/sh_down: those three are the *shared expert's*, read by
+        // moe_shared(), and a dense layer must not be able to reach them by accident.
+        Dev ffn_gate, ffn_up, ffn_down;
     };
 
     void gdn(Block& B, int n);
@@ -87,8 +102,10 @@ private:
     void attn_store(Block& B, int64_t pos, int n);
     void turn_of(int64_t row, int32_t* thw) const;
     const int32_t* turns(int64_t pos, int n, int64_t* first);
+    void dense_ffn(Block& B, int il, int n);
 
     std::vector<Block> blocks_;   ///< one a layer of layers_
+    bool dense_ = false;          ///< a qwen35 file: a dense SwiGLU FFN instead of routed experts
     bool clover_ = false;         ///< a Clover file (architecture clover_moe): text only, its ssm_a is A_log itself
     int mask_ = -1;               ///< Clover's mask token, which its block of guesses is filled with; -1: no block
     float coreset_ = 0.f;         ///< Clover: a block's tokens choose among the experts of this share of its weight
