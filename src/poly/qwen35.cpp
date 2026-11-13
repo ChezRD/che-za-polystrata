@@ -280,6 +280,41 @@ void Qwen35::alloc_caches() {
     h_axes_.resize((size_t) rows_ * 3);
 }
 
+// **THE MATRICES A DENSE PREFILL MULTIPLIES, so `Engine::load` can create `mmq_` for them.**
+//
+// The list is deliberately the ones a prompt batch actually runs through `lin()`: the FFN's three (94.8% of the
+// measured kernel time together), and on each layer its own projections.  A recurrent layer has `attn_qkv` (conv_dim
+// out), `attn_gate` (d_inner), `ssm_alpha`/`ssm_beta` (v_heads each) and `ssm_out` (n_embd from d_inner); an attention
+// layer has q, k, v, o.  Whatever `Mmq::fits` refuses is skipped by the caller, so this needs no type switch of its own.
+void Qwen35::dense_products(std::vector<const Dev*>& out) const {
+    auto add = [&](const Dev& d) {
+        if (d.p != nullptr && d.type != 0 && d.n_in > 0 && d.n_out > 0) out.push_back(&d);
+    };
+    // **A DENSE MODEL ONLY, AND THAT IS A CORRECTNESS REQUIREMENT, NOT A SCOPE CHOICE.**  On a MoE file the same
+    // `Block` fields hold the attention and recurrent projections, and listing them here would turn the MMQ prompt path
+    // on for a model whose experts were measured through `native_mmvq` - which changes its bits.  The MoE path's
+    // regression gate is byte-identity, so this returns nothing at all unless the file is dense (the FFN exists only
+    // then: `load_layer` fills `ffn_gate/up/down` for a dense layer and `load_moe` otherwise).
+    if (!dense_) return;
+    for (const Block& B : blocks_) {
+        add(B.ffn_gate);
+        add(B.ffn_up);
+        add(B.ffn_down);
+        if (B.gdn) {
+            add(B.wqkv);
+            add(B.wz);
+            add(B.alpha);
+            add(B.beta);
+            add(B.wo);
+        } else {
+            add(B.wq);
+            add(B.wk);
+            add(B.wv);
+            add(B.wo);
+        }
+    }
+}
+
 // Per-token buffers hold rows_ tokens, row after row.
 void Qwen35::assign_scratch() {
     const size_t n = (size_t) rows_, heads = n * n_head_ * head_dim_, kv = n * n_kv_ * head_dim_;

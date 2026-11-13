@@ -459,6 +459,15 @@ protected:
     virtual void assign_scratch() = 0;
     /// The widest input lin() gets, beside the model's width and the FFNs'.
     virtual int widest() const = 0;
+    /// **THE MATRICES THIS ARCHITECTURE MULTIPLIES OUTSIDE THE ROUTED EXPERTS' PATH**, i.e. the ones a dense model's
+    /// prefill spends its time in: an FFN's gate/up/down, a GDN layer's projections.  `mmq_` used to be created from a
+    /// loop over MoE layers only, so a dense model never had one and every matmul took `native_mmvq` eight tokens a
+    /// launch - measured at 12.6x slower than MMQ on a real [4096 x 12288] IQ3_XXS matrix
+    /// (`docs/PREFILL-GAP.md`).  An architecture that has such matrices returns them here so `Engine::load` can ask
+    /// `Mmq::fits` about them; the default is none, which leaves every non-dense architecture exactly as it was.
+    ///
+    /// Filled only after `alloc_caches()`, when the weights' types are known.  Appends to `out`.
+    virtual void dense_products(std::vector<const Dev*>& out) const { (void) out; }
     /// The copies of a token's embedding a layer's input starts from.
     virtual int streams() const = 0;
     /// A layer from its input to its router's copy (a layer without routed experts: to its end).
