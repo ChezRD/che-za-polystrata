@@ -721,6 +721,100 @@ __global__ void store_q4_at_kernel(const float* __restrict__ x, uint8_t* __restr
     if (lane < 16) q4[((size_t) row * nb + blk) * 16 + lane] = byte;
 }
 
+// Q6_0: d = amax/31, code = clamp(rint(x/d), -31, 31) stored as code + 32 in six bits, 32 codes little-endian at
+// six bits each (24 bytes, four values in three bytes) and one fp16 scale a block, the scales in an array of their
+// own as Q8_0's and Q4_0's are.  The codes are offset-binary about zero so that a block of 32 equal magnitudes
+// decodes back to them exactly (d = amax/31 is the fp16 it is stored as for a power-of-two amax).
+__device__ __forceinline__ uint32_t q6_code(float x, float id) {
+    float q = rintf(x * id);
+    q = fminf(fmaxf(q, -31.0f), 31.0f);
+    return (uint32_t) ((int) q + 32);
+}
+
+// One thread a 32-value block.  The six bytes of a 4-value group go out as bytes, the 24 of a block as three
+// aligned uint2, so nothing here is a partial store.
+__global__ void store_q6_kernel(const float* __restrict__ x, uint8_t* __restrict__ q6, half* __restrict__ scales,
+                                int n, int rows, int nb) {
+    const int gb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gb >= nb * rows) return;
+    const int row = gb / nb, blk = gb % nb;
+    const float* xr = x + (size_t) row * n + blk * 32;
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(xr[j]));
+    const float d = amax / 31.0f;
+    const float id = d > 0.f ? 1.0f / d : 0.0f;
+    scales[(size_t) row * nb + blk] = __float2half(d);
+    uint32_t w[6] = {0u, 0u, 0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {   // value j at bit 6j of the block's 24 little-endian bytes
+        const uint32_t v = q6_code(xr[j], id);
+        const int bit = 6 * j, wi = bit >> 5, sh = bit & 31;
+        w[wi] |= v << sh;
+        if (sh > 26) w[wi + 1] |= v >> (32 - sh);
+    }
+    uint2* qr = reinterpret_cast<uint2*>(q6 + ((size_t) row * nb + blk) * 24);
+    qr[0] = make_uint2(w[0], w[1]);
+    qr[1] = make_uint2(w[2], w[3]);
+    qr[2] = make_uint2(w[4], w[5]);
+}
+
+// Rows from the position the card holds when the launch runs.
+__global__ void store_q6_at_kernel(const float* __restrict__ x, uint8_t* __restrict__ q6, half* __restrict__ scales,
+                                   int n, int rows, int nb, const long long* __restrict__ at, int ring) {
+    const int gb = blockIdx.x * blockDim.x + threadIdx.x;
+    if (gb >= nb * rows) return;
+    const int trow = gb / nb, blk = gb % nb;
+    const long long row = ring > 0 ? (*at + trow) % ring : *at + trow;
+    const float* xr = x + (size_t) trow * n + blk * 32;
+    float amax = 0.f;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(xr[j]));
+    const float d = amax / 31.0f;
+    const float id = d > 0.f ? 1.0f / d : 0.0f;
+    scales[(size_t) row * nb + blk] = __float2half(d);
+    uint32_t w[6] = {0u, 0u, 0u, 0u, 0u, 0u};
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const uint32_t v = q6_code(xr[j], id);
+        const int bit = 6 * j, wi = bit >> 5, sh = bit & 31;
+        w[wi] |= v << sh;
+        if (sh > 26) w[wi + 1] |= v >> (32 - sh);
+    }
+    uint2* qr = reinterpret_cast<uint2*>(q6 + ((size_t) row * nb + blk) * 24);
+    qr[0] = make_uint2(w[0], w[1]);
+    qr[1] = make_uint2(w[2], w[3]);
+    qr[2] = make_uint2(w[4], w[5]);
+}
+
+// A Q6_0 key row back as halves, for a reader that wants the fp16 cache (the prompt batch's products): a thread a
+// 24-byte block, the six-bit codes gathered four bytes at a time and masked, `(code - 32) * scale` as halves.
+__global__ void dequant_q6_kernel(const uint8_t* __restrict__ q6, const uint16_t* __restrict__ scales,
+                                  half* __restrict__ out, int width, long long row, int valid) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= width) return;
+    const int r = blockIdx.y;
+    half x = __float2half(0.0f);
+    if (r < valid) {
+        const size_t nb = (size_t) (width >> 5), b = (size_t) (i >> 5);
+        const int j = i & 31, bit = 6 * j;
+        uint32_t w[6];
+        const uint8_t* blk = q6 + (((size_t) (row + r) * nb) + b) * 24;
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {   // three 8-byte reads: 24 bytes, 8-byte aligned
+            const uint2 v = *reinterpret_cast<const uint2*>(blk + 8 * k);
+            w[2 * k] = v.x;
+            w[2 * k + 1] = v.y;
+        }
+        const int wi = bit >> 5, sh = bit & 31;
+        uint32_t v = w[wi] >> sh;
+        if (sh > 26) v |= w[wi + 1] << (32 - sh);
+        const float d = __half2float(__ushort_as_half(scales[(size_t) (row + r) * nb + b]));
+        x = __float2half((float) ((int) (v & 0x3Fu) - 32) * d);
+    }
+    out[size_t(r) * width + i] = x;
+}
+
 // The orthonormal Sylvester-Hadamard transform of one row: element i * 32 + lane of N.  The low five index bits
 // live across the warp's lanes, the rest across each lane's registers.  H is symmetric, so the same launch
 // rotates a row and rotates it back.
@@ -3033,6 +3127,24 @@ void store_q4_at(const float* x, uint8_t* q4, uint16_t* scales, int n, const lon
     store_q4_at_kernel<<<grid(warps, 8), 256, 0, cs(stream)>>>(x, q4, scales, n, rows, nb, at, ring);
 }
 
+void store_q6(const float* x, uint8_t* q6, uint16_t* scales, int n, int64_t pos, int rows, void* stream) {
+    if ((n & 31) != 0) throw std::invalid_argument("store_q6: n is not a multiple of 32");
+    const int nb = n >> 5;
+    const size_t all = (size_t) nb * rows;
+    if (!all) return;
+    store_q6_kernel<<<grid(all, 256), 256, 0, cs(stream)>>>(x, q6 + (size_t) pos * nb * 24,
+                                                            (half*) scales + (size_t) pos * nb, n, rows, nb);
+}
+
+void store_q6_at(const float* x, uint8_t* q6, uint16_t* scales, int n, const long long* at, int rows, int ring,
+                 void* stream) {
+    if ((n & 31) != 0) throw std::invalid_argument("store_q6_at: n is not a multiple of 32");
+    const int nb = n >> 5;
+    const size_t all = (size_t) nb * rows;
+    if (!all) return;
+    store_q6_at_kernel<<<grid(all, 256), 256, 0, cs(stream)>>>(x, q6, (half*) scales, n, rows, nb, at, ring);
+}
+
 void fwht_rows(const float* x, float* y, int rows, int dim, void* stream) {
     if (rows <= 0) return;
     const float scale = 1.0f / std::sqrt((float) dim);
@@ -3198,7 +3310,7 @@ void head_norm_rope(const float* x, int x_stride, const float* w, float* y, int 
 void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t pos, int rows, float* score,
             int chunk, float* out, int dim, int n_head, int kv_heads, float scale, void* stream, int window,
             int ring, bool whole, const long long* at, int room, size_t score_floats, Kvq8 kq8, Kvq8 vq8,
-            const float* sinks, size_t part_floats, Kvq4 vq4) {
+            const float* sinks, size_t part_floats, Kvq4 vq4, Kvq6 kq6) {
     if (at && (room < 1 || (whole && rows > chunk)))
         throw std::invalid_argument("attend: a position on the card needs its room, and with `whole` one launch");
     if (dim % SCORE_VALUES || uintptr_t(q) % (SCORE_VALUES * sizeof(float)) || uintptr_t(kcache) % (SCORE_VALUES * 2))
@@ -3206,7 +3318,12 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
     const long long last = !whole ? -1 : at ? -2 : pos + rows - 1;   // -2: the launch's last token (attn_last())
     const int per = n_head / kv_heads;
     const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr,
-               v4 = vq4.q != nullptr && vq4.scales != nullptr;
+               v4 = vq4.q != nullptr && vq4.scales != nullptr, k6 = kq6.q6 != nullptr;
+    // A six-bit key cache has no reader in this kernel: its score loop converts Q8_0's codes four at a time, and the
+    // six-bit form is the decode kernel's (fdec_k6v4) and attend_batch()'s through dequant_q6_kernel.  Refuse it
+    // rather than read the codes as fp16 halves.
+    if (k6)
+        throw std::invalid_argument("attend: a six-bit key cache is read by fdec_k6v4() and attend_batch(), not here");
     // attn_split_kernel, a launch as many tokens as score has room for every block's sums of at the longest the call
     // can attend
     const int most = grid(size_t(at ? room : pos + rows), SPLIT_KEYS);
@@ -4038,12 +4155,12 @@ void probe_mma_speed(double* mma_ms, double* dp4a_ms) {
 void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint16_t* vcache, int64_t pos, int rows,
                   float* score, size_t score_floats, float* work, float* out, int dim, int n_head, int kv_heads,
                   float scale, void* stream, int window, int ring, bool whole, Kvq8 kq8, Kvq8 vq8, uint16_t* kwork,
-                  uint16_t* vwork, size_t work_halves, const float* sinks, Kvq4 vq4) {
+                  uint16_t* vwork, size_t work_halves, const float* sinks, Kvq4 vq4, Kvq6 kq6) {
     const int per = n_head / kv_heads, width = kv_heads * dim;
     // The fp16-only dim==64 fast path reads the fp16 caches, which are null under q8 (a q8 cache is load-restricted
     // to qwen35moe's head_dim 128, so it never reaches here); guard explicitly so it is provably not taken for q8.
     if (dim == 64 && per == 4 && window == 0 && ring == 0 && !whole && !sinks && kq8.codes == nullptr &&
-        vq8.codes == nullptr && vq4.q == nullptr &&
+        vq8.codes == nullptr && vq4.q == nullptr && kq6.q6 == nullptr &&
         tensor_cores()) {
         attn_flash64_kernel<<<dim3(grid(rows, FLASH_TOKENS), kv_heads), 4 * WARP, 0, cs(stream)>>>(
             q, (const half*) kcache, (const half*) vcache, out, rows, n_head, kv_heads, (long long) pos,
@@ -4051,7 +4168,7 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
         return;
     }
     if (dim == 128 && per == 8 && !whole && kq8.codes == nullptr && vq8.codes == nullptr && vq4.q == nullptr &&
-        attend_batch_flash128(dim, per)) {
+        kq6.q6 == nullptr && attend_batch_flash128(dim, per)) {
         // the device's own setting: asked on whichever card the call is for
         const cudaError_t e =
             cudaFuncSetAttribute(attn_flash128_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, FLASH128_SMEM);
@@ -4065,12 +4182,12 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
     const cublasHandle_t h = (cublasHandle_t) blas;
     const float one = 1.0f, zero = 0.0f;
     const long long last = whole ? pos + rows - 1 : -1;
-    const bool kq = kq8.codes != nullptr, vq = vq8.codes != nullptr,
+    const bool kq = kq8.codes != nullptr, k6 = kq6.q6 != nullptr, vq = vq8.codes != nullptr,
                v4 = vq4.q != nullptr && vq4.scales != nullptr;
     // the rows a q8 workspace holds: a block of keys larger than this is split into more products
     const int work_rows = width > 0 ? (int) std::min<size_t>(work_halves / (size_t) width, (size_t) INT_MAX) : 0;
-    if (kq && (kwork == nullptr || work_rows < 1))
-        throw std::invalid_argument("attend_batch: a q8 key cache needs a row of its workspace");
+    if ((kq || k6) && (kwork == nullptr || work_rows < 1))
+        throw std::invalid_argument("attend_batch: a q8 or q6 key cache needs a row of its workspace");
     if ((vq || v4) && (vwork == nullptr || work_rows < 1))
         throw std::invalid_argument("attend_batch: a quantized value cache needs a row of its workspace");
     // The products take halves and sum floats, on the tensor cores: the cache's rows as they lie there, the
@@ -4186,13 +4303,16 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
             if (kq)
                 dequant_q8_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(kq8.codes, kq8.scales,
                                                                                      (half*) kwork, width, row);
+            if (k6)   // the six-bit keys, into the same workspace a q8 key cache takes
+                dequant_q6_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(kq6.q6, kq6.scales,
+                                                                                     (half*) kwork, width, row, (int) m);
             if (vq)
                 dequant_q8_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(vq8.codes, vq8.scales,
                                                                                      (half*) vwork, width, row);
             if (v4)
                 dequant_q4_kernel<<<dim3(grid(width, 256), m), 256, 0, cs(stream)>>>(vq4.q, vq4.scales, (half*) vwork,
                                                                                     width, row);
-            const half* krow = kq ? (const half*) kwork : (const half*) kcache + size_t(row) * width;
+            const half* krow = (kq || k6) ? (const half*) kwork : (const half*) kcache + size_t(row) * width;
             const half* vrow = (vq || v4) ? (const half*) vwork : (const half*) vcache + size_t(row) * width;
             // A product a group: its heads' queries of every token of the chunk against the group's keys.  cuBLAS
             // reads the cache's rows as the transpose, and the groups' keys lie `dim` apart in a row.

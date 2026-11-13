@@ -296,6 +296,17 @@ __device__ __forceinline__ uint32_t i8pair(uint32_t w, uint32_t sel) {
     return *reinterpret_cast<uint32_t*>(&h);
 }
 
+// Two six-bit codes of a 12-bit field as a half2, exactly, by the q8 path's trick: a byte 0x00..0x3F in 0x64XX is
+// 1024 + XX, so one HADD2 of -1056 turns a pair into (code - 32), Kvq6's offset binary.  `g` holds the two codes in
+// its bits 0..11, so the low byte of g >> 6 is the second one with two junk bits above it, and one LOP3 clears both.
+// Five SASS instructions a pair: SHF, PRMT, LOP3, PRMT, HADD2.
+__device__ __forceinline__ uint32_t q6pair(uint32_t g) {
+    const uint32_t p = __byte_perm(g, g >> 6, 0x4040) & 0x3F3F3F3Fu;   // [c0, c1, c0, c1] with their two bits gone
+    const uint32_t m = __byte_perm(p, 0x64646464u, 0x4140);            // [c0, 0x64, c1, 0x64]: two halves of 0x64XX
+    half2 h = __hsub2(*reinterpret_cast<const half2*>(&m), __float2half2_rn(1056.0f));
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
 __device__ __forceinline__ uint32_t mul2(uint32_t x, half2 s) {
     half2 h = __hmul2(*reinterpret_cast<half2*>(&x), s);
     return *reinterpret_cast<uint32_t*>(&h);
@@ -316,14 +327,16 @@ __device__ __forceinline__ uint32_t word(const uint4& v, int i) {
 // token comes out the same to the bit whatever tokens the launch has beside it.  The dimensions are numbered as
 // suits the reads (a thread's 8 values of a block of K, its 8 dimensions of V), which the sums don't see.  F16: an
 // fp16 cache (kc and vc are halves, no scales), read as it is.
-// VM: 0 both fp16, 1 both q8_0, 2 q8_0 keys with q4_0 values (K8V4, the values dequantized in registers).
+// VM: 0 both fp16, 1 both q8_0, 2 q8_0 keys with q4_0 values (K8V4, the values dequantized in registers), 3 six-bit
+// keys with q4_0 values (K6V4): the keys' 24-byte block is two uint32 of the lane's 6 bytes and the pairs are
+// decoded where q8's codes are, everything below the score loop the same as VM 2.
 template <int D, int W, int MT, int VM, int Group>
 __global__ void __launch_bounds__(W * WARP_SIZE)
 fdec_kernel(const float* __restrict__ q, const void* __restrict__ kc, const uint16_t* __restrict__ ks,
             const void* __restrict__ vc, const uint16_t* __restrict__ vs, long long pos,
             const long long* __restrict__ at, int first, int tokens, int n_head, int kv_heads, float scale,
             float* __restrict__ part, float* __restrict__ ml) {
-    constexpr bool F16 = VM == 0, VQ4 = VM == 2;
+    constexpr bool F16 = VM == 0, VQ4 = VM == 2 || VM == 3, KQ6 = VM == 3;
     constexpr int NT = 2, NB = D / 32, TILE = D == 256 ? kTile : 32, KT = TILE / 16, Q = MT * 16, QS = D + 8, PS = TILE + 8;
     __shared__ __align__(16) half Qs[Q * QS];
     __shared__ __align__(16) half Ps[Q * PS];
@@ -339,15 +352,16 @@ fdec_kernel(const float* __restrict__ q, const void* __restrict__ kc, const uint
         Qs[row * QS + d] = __float2half(x);
     }
     constexpr int E = F16 ? 2 : 1;                         // bytes a value
-    constexpr uint32_t kZero = F16 ? 0u : 0x80808080u;     // a zero (a q8 code's once flipped)
+    constexpr uint32_t kZero = F16 ? 0u : (KQ6 ? 0u : 0x80808080u);   // a zero: q6's is 0 (code 0 = -32), q8's 0x80
     const size_t width = (size_t) kv_heads * D, swidth = width / 32;
-    const char* kg = (const char*) kc + (size_t) grp * D * E;
+    const char* kg = (const char*) kc + (size_t) grp * (KQ6 ? (D / 32) * 24 : D * E);
+    const size_t krow = KQ6 ? (size_t) (width / 32) * 24 : width;   // bytes a key row of codes
     const int vd0 = 64 * w + 8 * g8;   // the warp's first value of the group: 64 a warp, so 4 warps for 256, 2 for 128
     const char* vg = VQ4 ? (const char*) vc + ((size_t) grp * (D / 32) + vd0 / 32) * 16
                          : (const char*) vc + ((size_t) grp * D + vd0) * E;
     const size_t vstride = VQ4 ? (size_t) kv_heads * (D / 32) * 16 : width * E;
     const uint16_t* ksg = F16 ? nullptr : ks + (size_t) grp * (D / 32);
-    const uint16_t* vsg = VM == 1 || VM == 2 ? vs + (size_t) grp * (D / 32) + vd0 / 32 : nullptr;
+    const uint16_t* vsg = VM >= 1 ? vs + (size_t) grp * (D / 32) + vd0 / 32 : nullptr;
     const size_t vswidth = (size_t) kv_heads * (D / 32);
     const int vwithin = vd0 % 32;
     float m[MT][2], l[MT][2], o[MT][8][4];
@@ -372,10 +386,26 @@ fdec_kernel(const float* __restrict__ q, const void* __restrict__ kc, const uint
         for (int nt = 0; nt < NT; ++nt) {
             const long long key = tb + 16 * w + 8 * nt + g8;
 #pragma unroll
-            for (int b = 0; b < NB; ++b)
-                kx[nt][b] = key > last ? make_uint4(kZero, kZero, kZero, kZero)
-                          : F16 ? *reinterpret_cast<const uint4*>(kg + (key * width + 32 * b + 8 * t) * E)
-                                : widen(*reinterpret_cast<const uint2*>(kg + key * width + 32 * b + 8 * t));
+            for (int b = 0; b < NB; ++b) {
+                if constexpr (KQ6) {
+                    // the lane's 8 codes are 6 bytes at offset 6t of the 24-byte block, read as two 4-byte words at
+                    // the 4-aligned address below with the 0 or 2 leftover bytes shifted out; .x is codes 0..3 in
+                    // bits 0..23 and .y codes 4..7, so the score loop's pair split is the same two shifts as q8's
+                    const char* kb = kg + key * krow + 24 * b + ((6 * t) & ~3);
+                    uint32_t u0 = 0u, u1 = 0u;   // kZero: code 0 is -32, finite, and the mask removes the key
+                    if (key <= last) {
+                        u0 = *reinterpret_cast<const uint32_t*>(kb);   // 4-byte aligned: 24b and 6t & ~3 are
+                        u1 = *reinterpret_cast<const uint32_t*>(kb + 4);
+                    }
+                    const uint32_t s = (t & 1) ? 16u : 0u;
+                    const uint32_t f0 = __funnelshift_r(u0, u1, s), f1 = __funnelshift_r(u1, 0u, s);
+                    kx[nt][b] = make_uint4(f0, __funnelshift_r(f0, f1, 24), 0u, 0u);
+                } else {
+                    kx[nt][b] = key > last ? make_uint4(kZero, kZero, kZero, kZero)
+                              : F16 ? *reinterpret_cast<const uint4*>(kg + (key * width + 32 * b + 8 * t) * E)
+                                    : widen(*reinterpret_cast<const uint2*>(kg + key * width + 32 * b + 8 * t));
+                }
+            }
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
                 const long long k2 = tb + 16 * w + 8 * nt + 2 * t + j;
@@ -442,6 +472,10 @@ fdec_kernel(const float* __restrict__ q, const void* __restrict__ kc, const uint
                     if constexpr (F16) {
                         bk[nt][0] = h ? kx[nt][b].z : kx[nt][b].x;
                         bk[nt][1] = h ? kx[nt][b].w : kx[nt][b].y;
+                    } else if constexpr (KQ6) {
+                        const uint32_t word = h ? kx[nt][b].y : kx[nt][b].x;   // 4 codes, 24 bits
+                        bk[nt][0] = q6pair(word);
+                        bk[nt][1] = q6pair(word >> 12);
                     } else {
                         const uint32_t word = (h ? kx[nt][b].y : kx[nt][b].x) ^ 0x80808080u;
                         bk[nt][0] = i8pair(word, 0x4140);
@@ -793,6 +827,19 @@ bool fdec_k8v4(const float* q, Kvq8 kq8, Kvq4 vq4, int64_t pos, int n, const lon
     return false;
 }
 
+bool fdec_k6v4(const float* q, Kvq6 kq6, Kvq4 vq4, int64_t pos, int n, const long long* at, int room, float* out,
+               int dim, int n_head, int kv_heads, float scale, float* scratch, size_t scratch_floats, void* stream, const float* sinks) {
+    if (!fdec_allowed()) return false;
+    if (!kq6.q6 || !kq6.scales || !vq4.q || !vq4.scales) return false;
+    if (!fdec_group_ok_impl(n_head, kv_heads, 1)) return false;
+    const int g = n_head / kv_heads;
+    if (dim == 128) return run_dec_grp<128, 3>(g, q, kq6.q6, kq6.scales, vq4.q, vq4.scales, pos, n, at, room, out,
+                                               n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
+    if (dim == 256) return run_dec_grp<256, 3>(g, q, kq6.q6, kq6.scales, vq4.q, vq4.scales, pos, n, at, room, out,
+                                               n_head, kv_heads, scale, scratch, scratch_floats, stream, sinks);
+    return false;
+}
+
 bool fdec_f16(const float* q, const uint16_t* keys, const uint16_t* vals, int64_t pos, int n, const long long* at,
               int room, float* out, int dim, int n_head, int kv_heads, float scale, float* scratch,
               size_t scratch_floats, void* stream, const float* sinks) {
@@ -822,6 +869,11 @@ bool fdec_f16(const float*, const uint16_t*, const uint16_t*, int64_t, int, cons
 }
 
 bool fdec_k8v4(const float*, Kvq8, Kvq4, int64_t, int, const long long*, int, float*, int, int, int, float, float*,
+               size_t, void*) {
+    return false;
+}
+
+bool fdec_k6v4(const float*, Kvq6, Kvq4, int64_t, int, const long long*, int, float*, int, int, int, float, float*,
                size_t, void*) {
     return false;
 }

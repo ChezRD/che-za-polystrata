@@ -101,6 +101,7 @@ struct KvInt8 {
 /// pass for the same thing.  It costs one O(rows) pass to get the attention back onto the fast path.
 void dequant_int8_to_f16(const int8_t* code, const uint16_t* delta, uint16_t* out, int64_t n_blocks, void* stream);
 
+
 /// A runtime capability probe for the int8 tensor-core path: it runs one m16n8k32 on this card and checks the
 /// result against the same product computed on the host, so a kernel can be dispatched on the answer rather than
 /// on an assumed architecture.  True on sm_80 and up; a backend whose int8 mma is not there (HIP without
@@ -136,6 +137,17 @@ void store_q8_at(const float* x, int8_t* codes, uint16_t* scales, int n, const l
 void store_q4(const float* x, uint8_t* q4, uint16_t* scales, int n, int64_t pos, int rows, void* stream);
 /// The same from the row the card holds at `at` when the launch runs; with `ring`, a row is its number % ring.
 void store_q4_at(const float* x, uint8_t* q4, uint16_t* scales, int n, const long long* at, int rows, int ring,
+                 void* stream);
+
+/// Stores the tokens' rows as 6-bit codes (Kvq6): d = amax/31, code = clamp(rint(x/d), -31, 31) + 32 in six bits,
+/// the 32 codes of a block packed little-endian at six bits each (24 bytes) and the scales in an array of their own
+/// as Q4_0's are: `q6` is 24 bytes a 32-value block a row, `scales` 2 bytes a block a row, n a multiple of 32.
+/// The two spare codes of the six bits are not used, so the format is symmetric about zero and a block of equal
+/// magnitudes decodes back to them exactly, which is what the tests rest on.  The values are quantized as they are
+/// - a rotated cache rotates them first (fwht_rows()).
+void store_q6(const float* x, uint8_t* q6, uint16_t* scales, int n, int64_t pos, int rows, void* stream);
+/// The same from the row the card holds at `at` when the launch runs; with `ring`, a row is its number % ring.
+void store_q6_at(const float* x, uint8_t* q6, uint16_t* scales, int n, const long long* at, int rows, int ring,
                  void* stream);
 
 /// x and y are `rows` rows of `dim` values; each row is multiplied by the orthonormal Sylvester-Hadamard matrix
@@ -268,6 +280,17 @@ struct Kvq4 {
     const uint16_t* scales = nullptr;
 };
 
+/// An attention cache of 6-bit codes with one fp16 scale a 32-value block: the keys of --kv k6v4.  A row is
+/// `n / 32` blocks of 24 code bytes and `n / 32` fp16 scales, two arrays as Q4_0's are (`n = kv_heads * dim`).
+/// Code j of a block is bits `6j .. 6j + 5` of the block's 24 little-endian bytes, so it may straddle two of them;
+/// the value is `(code - 32) * scales[row * (n / 32) + b]`.  32 values of 6 bits is 24 bytes and 24 is a multiple
+/// of 8, so every block starts 8-byte aligned and a read is three aligned `uint2` (one an 8-value group's 6 bytes
+/// plus 2 bytes of the next group, masked off).  A q6 read is active wherever `q6` is not null.
+struct Kvq6 {
+    const uint8_t* q6 = nullptr;
+    const uint16_t* scales = nullptr;
+};
+
 /// Causal attention for the tokens from position `pos`: token t attends the rows 0 to pos + t, or with `window`
 /// only the last `window` of them.  q: n_head * dim a token.  kcache and vcache: fp16, kv_heads * dim a row; the
 /// heads read a row's keys and values in turn, n_head / kv_heads heads each.  With `ring`, the sequence's row p
@@ -294,7 +317,7 @@ void attend(const float* q, const uint16_t* kcache, const uint16_t* vcache, int6
             int chunk, float* out, int dim, int n_head, int kv_heads, float scale, void* stream, int window = 0,
             int ring = 0, bool whole = false, const long long* at = nullptr, int room = 0, size_t score_floats = 0,
             Kvq8 kq8 = {}, Kvq8 vq8 = {}, const float* sinks = nullptr, size_t part_floats = 0,
-            Kvq4 vq4 = {});
+            Kvq4 vq4 = {}, Kvq6 kq6 = {});
 /// The floats of score that attend()'s blocks of rows take for calls of up to chunk tokens attending up to max_rows
 /// rows (score_floats): with that much a model's every call takes them.
 size_t attend_split_floats(int chunk, int n_head, int max_rows, int dim);
@@ -320,9 +343,10 @@ void attend_batch(void* blas, const float* q, const uint16_t* kcache, const uint
                   float* score, size_t score_floats, float* work, float* out, int dim, int n_head, int kv_heads,
                   float scale, void* stream, int window = 0, int ring = 0, bool whole = false, Kvq8 kq8 = {},
                   Kvq8 vq8 = {}, uint16_t* kwork = nullptr, uint16_t* vwork = nullptr, size_t work_halves = 0,
-                  const float* sinks = nullptr, Kvq4 vq4 = {});
+                  const float* sinks = nullptr, Kvq4 vq4 = {}, Kvq6 kq6 = {});
 /// Whether attend_batch() takes its flash128 kernel here for heads of `dim` values in groups of `per`: heads of 128
 /// values in groups of 8 (Flint's), a window, a ring and sinks included, on a card running ptx 8.0's instructions.
+/// With `kq6` (q6 not null) the keys are a six-bit cache, dequantized into `kwork` like a q8 one.
 bool attend_batch_flash128(int dim, int per);
 /// Dequantizes `rows` rows of a Q8_0 cache, from row `first`, into `out` as fp16: `width` values a row, a scale a
 /// block of 32, as store_q8() wrote them.  A window layer's whole ring in one call is what a prompt batch needs to

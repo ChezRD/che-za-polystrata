@@ -45,6 +45,13 @@ import sys
 # spill stores / spill loads at the register count it settled on).  A spill is a finding, not a licence: the entries
 # document the state of 011c9e60 so the gate can hold the line from here.
 ALLOWED = {
+    # fdec_kernel, the poly decode-attention kernel (src/poly/fattn.cu), sm_89 and CUDA 13.1.  It was never under this
+    # guard until strata_poly_mmq joined the library list: every instantiation keeps 255 of 255 registers and spills
+    # 8 to 48 bytes of it, no array - 48 is the measured maximum (q8_0 keys, group 4, either token-group count;
+    # k8v4 is 8..40 and k6v4 24..32, so the six-bit key side adds no frame of its own).  Found on main, not by the
+    # format work, and reported rather than fixed: the fix is fewer live registers in the tile loop, which is a
+    # change to the hottest kernel in the engine and not this branch's.
+    "strata::poly::{anonymous}::fdec_kernel": {"sm_89": (48, 0)},
     # float values[V] (V = NE / 32 = 8): the lane's logits for the top-k selection (no spill)
     "q36k::k_route_group": {"sm_86": (32, 0)},
     # spill 4 B stores / 4 B loads at 64 registers under __launch_bounds__(256); its w[4] / o[4] stay in registers

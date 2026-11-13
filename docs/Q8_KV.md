@@ -272,6 +272,145 @@ interleaved runs, pinned clock: **q8_0 4.96 ns a cell, k8v4 5.88, fp16 8.32**. S
 three at long context, for 31% more bytes than k8v4 and 47% fewer than fp16. The full eight-row table, the card's
 documented peaks and the measurement protocol are in [QUANT_MICROBENCH.md](QUANT_MICROBENCH.md).
 
+## A six-bit key side (`k6v4`, kernels only)
+
+`k6v4` keeps this format's values — rotated Q4_0, so nothing about them or their tests moves — and stores the *keys*
+at six bits instead, 24 bytes a 32-value block plus a 2-byte fp16 scale. A cell is **704 B against k8v4's 832**
+(−15.4%) and q8_0's 1,088 (−35%), which at the dense Qwen3.8-27B geometry (4 KV heads of 256 values, 17 stacks) is
+**1,408 B against 1,664**.
+
+**The packing.** 32 values of 6 bits is 192 bits, so a block's codes are **24 bytes: value j at bits 6j**, four values
+in three bytes, little-endian. 24 is a multiple of 8, so every block starts 8-byte aligned and its codes are three
+aligned `uint2`. The scales stay in an array of their own, as Q8_0's and Q4_0's do — a 26-byte block with the scale
+inside it would lose that alignment for one byte a value's worth of nothing.
+
+Codes are **offset binary about zero**: `d = amax/31`, `code = clamp(rint(x/d), -31, 31) + 32`, value
+`(code - 32) * d`. That is 63 levels, and a block of equal magnitudes decodes back to them exactly.
+
+**The read is five instructions a pair of codes**, and the arithmetic is this format's own trick one bit narrower:
+byte `0x00..0x3F` in `0x64XX` is `1024 + code`, so one `HADD2` of −1056 is `code − 32`. A lane's 8 codes are the 6
+bytes at offset `6t` of the block, which is 4-byte aligned but not 8, so they are read as **two `uint32`** and one
+`SHF` (a funnel shift by 0 or 16 bits) lines them up:
+
+| step | instruction | what |
+| --- | --- | --- |
+| the 6 bytes | `LDG.E` ×2 | two 4-byte words at `24b + (6t & ~3)`, 4-byte aligned |
+| bits 0..31 / 24..55 | `SHF` ×3 | `__funnelshift_r`, so `.x` is codes 0..3 and `.y` codes 4..7 |
+| a pair to bytes | `SHF` + `PRMT` | `__byte_perm(f, f >> 6, 0x4040)` puts the two codes in bytes 0 and 1 |
+| the mask | `LOP3` | `& 0x3F3F3F3F` clears the two bits each 6-bit code leaves over |
+| the halves | `PRMT` + `HADD2` | `__byte_perm(p, 0x64646464, 0x4140)` is `[c0, 0x64, c1, 0x64]`, one subtract is codes−32 |
+
+Every one of those mnemonics is in the Ada ISA list (`sm89_inst.txt`); there is no 6-bit datatype instruction on
+sm_89, so a 6-bit format is bit surgery plus fp16 arithmetic and nothing else. The instruction mix says the surgery
+stayed surgery: below, the group-6, two-token-group kernel against k8v4's, from `cuobjdump --dump-sass`.
+
+| | k8v4 | k6v4 | |
+| --- | ---: | ---: | --- |
+| total | 2,688 | 2,928 | +8.9% |
+| `HMMA.16816.F32` | 128 | **128** | unchanged: the tensor-core work is the same |
+| `FFMA` | 132 | **132** | unchanged: no arithmetic moved onto the ALU |
+| `HADD2` / `HMUL2` | 192 / 64 | **192 / 64** | unchanged: the values' path is untouched |
+| `SHF` | 66 | **205** | +139: the bit splits |
+| `PRMT` | 226 | **288** | +62: the gathers and the halves |
+| `LOP3` | 99 | **134** | +35: the masks |
+| `LDG` | 82 | **98** | +16: two 4-byte reads a block instead of one 8-byte one |
+| REG / STACK / LOCAL | 255 / 40 / 0 | **255 / 24 / 0** | no register or spill cost |
+
+**What it costs.** One call, one token, everything in one process, five runs of each arm alternating rather than one
+arm's median against another's (the reason is measured in
+[QUANT_MICROBENCH.md](QUANT_MICROBENCH.md) §32.3: a single run of k8v4 against q8_0 said 1.11 where five interleaved
+runs said 1.185). Pinned at 2,820 MHz, RTX 4060 Ti.
+
+| cells | k8v4 ns a cell | k6v4 ns a cell | k6v4 / k8v4 | |
+| --- | ---: | ---: | ---: | --- |
+| 4,096 | 15.85 | 16.80 | **1.060** | launch-bound: more ALU, no bytes to save |
+| 32,768 | 9.88 | 9.05 | **0.915** | |
+| 131,072 | 11.28 | 10.46 | **0.928** | |
+| 262,144 | 11.42 | 11.06 | **0.968** | 0.921 and 0.934 on two runs of the alternated ratio |
+
+So at the contexts the format exists for it is **7% faster than k8v4 on the alternated ratio (0.921, 0.934), never
+slower than 1.05**, and 15% smaller: the kernel at 256K is at 44% of the card's DRAM peak rather than 51%, so the
+bytes it stops reading more than pay for the unpack. The one point it loses is 4K, where a call is 0.07 ms and there
+is nothing for the saved bytes to buy.
+
+The eight-value-group geometry (16 heads on 2 KV) measured **0.978 and 0.929** at 256K, the same conclusion.
+
+**What it buys on the dense model, measured.** The context ceiling of Qwen3.8-27B UD-IQ3_XXS on this 16 GB RTX
+4060 Ti, with `--kv-whole` so a context that does not fit fails at load. The desktop on this box holds about 3.1 GiB
+of the card and its use drifts between runs, so a single bisection is a sample of a moving quantity: each number
+below was then **re-probed at the boundary three to five times** and is the largest context that loaded every time
+(the next 1 KiB up failed every time).
+
+| `--prompt-batch` | k8v4 | loads | k6v4 | loads | k6v4's gain |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 92,160 | 3/3 | 106,496 | 4/5 | **+15.6%** |
+| 128 | 102,400 | 3/3 | 122,880 | 3/3 | **+20.0%** |
+
+Both at `--window 1` (see below), against `docs/QWEN38.md`'s ~109,400 for k8v4 at the batch-128 scratch — measured
+there as 102,400, within the ~7% that doc's tilde covers. The gain is the 15.4% of bytes a cell with the rest from
+where the scratch and the wall happen to round. `122,880 ≈ 109,400 / 0.8462 = 129,300` was ~5% optimistic, and the
+reason is the second scratch, not the format.
+
+Two caveats, stated rather than smoothed. The k8v4 batch-128 number moved by 2% between two clean bisections
+(104,448 then 102,400) and one boundary probe flipped on a re-run, so **treat these ceilings as ±2%**. And
+`--window 1` is how they were taken, because this tree has no `opt_.draft` guard on the `snap_` buffer;
+`--window 8 --prompt-batch 512` does allocate it and would not load 92,160 at all — that buffer plus the draft
+block's own is worth more context than the format buys back, which is the cost `docs/QWEN38.md` already documents
+and a reason to land the `snap_` guard before quoting a k6v4 ceiling at the default window.
+
+**Teacher-forced top-1, the method of `docs/FLINT.md:173`.** Same shape of measurement: N prompts of 8,192 random
+token ids, 48 greedy tokens each, every arm replaying the same prefix, agreement counted over every position. On the
+dense model, one binary, one card, temperature 0:
+
+| arm | top-1 against fp16 | of 144 positions | per prompt |
+| --- | ---: | ---: | --- |
+| q8_0 | **99.3%** | 143/144 | 47, 48, 48 |
+| k8v4 | **97.9%** | 141/144 | 45, 48, 48 |
+| **k6v4** | **97.2%** | **140/144** | **44, 48, 48** |
+
+**The prediction was "between k8v4 and q8_0". The measurement puts k6v4 one position below k8v4 and two below
+q8_0** — but the per-position record says that ordering is not the key format's. Of k6v4's four misses, **two are the
+same wrong token k8v4 picks** (position 9, both give 8442; position 13, both give 16 where the reference says 17), so
+those are the 4-bit values' and the split kernel's, not the keys'. One is k6v4's own (position 10: 257 against 198).
+The fourth is the end-of-turn token at position 24, where a 6-bit key tips an EOS/number near-tie. And at position 26
+**k6v4 is the only arm that gets it right**, where both q8_0 and k8v4 pick 248044 against the reference's 248045.
+
+So: **144 positions cannot separate k6v4 from k8v4.** One position is 0.7 of a point, the whole k8v4-to-q8_0 gap here
+is 1.4 points, and k6v4 both loses and wins single positions against both. What the run does establish is that a
+six-bit key is not a collapse — it is within one position of the format it would replace, on the same binary, the
+same prompts and the same prefixes — and it points the way to settle the ranking: more prompts, not more analysis.
+`docs/FLINT.md`'s 83.3 / 90.4 are **not** a comparison for these numbers: they are Flint on a different card, where
+the split kernel's long-range loss dominates, and this model at 8K does not show that loss at all.
+
+**The answers do not move at short range.** On four short prompts (a chat turn, two arithmetic ones, prose and code),
+16 greedy tokens at temperature 0: **k6v4 and k8v4 produce the identical 16 tokens on 4 of 4.** The caches hold
+different numbers — a six-bit key is not an eight-bit one — but the picks agree, which is the same finding
+`docs/DETAILS.md` records for k8v4 against fp16 below 4,096 positions. The window's draft block also runs: 12 of 13
+guesses right at `--window 8`, which exercises `store_q6_at` and the per-sequence `attn_rows` path.
+
+**What it is not.** The keys' 63 levels cost accuracy where q8_0's 255 did not: on 4,096 rows of Gaussian keys the
+quantizer's own error is **max 8.1e-2, rms 2.2e-2, against q8_0's 2.0e-2 and 5.3e-3 — 3.98× and 4.09×**, which is the
+step of six bits against eight. On the per-cell id payload of the parity test (a cell's id in every key and value,
+one-hot queries, so a wrong gather is a cell-id-sized error) the same payload gives **k6v4 2.4e-5 against k8v4
+3.3e-5**, both far under the 2.5e-3 bar and both dominated by the 4-bit values, not the keys.
+
+**`--kv k6v4` is reachable.** It is qwen35moe's and the dense qwen35's, like k8v4: `KvFmt::kK6V4`, the `--kv`
+parser, `Qwen35::alloc_caches`, `attn_store` (with `store_q6_at`, so a recorded launch works), and the three
+attention dispatches. A six-bit key cache is read by the decode kernel and by `attend_batch`, whose dequantizer
+(`dequant_q6_kernel`) turns each 24-byte block into fp16 in the workspace the products already use for a q8 cache.
+`attend()` has no six-bit reader and refuses one rather than read the codes as halves, so under k6v4 the decode
+kernel takes every position (`fdec_from_ = 0`), and the two paths that would reach `attend()` — the block of guesses
+and a run with `STRATA_FDEC=0` — are refused at load with that reason. Flint is refused for the same kind of reason:
+its layers keep caches of their own and this branch adds no reader for them.
+
+One gate was blind and is not now. `cuda_spill_guard` listed the `strata_*` libraries and not `strata_poly_mmq`, so
+it had never seen `fdec_kernel`. Adding the library makes the guard report **95 kernels on sm_89, 21 of them using a
+stack frame, all 21 allowlisted at their measured maximum (48 bytes, LOCAL 0)** and **0 violations** — the guard now
+passes while actually seeing the poly decode kernels for the first time. The frames are 8 to 48 bytes at 255 of 255
+registers with no local array, and they are **not this format's doing**: `main`'s own `fattn.cu` measures the same 16
+frames, k8v4 is 8–40 bytes and k6v4 24–32, so the six-bit key side adds no frame of its own. Recorded, not fixed —
+the fix is fewer live registers in the tile loop of the hottest kernel in the engine, which is its own change.
+
 ## The comparison with another implementation
 
 `llama.cpp` (the in-tree build `runners/llama.cpp/build/bin/llama-cli`) reads the same `qwen35moe` files and

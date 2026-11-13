@@ -480,6 +480,15 @@ struct Session {
         }
         const auto pick = [&](const float* logits) {
             picked_from = logits;
+            // STRATA_TOPK1=<path>: the token the model would pick at this position, whether or not --follow takes
+            // another one.  With --follow the prefix is fixed, so two runs' lines are two teacher-forced argmaxes at
+            // the same position, and their agreement is the teacher-forced top-1 of docs/FLINT.md's method.
+            if (std::FILE* topk1 = [] {
+                    const char* p = std::getenv("STRATA_TOPK1");
+                    static std::FILE* f = p != nullptr ? std::fopen(p, "ab") : nullptr;
+                    return f;
+                }())
+                std::fprintf(topk1, "%lld %d\n", (long long) r.produced, (int) strata::poly::most_likely(logits, engine.n_vocab()));
             if (follow && r.produced < (int64_t) follow->size()) return (*follow)[(size_t) r.produced];
             return (int32_t) sampler.pick(logits, engine.n_vocab(), s, history, rng);
         };
@@ -1254,7 +1263,9 @@ void usage() {
                  "                         and Flint's: keys as q8_0, values rotated by the head's Hadamard matrix\n"
                  "                         and in Q4_0: 832 bytes a row including the values' scales, against\n"
                  "                         q8_0's 1,088 at 256 values and two KV heads; on Flint, the same 832\n"
-                 "                         against q8_0's 1,088 and fp16's 2,048);\n"
+                 "                         against q8_0's 1,088 and fp16's 2,048); k6v4 (the same values as k8v4,\n"
+                 "                         the keys at six bits: 704 bytes a cell, qwen35moe's and the dense\n"
+                 "                         qwen35's);\n"
                  "                         int8 / int8k (Gemma 4's:\n"
                  "                         the same Q8_0 rule with the codes and their deltas in two arrays, so a\n"
                  "                         reader takes four codes to a load; int8k keeps the keys' side\n"
@@ -1386,10 +1397,11 @@ bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching) {
             if (fmt == "fp16") o.kv_format = KvFmt::kFp16;
             else if (fmt == "q8_0") o.kv_format = KvFmt::kQ8_0;
             else if (fmt == "k8v4") o.kv_format = KvFmt::kK8V4;
+            else if (fmt == "k6v4") o.kv_format = KvFmt::kK6V4;
             else if (fmt == "int8") o.kv_format = KvFmt::kInt8;
             else if (fmt == "int8k") o.kv_format = KvFmt::kInt8K;
             else {
-                c.error = "--kv " + fmt + ": unknown format (use fp16, q8_0, k8v4, int8 or int8k)";
+                c.error = "--kv " + fmt + ": unknown format (use fp16, q8_0, k8v4, k6v4, int8 or int8k)";
                 std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
                 return false;
             }

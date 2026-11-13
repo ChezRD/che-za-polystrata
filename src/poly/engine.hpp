@@ -49,8 +49,11 @@ struct Likeliest;
 /// geometry before allocation on Metal; other backends default to fp16.  k8v4 is qwen35moe's too: the keys stay
 /// Q8_0 (their scores are the q8_0 ones), the values are rotated by the head's Hadamard matrix and stored as
 /// Q4_0 (18 bytes a 32-value block), and the attention's output is rotated back before the gate - 832 bytes a
-/// cell against q8_0's 1,088 for heads of 256 and two KV heads.
-enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kK8V4 = 4 };
+/// cell against q8_0's 1,088 for heads of 256 and two KV heads.  k6v4 is the same format's values with a six-bit
+/// key side: 24 bytes a 32-value block plus its fp16 scale, codes offset binary about zero (code = value / d + 32,
+/// d = amax / 31), 704 bytes a cell - the decode kernel unpacks the codes in registers and the prompt path hands
+/// each block's 24 bytes to a dequantizer, so nothing but the keys' own step changes.
+enum class KvFmt { kAuto = -1, kFp16 = 0, kQ8_0 = 1, kInt8 = 2, kInt8K = 3, kK8V4 = 4, kK6V4 = 5 };
 
 struct Options {
 #if defined(STRATA_GPU_METAL)
@@ -248,6 +251,10 @@ public:
     bool int8k() const { return opt_.kv_format == KvFmt::kInt8K; }
     /// The keys in Q8_0 (exactly q8_0's), the values rotated and in Q4_0: --kv k8v4.
     bool k8v4() const { return opt_.kv_format == KvFmt::kK8V4; }
+    /// The same values as k8v4, the keys at six bits a value: --kv k6v4.
+    bool k6v4() const { return opt_.kv_format == KvFmt::kK6V4; }
+    /// Either of the two splits: rotated Q4_0 values, and a key side that is q8_0's or six-bit.
+    bool kv4() const { return k8v4() || k6v4(); }
 
     /// Forget the sequence.
     void reset();

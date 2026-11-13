@@ -144,6 +144,8 @@ int main(int argc, char** argv) {
     // ---- an fp16 source, quantized on the host into the two caches (no store kernels: this is the read row)
     std::vector<int8_t> kc((size_t) rows_max * width);
     std::vector<uint16_t> ks((size_t) rows_max * nb);
+    std::vector<uint8_t> k6((size_t) rows_max * nb * 24);
+    std::vector<uint16_t> k6s((size_t) rows_max * nb);
     std::vector<uint8_t> vq((size_t) rows_max * nb * 16);
     std::vector<uint16_t> vs((size_t) rows_max * nb);
     {
@@ -163,6 +165,21 @@ int main(int argc, char** argv) {
                     float q = std::rint(xb[j] * id);
                     q = std::fmin(std::fmax(q, -127.f), 127.f);
                     kc[(size_t) r * width + b * 32 + j] = (int8_t) q;
+                }
+                // q6_0, store_q6()'s rule: d = amax/31, code = clamp(rint(x/d), -31, 31) + 32, 24 bytes a block
+                {
+                    const float d6 = amax / 31.f, i6 = d6 > 0.f ? 1.f / d6 : 0.f;
+                    k6s[(size_t) r * nb + b] = __half_as_ushort(__float2half(d6));
+                    uint32_t w6[6] = {0, 0, 0, 0, 0, 0};
+                    for (int j = 0; j < 32; ++j) {
+                        float q = std::rint(xb[j] * i6);
+                        q = std::fmin(std::fmax(q, -31.f), 31.f);
+                        const uint32_t v = (uint32_t) ((int) q + 32);
+                        const int bit = 6 * j, wi = bit >> 5, sh = bit & 31;
+                        w6[wi] |= v << sh;
+                        if (sh > 26) w6[wi + 1] |= v >> (32 - sh);
+                    }
+                    std::memcpy(k6.data() + ((size_t) r * nb + b) * 24, w6, 24);
                 }
                 // q4_0, ggml's rule (kv_q4_test.cpp's host reference)
                 const float dq = mval / -8.f, iq = dq != 0.f ? 1.f / dq : 0.f;
@@ -206,6 +223,10 @@ int main(int argc, char** argv) {
     hf.shrink_to_fit();
     int8_t* dkc = upload(kc);
     uint16_t* dks = upload(ks);
+    uint8_t* dk6 = upload(k6);
+    uint16_t* dk6s = upload(k6s);
+    k6.clear(); k6.shrink_to_fit();
+    k6s.clear(); k6s.shrink_to_fit();
     uint8_t* dvq = upload(vq);
     uint16_t* dvs = upload(vs);
     kc.clear(); kc.shrink_to_fit();
@@ -214,6 +235,7 @@ int main(int argc, char** argv) {
     vs.clear(); vs.shrink_to_fit();
     const Kvq8 kq{dkc, dks};
     const Kvq4 v4{dvq, dvs};
+    const Kvq6 k6q{dk6, dk6s};
 
     std::vector<float> hq((size_t) (n_head * dim));
     for (float& x : hq) x = 2.f * nd(rng);
@@ -257,6 +279,9 @@ int main(int argc, char** argv) {
             const double m4 = time_ms([&] {
                 fdec_k8v4(q, kq, v4, pos, 1, nullptr, r, out, dim, n_head, kv_heads, scale, score, score_n, nullptr);
             });
+            const double m6 = time_ms([&] {
+                fdec_k6v4(q, k6q, v4, pos, 1, nullptr, r, out, dim, n_head, kv_heads, scale, score, score_n, nullptr);
+            });
             const double mq = time_ms([&] {
                 fdec_q8(q, kq, Kvq8{dvc, dvsc}, pos, 1, nullptr, r, out2, dim, n_head, kv_heads, scale, score, score_n,
                         nullptr);
@@ -268,6 +293,11 @@ int main(int argc, char** argv) {
             (void) mh;
             k8[ci] = m4;
             q8[ci] = mq;
+            const double ns6 = m6 * 1e6 / (double) rows;
+            const double cell6 = nb * 24 + nb * 2 + nb * 16 + nb * 2;   // K six-bit codes + scales, V q4_0
+            const double gbs6 = (double) cell6 * (double) rows / (m6 * 1e6);
+            std::printf("  %7lld  fdec_k6v4  %9.4f  %9.2f  %6.1f  %8.1f%%  %8.1f%%  | k6v4/k8v4 %.4f  (%d B a cell)\n",
+                        pos, m6, ns6, gbs6, 100.0 * gbs6 / peak, 100.0 * gbs6 / 280.0, m6 / m4, (int) cell6);
             const double ns = m4 * 1e6 / (double) rows;
             const double gbs = (double) cell_bytes * (double) rows / (m4 * 1e6);
             const int ctas = (int) ((rows + 1023) / 1024 * kv_heads);
@@ -295,6 +325,39 @@ int main(int argc, char** argv) {
             std::printf("  %7lld  attend     %9.4f  %9.2f  %6.1f  %8.1f%%  %8.1f%%\n", pos, ma, ns, gbs,
                         100.0 * gbs / peak, 100.0 * gbs / 280.0);
         }
+    }
+    // ---- the bar: k6v4 against k8v4, the two arms ALTERNATING inside one repetition loop rather than one arm's
+    // whole median against another's.  MB-ROW-1-5.md §32.3 is why: a single run of k8v4 against q8_0 gave 1.11 and
+    // five interleaved runs 1.185, so the alternated ratio is the one to quote.  Each repetition times one call of
+    // each arm back to back; the median of the per-repetition ratios is the number.
+    if (fdec_ok) {
+        const long long pos = cells_list.back();
+        const long long rows = std::min<long long>(pos + 1, rows_max);
+        const int r = (int) rows;
+        std::vector<double> ratio;
+        for (int rep = 0; rep < 5; ++rep) {
+            cudaEventRecord(e0);
+            for (int i = 0; i < iters; ++i)
+                fdec_k8v4(q, kq, v4, pos, 1, nullptr, r, out, dim, n_head, kv_heads, scale, score, score_n, nullptr);
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "timed");
+            float ms8 = 0.f;
+            cudaEventElapsedTime(&ms8, e0, e1);
+            cudaEventRecord(e0);
+            for (int i = 0; i < iters; ++i)
+                fdec_k6v4(q, k6q, v4, pos, 1, nullptr, r, out, dim, n_head, kv_heads, scale, score, score_n, nullptr);
+            cudaEventRecord(e1);
+            ck(cudaEventSynchronize(e1), "timed");
+            float ms6 = 0.f;
+            cudaEventElapsedTime(&ms6, e0, e1);
+            if (rep) ratio.push_back((double) ms6 / ms8);
+        }
+        const double md = median(ratio);
+        double lo = *std::min_element(ratio.begin(), ratio.end()), hi = *std::max_element(ratio.begin(), ratio.end());
+        std::printf("\nk6v4 / k8v4 at %lld cells, five runs alternating in one process: %.4f (per-run %.4f..%.4f)\n",
+                    pos, md, lo, hi);
+        std::printf("  k6v4 %s the 5%% bar: %s\n", md <= 1.05 ? "clears" : "MISSES",
+                    md <= 1.05 ? "within 5% of k8v4's per-cell cost" : "more than 5% above k8v4's per-cell cost");
     }
     std::printf("\nCTAs a call: fdec = ceil(rows/1024) x %d KV; attend = ceil(%lld/64) x 1 block a head group\n",
                 kv_heads, (long long) cells_list.back());
