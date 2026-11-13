@@ -1317,6 +1317,9 @@ void usage() {
                  "                         cache stays as it is)\n"
                  "  --eos-ids ID,ID,...    tokens that end a reply (default: the GGUF's eos, eot and eom)\n"
                  "  --temperature F --top-k N --top-p F --min-p F --seed N   sampling for --tokens (default greedy)\n"
+                 "  --tokens-file FILE     with --tokens omitted: read the prompt's ids from FILE, the same\n"
+                 "                         comma-separated text.  A long prompt exceeds the 128 KiB one argument\n"
+                 "                         may hold, which is about 21,800 ids.\n"
                  "  --images FILE          with --tokens: the prompt's pictures, as strata-vision writes them\n"
                  "  --image-pad ID         the token whose runs in --tokens are the pictures' places, a token a row\n"
                  "  --dump-layers          print a checksum of every layer's stages to stderr\n"
@@ -1447,6 +1450,34 @@ bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching) {
         else if (a == "--top-p") s.top_p = std::strtof(val(), nullptr);
         else if (a == "--min-p") s.min_p = std::strtof(val(), nullptr);
         else if (a == "--seed") s.seed = std::strtoull(val(), nullptr, 10);
+        else if (a == "--tokens-file") {
+            // **A PROMPT FROM A FILE, BECAUSE A LONG ONE DOES NOT FIT AN ARGUMENT.**  Linux caps a SINGLE argument at
+            // 128 KiB (MAX_ARG_STRLEN), which is about 21,800 comma-separated ids - so a 131,072- or 262,144-token
+            // prompt cannot be spelled on the command line at all, and those are the contexts this model exists to
+            // reach.  The file holds the same comma-separated text `--tokens` takes and goes through the same parser,
+            // so nothing downstream can tell the two apart.
+            std::FILE* f = std::fopen(val(), "rb");
+            if (f == nullptr) {
+                c.error = std::string("cannot open ") + val();
+                if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
+            }
+            std::string txt;
+            char buf[1 << 16];
+            size_t got;
+            while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) txt.append(buf, got);
+            std::fclose(f);
+            // a text file ends in a newline and `parse_ids` rightly stops at any byte that is neither a digit nor a
+            // comma, so the file's own trailing whitespace is trimmed here rather than taught to the shared parser.
+            while (!txt.empty() && (txt.back() == '\n' || txt.back() == '\r' || txt.back() == ' ' ||
+                                    txt.back() == '\t'))
+                txt.pop_back();
+            if (!parse_ids(txt.c_str(), ids)) {
+                c.error = "--tokens-file does not hold comma-separated token ids";
+                if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
+            }
+        }
         else if (a == "--tokens" || a == "--eos-ids" || a == "--follow") {
             const char* v = val();
             if (bad) return false;
