@@ -1317,9 +1317,10 @@ void usage() {
                  "                         cache stays as it is)\n"
                  "  --eos-ids ID,ID,...    tokens that end a reply (default: the GGUF's eos, eot and eom)\n"
                  "  --temperature F --top-k N --top-p F --min-p F --seed N   sampling for --tokens (default greedy)\n"
-                 "  --tokens-file FILE     with --tokens omitted: read the prompt's ids from FILE, the same\n"
-                 "                         comma-separated text.  A long prompt exceeds the 128 KiB one argument\n"
-                 "                         may hold, which is about 21,800 ids.\n"
+                 "  --tokens-file FILE     with --tokens omitted (the two cannot be combined): read the prompt's\n"
+                 "                         ids from FILE, the same comma-separated text.  A long prompt exceeds\n"
+                 "                         the 128 KiB one argument may hold: about 18,700 six-digit ids, more\n"
+                 "                         when the ids are shorter.\n"
                  "  --images FILE          with --tokens: the prompt's pictures, as strata-vision writes them\n"
                  "  --image-pad ID         the token whose runs in --tokens are the pictures' places, a token a row\n"
                  "  --dump-layers          print a checksum of every layer's stages to stderr\n"
@@ -1356,6 +1357,10 @@ bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching) {
     std::vector<int32_t>& eos = c.eos;
     std::vector<int32_t>& follow = c.follow;
     bool bad = false;
+    // `--tokens` and `--tokens-file` both give the prompt's ids, so only one of them may say it: a second one
+    // silently replacing the first is how a run measures a prompt nobody asked for.  `--eos-ids` and `--follow`
+    // are separate lists and are unaffected.
+    bool seen_tokens = false, seen_tokens_file = false;
     for (size_t i = 0; i < av.size(); ++i) {
         const std::string a = av[i];
         auto val = [&]() -> const char* {
@@ -1452,13 +1457,24 @@ bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching) {
         else if (a == "--seed") s.seed = std::strtoull(val(), nullptr, 10);
         else if (a == "--tokens-file") {
             // **A PROMPT FROM A FILE, BECAUSE A LONG ONE DOES NOT FIT AN ARGUMENT.**  Linux caps a SINGLE argument at
-            // 128 KiB (MAX_ARG_STRLEN), which is about 21,800 comma-separated ids - so a 131,072- or 262,144-token
-            // prompt cannot be spelled on the command line at all, and those are the contexts this model exists to
-            // reach.  The file holds the same comma-separated text `--tokens` takes and goes through the same parser,
-            // so nothing downstream can tell the two apart.
-            std::FILE* f = std::fopen(val(), "rb");
+            // 128 KiB (MAX_ARG_STRLEN, 131,072 bytes on a 4 KiB page); an argument of 131,071 bytes is accepted and
+            // one of 131,072 is refused with E2BIG.  How many ids that is depends on their width: a six-digit id and
+            // its comma are 7 bytes, so 18,724 of them fit in 131,071 bytes and 18,725 do not - measured on this
+            // machine.  Ornith-1.5-9B's vocabulary is 248,320 ids, so most of its ids are six digits and 18,700 is
+            // the number that matters there.  A 131,072- or 262,144-token prompt needs 0.9 or 1.8 MiB, so neither
+            // can be spelled on the command line at all, and those are the contexts this model exists to reach.
+            // The file holds the same comma-separated text `--tokens` takes and goes through the same parser, so
+            // nothing downstream can tell the two apart.
+            const char* const v = val();   // ONE call: val() advances i, and a second one read the next flag
+            if (bad) return false;
+            if (seen_tokens) {
+                c.error = "--tokens and --tokens-file cannot be combined";
+                if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
+            }
+            std::FILE* f = std::fopen(v, "rb");
             if (f == nullptr) {
-                c.error = std::string("cannot open ") + val();
+                c.error = std::string("cannot open ") + v;
                 if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
                 return false;
             }
@@ -1466,21 +1482,55 @@ bool parse_args(const std::vector<std::string>& av, Cmd& c, bool switching) {
             char buf[1 << 16];
             size_t got;
             while ((got = std::fread(buf, 1, sizeof buf, f)) > 0) txt.append(buf, got);
+            // A directory opens but does not read, and a short read is not an empty file: say which it was rather
+            // than let the empty-file message below claim the file holds nothing.
+            const bool read_failed = std::ferror(f) != 0;
             std::fclose(f);
+            if (read_failed) {
+                c.error = std::string("cannot read ") + v;
+                if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
+            }
             // a text file ends in a newline and `parse_ids` rightly stops at any byte that is neither a digit nor a
             // comma, so the file's own trailing whitespace is trimmed here rather than taught to the shared parser.
             while (!txt.empty() && (txt.back() == '\n' || txt.back() == '\r' || txt.back() == ' ' ||
                                     txt.back() == '\t'))
                 txt.pop_back();
-            if (!parse_ids(txt.c_str(), ids)) {
-                c.error = "--tokens-file does not hold comma-separated token ids";
+            // **A NUL BYTE IS REFUSED, NOT PARSED PAST.**  `parse_ids` takes a C string, so it stops at the first NUL
+            // and would accept `1,2,3\0hello` as the three ids 1,2,3 - which is what a UTF-16 file without a BOM is:
+            // every other byte is a NUL, so a real prompt reads as a one-id prompt and the run looks successful.  The
+            // same guard is in the Qwen parser (src/program/generate.cpp), and it belongs here for the same reason.
+            if (txt.empty()) {
+                c.error = std::string("--tokens-file: ") + v + " is empty";
                 if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
                 return false;
             }
+            if (txt.find('\0') != std::string::npos) {
+                c.error = std::string("--tokens-file: ") + v +
+                          " holds a NUL byte; a text file of comma-separated ids is expected (UTF-16 is not)";
+                if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
+            }
+            if (!parse_ids(txt.c_str(), ids)) {
+                c.error = std::string("--tokens-file: ") + v + " does not hold comma-separated token ids";
+                if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                return false;
+            }
+            seen_tokens_file = true;
         }
         else if (a == "--tokens" || a == "--eos-ids" || a == "--follow") {
             const char* v = val();
             if (bad) return false;
+            if (a == "--tokens") {
+                // Only the two flags against each other: a repeated `--tokens` still lets the last one win, which is
+                // what it has always done and what a sweep of one prompt under several settings relies on.
+                if (seen_tokens_file) {
+                    c.error = "--tokens and --tokens-file cannot be combined";
+                    if (!switching) std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
+                    return false;
+                }
+                seen_tokens = true;
+            }
             if (!parse_ids(v, a == "--tokens" ? ids : a == "--eos-ids" ? eos : follow)) {
                 c.error = a + " takes token ids separated by commas";
                 std::fprintf(stderr, "strata-poly: %s\n", c.error.c_str());
