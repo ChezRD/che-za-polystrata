@@ -25,8 +25,12 @@ offers the same steps as tools.
   common base, and `main` merges it; the server, installer, tools, docs and the app stay out of that snapshot. The
   previous snapshot is the merge base for the next sync. Metal is merged by code (upstream reworked it heavily) but
   cannot be built or run without a Mac, so say what was not tested.
-- Text taken from the Strata project names that project. After merging from it,
-  `python tools/polystrata_names.py` writes PolyStrata again; its first lines say what it leaves alone.
+- Text taken from the Strata project names that project. The engine's sources and the documents about it keep
+  upstream's names, and a wholesale rename is wrong: in this tree "Strata" usually means the upstream project
+  (its releases, its forks, the measurements taken on it), not this fork. Name this fork PolyStrata in the text
+  that is about this fork, and write "the Strata project" or link [Strata](https://github.com/Niko1221/Strata)
+  where you mean upstream. There is no script that rewrites the name; one existed until 2026-11-13 and turned
+  `Hardin22/Strata-DualGPU` into a repository that does not exist.
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a

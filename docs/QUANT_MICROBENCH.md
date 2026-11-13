@@ -563,14 +563,14 @@ binaries around them are in `ctest` and run with the rest of the suite — `poly
 | ---: | --- | --- | --- |
 | 1 | `poly_kv_q4_test` | `poly_kv_q4_test --bench` (and `poly_kv_q8_test --bench` for the q8_0 arm) | the correctness checks are; `--bench` is not |
 | 2 | `poly_kv_read_bench` | `poly_kv_read_bench 256 16 2 --only-fdec --cells 4096,32768,131072,262144 --rows-max 262145` | no; the correctness guard is `poly_fattn_test k8v4` / `deep <pos>`, which is |
-| 3 | `gdn_state_bench` | `gdn_state_bench` (timing, 16 arms); `gdn_state_bench --accuracy` (error at 1 and 128 steps); `gdn_state_bench --smoke` (partial-tile correctness) | no |
-| 4 | `gdn_state_bench` | same binary: the compensator arms are A2/A3/A11/A16/A17 | no |
+| 3 | ~~`gdn_state_bench`~~ | **deleted 2026-11-13**; its rows 3 and 4 are below | — |
+| 4 | ~~`gdn_state_bench`~~ | **deleted 2026-11-13**: the compensator arms were A2/A3/A11/A16/A17 of the same binary; the numbers they produced stay in row 4 above | — |
 | 5 | `q8_1_quant_bench` | `q8_1_quant_bench` | no |
 | 6 | `mmq_expert_bench` | `mmq_expert_bench 12 160 626` | no |
 | 6 | `native_expert_bench` | `native_expert_bench <shard>.gguf 0,1,2,3 64 1 -1 -1 200` | no |
 | 7 | `nvfp4_decode_bench` | `nvfp4_decode_bench` (defaults are 40/40, 64 groups, 2 tokens, 50 iterations) | no |
-| 8 | `lsa_scan_bench` | `lsa_scan_bench` | no |
-| W1 | `lsa_ward_bench` | `lsa_ward_bench --keys <keys128.bin> --blocks 128 --m 64 --oracle 16 --runs 9 --iters 40`; `--smoke` for the invariants, `--pools 64 --keys <keys128-256.bin> --m 32` for the 256-key block, `--arm warp\|warp8\|cta256` for the other arms, `--barrier` for the fence probe | no |
+| 8 | ~~`lsa_scan_bench`~~ | **deleted 2026-11-13**: LSA is dropped (1.008× / 1.028× ceiling, see `docs/LSA-DENSE.md`) | — |
+| W1 | ~~`lsa_ward_bench`~~ | **deleted 2026-11-13**: same reason; the invocation was `--keys <keys128.bin> --blocks 128 --m 64 --oracle 16 --runs 9 --iters 40` when it ran | — |
 
 The build is the same for all of them:
 

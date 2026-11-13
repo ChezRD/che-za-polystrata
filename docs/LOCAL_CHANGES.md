@@ -56,8 +56,10 @@ the Strata project's 0.2.13.1 release) is recorded in [SYNC-2026-11-11.md](SYNC-
 - The prefill and tail changes are fork-local unless measured and accepted upstream.
 - If an upstream file must change, keep the edit to one marked block
   `// POLYSTRATA LOCAL: <id> begin/end` and check it after each sync.
-- After a sync: `python tools/polystrata_names.py`, then build, `ctest -R 'local_hooks|iq_|poly_'`,
-  `native_grouped_parity`, and the 12G/REAP smoke tests.
+- After a sync: build, `ctest -R 'local_hooks|iq_|poly_'`, `native_grouped_parity`, and the 12G/REAP smoke
+  tests. Do not rename anything: the engine's sources and the documents about it keep upstream's names, and a
+  wholesale rename rewrote other projects' names (see "Text and names" in `docs/SYNC-2026-11-11.md` for the one
+  that was done, and `AGENTS.md` for the rule).
 
 ## Verification, 2026-11-11 sync
 

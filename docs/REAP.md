@@ -76,6 +76,18 @@ build-poly-local/strata --pack "$PACK" --native "$REAP" \
 
 Notes:
 
+- **`--prefill auto` did not give this run a large chunk: it ran at 8192.** `--resident-budget-gib` sets
+  `resident_cpu_experts` (`src/program/generate.cpp:3793-3794`), and the #2090 RAM guard then steps a bare auto's
+  ceiling 32768 → 16384 → 8192 while `MemAvailable < pin + extra + 6144` (`generate.cpp:9907-9935`). On this box the
+  resident pin is ≈ 54 GiB against `MemAvailable` ≈ 45 GiB, so the 256K table above was measured at **chunk 8192**.
+  The guard prints a line saying so ("prompt chunks stay at 8192"). `STRATA_NV_CHUNK=1` forces the ceiling and gives
+  up the RAM guard.
+- **16384 and 24576 are not measured.** One attempt on 2026-11-14 never reached the prefill: at
+  `--resident-budget-gib 34 --vram-reserve-mib 2048` the expert cache left **228 MiB (at 16384) and 209 MiB (at
+  24576)** free, while a chunk's device buffers want **0.2267 MiB a token** — 3,714 MiB at 16384 and 5,571 MiB at
+  24576. Both exited at start with "device buffers for a chunk of N tokens do not fit". **That is the budget, not the
+  card.** No prefill or decode figure exists for either size; the arm that answers it lowers `--resident-budget-gib`
+  until a chunk's buffers fit, and then trades decode for prefill explicitly.
 - `--adapt-async` and `--expert-profile-save` act in `--serve`; the CLI accepts them but
   prints that asynchronous adaptation is off.
 - The REAP file's expert blobs are larger than Swift's (4.43 MB against 2.33 MB), so the same

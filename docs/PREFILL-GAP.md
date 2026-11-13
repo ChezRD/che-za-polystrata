@@ -199,6 +199,13 @@ At 40,960 tokens the same A/B was **1,932 / 1,935 / 2,008 tok/s** against **266 
 because the shorter context lets the fast path do more of its work per weight read. **The ratio falls with context
 length, which is the signature of a win in the matmul and not in attention.**
 
+> **Unverified: the KV format and batch size were not recorded with the 40,960 figure.** The command line in §6 is the
+> 131,072 one (`--kv k6v4`, `--prompt-batch 128`), and the 40,960 run did not have its own written down. A later
+> attempt to reproduce 40,960 on a loaded box measured 1,717 / 1,712 / 1,722 at `--prompt-batch 128 --kv k8v4`,
+> 1,833 at 512 and 1,841 at 1024 — but that run overlapped a build at `loadavg` 24 on 12 cores, so it is not evidence
+> against the number above either. Treat the pair as measured once, format unrecorded, rather than as a figure to
+> quote. 1,942 in the merge commit's message is the same run.
+
 ### The MoE regression gate
 
 Both MoE models on this box, greedy, 32 tokens, `STRATA_MMQ_DENSE` unset against `=0`:

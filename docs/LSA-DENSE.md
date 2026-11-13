@@ -1,5 +1,13 @@
 # LSA on the dense Qwen3.8-27B: the distilled map, and what using it takes
 
+> **Status: dropped, 2026-11-13.** LSA is not being built. Its ceiling was measured on our models at **1.008× on the
+> 27B and 1.028× on Ornith** (post-MMQ), with attention at **0.8% of Ornith's prefill** — so a perfect implementation
+> could not move the number that matters. The branch `feat/lsa-phase1-wt` (kernels, wiring, the python tools) is
+> parked, not merged, and the two probe harnesses that were in `main` (`src/kernels/lsa_scan_bench.cu`,
+> `lsa_ward_bench.cu`) are deleted. This document is kept because everything below is about **another project's**
+> shipped weights (HyperQwen's D-LSA): the pin file, the SHA-256 and the tensor names cost real work to establish and
+> are still true. Read it as a survey of what using that map would take, not as a plan for this fork.
+
 A design note from surveying **https://github.com/syv-ai/HyperQwen** (`lsa/`) against our dense `qwen35` family. It
 answers one question: can we run the paper's **D-LSA (Flat)** — the variant measured at 72.4× prefill / 42.5× decode
 per attention layer at 10M tokens on this exact model — or only the training-free fallback that the paper says
