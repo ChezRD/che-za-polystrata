@@ -1,6 +1,6 @@
 # Tiel Coder 35B-A3B
 
-Volver a [README.es.md](../../README.es.md)
+Volver a [README.md](../../README.md)
 
 **Tiel Coder 35B-A3B**, Ornith 1.5 cuantizado por peculiar-ragdoll para agentes de programación: un archivo de 14 a 23 GB. También entiende imágenes.
 

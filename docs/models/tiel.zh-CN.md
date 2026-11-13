@@ -1,6 +1,6 @@
 # Tiel Coder 35B-A3B
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **Tiel Coder 35B-A3B**：peculiar-ragdoll 为编程智能体量化的 Ornith 1.5，文件 14 到 23 GB。它还能看图片。
 

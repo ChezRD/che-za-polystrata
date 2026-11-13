@@ -1,6 +1,6 @@
 # Tiel Coder 35B-A3B
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **Tiel Coder 35B-A3B**：peculiar-ragdoll がコーディングエージェント向けに量子化した Ornith 1.5。ファイルは 14〜23 GB。画像も読めます。
 

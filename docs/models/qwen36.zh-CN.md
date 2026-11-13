@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **Qwen3.6-35B-A3B**：文件 13 到 23 GB。它还能看图片。
 

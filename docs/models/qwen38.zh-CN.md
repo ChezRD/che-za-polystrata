@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **Qwen3.8-Flash-Next**：12 GB 及以上的 NVIDIA 或 AMD 显卡，Windows 或Linux。它还能看图片。引擎是 Strata 项目的，没有改动。
 

@@ -1,6 +1,6 @@
 # Gemma 4 26B-A4B
 
-Voltar para [README.pt-BR.md](../../README.pt-BR.md)
+Voltar para [README.md](../../README.md)
 
 **Gemma 4 26B-A4B**, um arquivo de 11 a 17 GB. Ele também entende imagens.
 

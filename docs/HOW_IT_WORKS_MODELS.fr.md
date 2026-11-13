@@ -1,6 +1,6 @@
 # Comment ça marche ?
 
-Retour à [README.fr.md](../README.fr.md)
+Retour à [README.md](../README.md)
 
 Les modèles comme celui-ci tournent d'habitude sur des serveurs avec des centaines de gigaoctets de mémoire
 graphique. Votre carte graphique a 8-32 Go. PolyStrata fait tenir le modèle en **répartissant le travail sur tout votre

@@ -1,6 +1,6 @@
 # LFM2.5-24B-A2B
 
-Zurück zu [README.de.md](../../README.de.md)
+Zurück zu [README.md](../../README.md)
 
 **LFM2.5-24B-A2B** von Liquid AI, eine Datei von 11 bis 25 GB. Die meisten seiner Schichten haben keine Attention, darum braucht eine lange Unterhaltung wenig VRAM: Ein Kontext von 128K braucht nur 2 GB mehr als 32K. Seine Lizenz erlaubt die kommerzielle Nutzung nur Firmen mit weniger als 10 Millionen Dollar Jahresumsatz.
 

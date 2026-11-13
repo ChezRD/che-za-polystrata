@@ -1,6 +1,6 @@
 # Wie funktioniert es?
 
-Zurück zu [README.de.md](../README.de.md)
+Zurück zu [README.md](../README.md)
 
 Modelle wie dieses laufen normalerweise auf Servern mit Hunderten Gigabyte Grafikspeicher. Deine Grafikkarte hat
 8-32 GB. PolyStrata bringt das Modell trotzdem unter, indem es **die Arbeit auf deinen ganzen PC verteilt**. Stell dir

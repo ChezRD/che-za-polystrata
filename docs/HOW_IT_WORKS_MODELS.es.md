@@ -1,6 +1,6 @@
 # ¿Cómo funciona?
 
-Volver a [README.es.md](../README.es.md)
+Volver a [README.md](../README.md)
 
 Los modelos como este suelen funcionar en servidores con cientos de gigabytes de memoria gráfica. Tu tarjeta gráfica
 tiene 8-32 GB. PolyStrata hace que el modelo quepa **repartiendo el trabajo por todo tu PC**. Piensa en una cocina: lo

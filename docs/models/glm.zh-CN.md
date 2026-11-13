@@ -1,6 +1,6 @@
 # GLM 5.3 Flash
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **GLM 5.3 Flash**：最大的一个，文件 79 到 114 GB，大部分留在内存里。
 

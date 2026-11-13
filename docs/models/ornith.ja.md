@@ -1,6 +1,6 @@
 # Ornith 1.5
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **Ornith 1.5**：構造は Qwen3.6-35B-A3B と同じで、重みが違います。ファイルは 14〜24 GB。画像も読めます。
 

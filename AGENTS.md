@@ -1,50 +1,41 @@
 # AGENTS.md
 
-PolyStrata runs the Qwen3.8-Flash-Next mixture-of-experts model (and its Coder, Swift 1.5 and Unsloth variants) on a
-normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux. It has a C++/CUDA/HIP engine
-(`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
-one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
+Che'za-PolyStrata is a research fork of PolyStrata and Strata, tuned for one RTX 4060 Ti 16 GB (sm_89).
 
-A second engine, `strata-poly` (`src/poly/`), runs GLM 5.3 Flash, Ornith 1.5 (35B and 122B), DeepSeek V4 Flash and other GGUF models on Linux or Windows: [docs/GLM.md](docs/GLM.md), [docs/ORNITH.md](docs/ORNITH.md), [docs/DEEPSEEK.md](docs/DEEPSEEK.md), [docs/BACKENDS.md](docs/BACKENDS.md). The Qwen engine, the installer, the server and the web app come from
-[Strata](https://github.com/Niko1221/Strata).
+## Architecture
 
-## Installing PolyStrata for a user
+The project builds two binaries:
 
-Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,
-start and verify the server, and connect the user's apps. Never expose the server beyond `127.0.0.1` without
-`--api-key`. As an alternative to shell commands, PolyStrata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.md))
-offers the same steps as tools.
+- `src/` -> `strata` (upstream: Strata). QSA attention, KV streaming. Primary model: Qwen3.8-Flash-Next.
+- `src/poly/` -> `strata-poly` (upstream: PolyStrata). Dense attention, resident KV. Models: Flint, Ornith, Qwen3.6, GLM 5.3 Flash, DeepSeek V4 Flash.
 
-## Working on the code
+Do not transfer benchmark numbers between these two engines.
 
-- How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
-  the [paper](docs/paper/Strata-Paper.pdf).
-- AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
-- The engine is synced from [Strata](https://github.com/Niko1221/Strata) as a unit: `src/`, `include/`, `metal/`, `sycl/`, `cmake/`, `tests/`, `CMakeLists.txt`
-  and the `third_party/ggml` headers. A branch named `upstream-engine-<tag>` holds one snapshot commit made on the last
-  common base, and `main` merges it; the server, installer, tools, docs and the app stay out of that snapshot. The
-  previous snapshot is the merge base for the next sync. Metal is merged by code (upstream reworked it heavily) but
-  cannot be built or run without a Mac, so say what was not tested.
-- Text taken from the Strata project names that project. The engine's sources and the documents about it keep
-  upstream's names, and a wholesale rename is wrong: in this tree "Strata" usually means the upstream project
-  (its releases, its forks, the measurements taken on it), not this fork. Name this fork PolyStrata in the text
-  that is about this fork, and write "the Strata project" or link [Strata](https://github.com/Niko1221/Strata)
-  where you mean upstream. There is no script that rewrites the name; one existed until 2026-11-13 and turned
-  `Hardin22/Strata-DualGPU` into a repository that does not exist.
-- Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
-  `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
-- Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a
-  measurement.
+## Build and Test
 
-## Contributing a change or report
+```sh
+cmake -S . -B build-poly-local -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89 -DSTRATA_BUILD_TESTS=ON
+cmake --build build-poly-local -j8
+ctest --test-dir build-poly-local --output-on-failure -j1
+```
 
-- Search the open issues and pull requests first, and add to a thread that already covers your point.
-- Open an issue with the form that fits (bug report, feature request or question).
-- One change per pull request. Say what it changes and what it leaves alone.
-- A new feature is opt-in, and the default path stays byte-identical to the last release. Say how you checked.
-- Build every backend a file touches (CUDA, HIP, SYCL) before asking for review.
-- Change a default only where you measured it faster, and show the numbers with what they were measured on.
-- A report from hardware the maintainers do not have is welcome. Follow
-  [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNITY_BENCHMARKS.md), compare against a same-day run of the build you are
-  testing, and say what you did not test.
-- Open test requests and the hardware that is wanted are listed in [docs/TEST_REQUESTS.md](docs/TEST_REQUESTS.md).
+- Leave `STRATA_GGML_DIR` empty (uses vendored `third_party/strata-ggml`).
+- Run `ctest` with `-j1` to prevent VRAM overcommit.
+- Local machine builds only CUDA (sm_89). Mark any Metal, HIP, or SYCL changes as untested.
+
+## GPU Rules
+
+Any timing or benchmark run on GPU must follow these rules:
+
+1. **Lock clock:** `sudo -n nvidia-smi -lgc 2820` before the run, `nvidia-smi -rgc` after.
+2. **Lock GPU:** Wrap executions in `flock -w 60 /tmp/opencode/gpu.lock timeout <sec> <cmd>`.
+3. **No background runs:** Run in foreground only. Never benchmark while compiling.
+4. **Report conditions:** State model, quant, KV type, context length, and verify parity/correctness.
+
+## Working Rules
+
+- **Local patches in upstream code:** Wrap edits in `// POLYSTRATA LOCAL: <id> begin` and `// POLYSTRATA LOCAL: <id> end`.
+- **Naming:** Keep original upstream names in engine sources and docs. Do not run bulk search-and-replace on "Strata" or "PolyStrata".
+- **Local files:** Files like `strata-*.json`, `strata-*.log`, `run-*.sh`, and `build*/` at the root are gitignored local state. Do not delete them and do not commit them.
+- **Defaults:** Change engine defaults only if verified faster with pinned clocks on this RTX 4060 Ti.

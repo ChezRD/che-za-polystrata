@@ -1,6 +1,6 @@
 # Como funciona?
 
-Voltar para [README.pt-BR.md](../README.pt-BR.md)
+Voltar para [README.md](../README.md)
 
 Modelos como este normalmente rodam em servidores com centenas de gigabytes de memória de vídeo. Sua placa de vídeo
 tem 8-32 GB. O PolyStrata faz o modelo caber **dividindo o trabalho pelo PC inteiro**. Pense numa cozinha: o que você

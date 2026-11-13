@@ -1,6 +1,6 @@
 # LFM2.5-24B-A2B
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **LFM2.5-24B-A2B**：Liquid AI 的模型，文件 11 到 25 GB。它大部分层没有注意力，所以长对话占的显存很少：128K 上下文只比 32K 多占 2 GB。它的许可证只允许年收入低于 1,000 万美元的公司商用。
 

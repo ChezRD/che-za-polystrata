@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next
 
-Volver a [README.es.md](../../README.es.md)
+Volver a [README.md](../../README.md)
 
 **Qwen3.8-Flash-Next** en una tarjeta gráfica NVIDIA o AMD de 12 GB o más, en Windows o Linux. También entiende imágenes. Su motor es el de [Strata](https://github.com/Niko1221/Strata), sin cambios.
 

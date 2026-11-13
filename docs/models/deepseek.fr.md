@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash
 
-Retour à [README.fr.md](../../README.fr.md)
+Retour à [README.md](../../README.md)
 
 **DeepSeek V4 Flash**, un fichier de 91 Go, dont la plus grande part reste aussi en RAM. Sa mémoire d'une discussion est petite : un contexte de 128K ne prend que 0,7 Go de VRAM de plus que 32K.
 

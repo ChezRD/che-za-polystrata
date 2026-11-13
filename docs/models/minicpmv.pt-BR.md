@@ -1,6 +1,6 @@
 # MiniCPM-V 4.7 35B-A3B
 
-Voltar para [README.pt-BR.md](../../README.pt-BR.md)
+Voltar para [README.md](../../README.md)
 
 **MiniCPM-V 4.7 35B-A3B** da OpenBMB, com a arquitetura do Qwen3.6-35B-A3B e pesos próprios, feito para ler imagens: um arquivo de 16 a 29 GB.
 

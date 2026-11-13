@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **DeepSeek V4 Flash**：文件 91 GB，大部分也留在内存里。它记对话占的显存很少：128K 上下文只比 32K 多占 0.7 GB。
 

@@ -1,6 +1,6 @@
 # Clover-35B-A3B-Preview
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **Clover-35B-A3B-Preview**：DiffuSpace のモデル。ファイルは 13〜21 GB。Qwen3.6-35B-A3B をさらに学習させ、トークンのまとまりを一度に書けるようにしたものです。読めるのはテキストだけです。
 

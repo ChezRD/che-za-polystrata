@@ -1,6 +1,6 @@
 # Kolibri 1
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **Kolibri 1**：Aleph Alpha 的模型，由 19,200 个专家组成，写德语和写英语一样好，文件 29 到 48 GB，显卡小的时候大部分放在内存里。每五层里有四层只往回看 513 个 token。
 

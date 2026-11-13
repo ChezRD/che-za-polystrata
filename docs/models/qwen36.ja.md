@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **Qwen3.6-35B-A3B**：ファイルは 13〜23 GB。画像も読めます。
 

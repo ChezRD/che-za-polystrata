@@ -1,6 +1,6 @@
 # GLM 5.3 Flash
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **GLM 5.3 Flash**：いちばん大きいモデル。ファイルは 79〜114 GB で、その大部分は RAM に置かれます。
 

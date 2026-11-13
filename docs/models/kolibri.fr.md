@@ -1,6 +1,6 @@
 # Kolibri 1
 
-Retour à [README.fr.md](../../README.fr.md)
+Retour à [README.md](../../README.md)
 
 **Kolibri 1** d'Aleph Alpha, un modèle de 19,200 experts qui écrit l'allemand aussi bien que l'anglais : un fichier de
 29 à 48 Go, qui reste surtout en RAM à côté d'une petite carte. Quatre couches sur cinq ne regardent que 513 tokens en

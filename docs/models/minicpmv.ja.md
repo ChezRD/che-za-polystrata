@@ -1,6 +1,6 @@
 # MiniCPM-V 4.7 35B-A3B
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **MiniCPM-V 4.7 35B-A3B**：OpenBMB のモデル。Qwen3.6-35B-A3B と同じ構造で、重みは独自のもの。画像を読むために作られています。ファイルは 16〜29 GB。
 

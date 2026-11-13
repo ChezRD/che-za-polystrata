@@ -1,6 +1,6 @@
 # MiniCPM-V 4.7 35B-A3B
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **MiniCPM-V 4.7 35B-A3B**：OpenBMB 的模型，结构和 Qwen3.6-35B-A3B 相同，权重是自己训练的，专门做看图，文件 16 到 29 GB。
 

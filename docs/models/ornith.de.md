@@ -1,6 +1,6 @@
 # Ornith 1.5
 
-Zurück zu [README.de.md](../../README.de.md)
+Zurück zu [README.md](../../README.md)
 
 **Ornith 1.5**, mit der Architektur von Qwen3.6-35B-A3B und anderen Gewichten: eine Datei von 14 bis 24 GB. Es versteht auch Bilder.
 

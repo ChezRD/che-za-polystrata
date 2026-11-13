@@ -1,6 +1,6 @@
 # Qwen3.6-35B-A3B
 
-Volver a [README.es.md](../../README.es.md)
+Volver a [README.md](../../README.md)
 
 **Qwen3.6-35B-A3B**, un archivo de 13 a 23 GB. También entiende imágenes.
 

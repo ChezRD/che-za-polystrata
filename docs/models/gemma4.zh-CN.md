@@ -1,6 +1,6 @@
 # Gemma 4 26B-A4B
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **Gemma 4 26B-A4B**：文件 11 到 17 GB。它还能看图片。
 

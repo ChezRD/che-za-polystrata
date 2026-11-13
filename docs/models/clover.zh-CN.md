@@ -1,6 +1,6 @@
 # Clover-35B-A3B-Preview
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **Clover-35B-A3B-Preview**：DiffuSpace 的模型，文件 13 到 21 GB。它是在 Qwen3.6-35B-A3B 上接着训练出来的，还能一次写出一整块 token。只看文字。
 

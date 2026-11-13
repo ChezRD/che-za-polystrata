@@ -1,6 +1,6 @@
 # Kolibri 1
 
-Zurück zu [README.de.md](../../README.de.md)
+Zurück zu [README.md](../../README.md)
 
 **Kolibri 1** von Aleph Alpha, ein Modell aus 19,200 Experten, das Deutsch so gut schreibt wie Englisch: eine Datei von
 29 bis 48 GB, die neben einer kleinen Karte größtenteils im RAM bleibt. Vier von fünf Schichten schauen nur 513 Tokens

@@ -1,6 +1,6 @@
 # Flint 40B-A2.5B
 
-Voltar para [README.pt-BR.md](../../README.pt-BR.md)
+Voltar para [README.md](../../README.md)
 
 **Flint 40B-A2.5B** da Recursive, feito para agentes de código: um arquivo de 18 a 42 GB. A maioria das camadas dele só olha 513 tokens para trás, então uma conversa longa ocupa pouca VRAM: um contexto de 128K ocupa só 2,6 GB a mais que 32K.
 

@@ -1,6 +1,6 @@
 # GLM 5.3 Flash
 
-Volver a [README.es.md](../../README.es.md)
+Volver a [README.md](../../README.md)
 
 **GLM 5.3 Flash**, el más grande: un archivo de 79 a 114 GB, que en su mayor parte se queda en la RAM.
 

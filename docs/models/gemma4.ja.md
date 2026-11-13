@@ -1,6 +1,6 @@
 # Gemma 4 26B-A4B
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **Gemma 4 26B-A4B**：ファイルは 11〜17 GB。画像も読めます。
 

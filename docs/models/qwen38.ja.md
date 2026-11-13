@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next
 
-[README.ja.md](../../README.ja.md) に戻る
+[README.md](../../README.md) に戻る
 
 **Qwen3.8-Flash-Next**：12 GB 以上の NVIDIA または AMD のグラフィックカード、Windows または Linux。画像も読めます。エンジンは[Strata](https://github.com/Niko1221/Strata) のものをそのまま使っています。
 

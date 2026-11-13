@@ -1,6 +1,6 @@
 # Flint 40B-A2.5B
 
-返回 [README.zh-CN.md](../../README.zh-CN.md)
+返回 [README.md](../../README.md)
 
 **Flint 40B-A2.5B**：Recursive 为编程智能体做的模型，文件 18 到 42 GB。它大部分层只往回看 513 个 token，所以长对话占的显存很少：128K 上下文只比 32K 多占 2.6 GB。
 

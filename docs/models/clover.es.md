@@ -1,6 +1,6 @@
 # Clover-35B-A3B-Preview
 
-Volver a [README.es.md](../../README.es.md)
+Volver a [README.md](../../README.md)
 
 **Clover-35B-A3B-Preview** de DiffuSpace, un archivo de 13 a 21 GB. Es Qwen3.6-35B-A3B entrenado más para escribir
 también un bloque de tokens de una vez. Solo lee texto.
